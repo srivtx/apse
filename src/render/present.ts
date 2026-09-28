@@ -196,6 +196,27 @@ export interface PresentOptions {
 /** MSAA levels the intermediate can be created at. Matches `RenderTargetImpl`. */
 const SAMPLE_COUNTS: readonly (1 | 4)[] = [1, 4];
 
+/**
+ * The tone map a renderer should use when the caller does not choose.
+ *
+ * **ON, and `aces`, and that is a deliberate default rather than a neutral
+ * one.** A material writes linear values; a canvas in `bgra8unorm` — which is
+ * what `getPreferredCanvasFormat()` returns on every desktop — stores them
+ * verbatim with no transfer function applied. A straight-to-canvas draw with no
+ * present pass therefore produces a linear image displayed as if it were sRGB:
+ * far too dark, with a lit surface reading as unlit and nothing anywhere
+ * reporting an error. A library whose out-of-the-box output is darker than
+ * everybody else's loses the argument before it starts.
+ *
+ * `aces` rather than `none` because `operator: 'none'` still applies the sRGB
+ * encode — that is the part which fixes the darkness — so both fix the bug, and
+ * the curve is what makes an unbounded highlight read as a highlight instead of
+ * a flat white blob. It matches `tonemapMaterial`'s own default
+ * (`tonemapMaterialSpec`), so a material built directly and a present pass built
+ * here agree. Set `toneMapping: null` to turn the pass off entirely.
+ */
+export const DEFAULT_TONE_MAPPING: TonemapOptions = Object.freeze({ operator: 'aces' });
+
 // ---------------------------------------------------------------------------
 // PresentPass
 // ---------------------------------------------------------------------------

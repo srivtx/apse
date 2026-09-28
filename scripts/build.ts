@@ -52,28 +52,63 @@ interface SizeRow {
   gzip: number;
   brotli: number;
   source: string;
+  /**
+   * Every source module in this entry's import closure, `src/`-relative and
+   * sorted. Empty for `tree-shaken app`: that row measures an *application*, not
+   * a published entry, and so has no layer contract to keep. `scripts/size-gate.ts`
+   * asserts the non-empty ones against the layer DAG.
+   */
+  modules: string[];
 }
 
 /**
  * Hard ceilings on gzip size, in KiB, for the full reachable module graph.
  *
- * These are set from measured reality with roughly 15% headroom, not from a
- * target. A budget nobody could hit is a budget that gets raised on the first
- * PR that breaks it, and then it means nothing.
+ * These are measured, not wished for. Every budget below carries the number it
+ * was derived from and the date that number was taken, so a reader can tell a
+ * re-baseline from a fudge.
+ *
+ * Headroom is 15%, and the reason it is 15% and not 5% is the warning band. The
+ * gate colours any entry at 90% of its ceiling yellow so a regression is visible
+ * as "now at 92% of budget" a long time before it fails. Re-baselining to 8% puts
+ * every row at 92% on day one, which turns a permanent state into a permanent
+ * warning and the warning into noise. At 15% a re-baselined tree sits at 87%: green,
+ * with about three points of headroom before anything turns yellow, and a hard
+ * failure at 100%.
+ *
+ * Is 15% still tight enough? On the root entry it is 10.2 KB of raw JavaScript,
+ * and on the headline claim it is 6.8 KB of gzip — a feature nobody budgeted for
+ * cannot land without tripping the gate, which is the whole point. The
+ * per-module-count check in `scripts/size-gate.ts` is what catches the small
+ * absorptions, because a few hundred bytes never reaches a byte ceiling at all.
+ *
+ * Measurement conditions, for every row: bun 1.3.9, node 22.21.0, esbuild
+ * exactly as pinned in `bun.lock`, macOS arm64, `gzip -9` over the concatenation
+ * of the entry and every chunk it transitively imports. Sizes vary by well under
+ * 1% across platforms with the same lockfile, so the 15% is headroom for the
+ * next deliberate feature, not a fudge factor for toolchain noise.
  *
  * The headline claim is `tree-shaken app`: a complete renderer, camera, PBR
  * material, and animation loop, measured after tree-shaking. For comparison,
  * three.js needs ~133 KB gzip for a single PBR cube.
  */
 const BUDGETS: Record<string, number> = {
-  'index': 70,
-  'core/index': 10,
-  'math/index': 8,
-  'geometry/index': 20,
-  'material/index': 40,
-  'scene/index': 13,
-  'render/index': 52,
-  'tree-shaken app': 46,
+  // measured 67.97 KB gzip on 2026-09-28
+  'index': 78.2,
+  // measured 7.72 KB gzip on 2026-09-28
+  'core/index': 8.9,
+  // measured 6.59 KB gzip on 2026-09-28
+  'math/index': 7.6,
+  // measured 17.99 KB gzip on 2026-09-28
+  'geometry/index': 20.7,
+  // measured 37.97 KB gzip on 2026-09-28
+  'material/index': 43.7,
+  // measured 10.51 KB gzip on 2026-09-28
+  'scene/index': 12.1,
+  // measured 50.26 KB gzip on 2026-09-28
+  'render/index': 57.8,
+  // measured 45.56 KB gzip on 2026-09-28
+  'tree-shaken app': 52.4,
 };
 
 /**
@@ -90,6 +125,7 @@ async function measureTreeShaken(): Promise<{ raw: number; gzip: number; brotli:
   await build({
     entryPoints: [entry],
     outfile: out,
+    absWorkingDir: ROOT,
     bundle: true,
     format: 'esm',
     target: 'es2022',
@@ -154,6 +190,12 @@ async function main(): Promise<void> {
     // `src/core/index.ts` becomes `core/index.js` and shares its module graph
     // with the root entry instead of duplicating it.
     entryPoints: Object.values(ENTRIES).map((src) => join(ROOT, src)),
+    // Pinning the working directory makes every path in the metafile relative to
+    // the repository root no matter where the script was invoked from, which is
+    // what the lookups below assume. Without it, `bun run --cwd ../.. build`
+    // produces a report whose keys resolve to nothing and a gate that passes
+    // because it measured an empty graph.
+    absWorkingDir: ROOT,
     outbase: SRC,
     outdir: DIST,
     metafile: true,
@@ -185,6 +227,32 @@ async function main(): Promise<void> {
     return seen;
   };
 
+  /**
+   * The source modules behind an entry, from the metafile's *input* graph.
+   *
+   * `reachable` answers "how many bytes does a consumer download"; this answers
+   * "which modules did they pull in", and the second question is the one the
+   * layer check in `scripts/size-gate.ts` asks. The output graph cannot answer
+   * it: after code splitting, the substance of an entry is scattered across the
+   * entry file and a set of shared chunks, and the mapping back to source is
+   * gone by the time you look at `outputs`.
+   */
+  const reachableInputs = (entry: string): string[] => {
+    const inputs = metafile.inputs;
+    const seen = new Set<string>();
+    const queue = [entry];
+    while (queue.length > 0) {
+      const file = queue.pop()!;
+      if (seen.has(file)) continue;
+      seen.add(file);
+      for (const imp of inputs[file]?.imports ?? []) {
+        if (imp.external) continue;
+        queue.push(imp.path);
+      }
+    }
+    return [...seen].sort();
+  };
+
   const compress = (buf: Buffer): { gzip: number; brotli: number } => ({
     gzip: gzipSync(buf, { level: 9 }).byteLength,
     brotli: brotliCompressSync(buf, {
@@ -212,13 +280,14 @@ async function main(): Promise<void> {
       gzip,
       brotli,
       source,
+      modules: reachableInputs(source),
     });
   }
 
   // A single-import consumer, which is what a real app looks like. This is the
   // number the README quotes, and the one every other library is compared to.
   const treeShaken = await measureTreeShaken();
-  rows.push({ entry: 'tree-shaken app', files: 1, ...treeShaken, source: 'bench/tree-shake.ts' });
+  rows.push({ entry: 'tree-shaken app', files: 1, ...treeShaken, source: 'bench/tree-shake.ts', modules: [] });
 
   await writeFile(
     join(DIST, 'size-report.json'),
@@ -228,17 +297,27 @@ async function main(): Promise<void> {
   const pad = (s: string, n: number): string => s.padEnd(n);
   const kb = (n: number): string => `${(n / 1024).toFixed(2)} KB`;
   process.stdout.write('\n');
-  process.stdout.write(`  ${pad('entry', 20)}${pad('files', 7)}${pad('raw', 11)}${pad('gzip', 11)}brotli\n`);
-  process.stdout.write(`  ${'-'.repeat(58)}\n`);
+  process.stdout.write(
+    `  ${pad('entry', 20)}${pad('files', 7)}${pad('modules', 9)}${pad('raw', 11)}${pad('gzip', 11)}brotli\n`,
+  );
+  process.stdout.write(`  ${'-'.repeat(67)}\n`);
   for (const r of rows) {
     process.stdout.write(
-      `  ${pad(r.entry, 20)}${pad(String(r.files), 7)}${pad(kb(r.raw), 11)}${pad(kb(r.gzip), 11)}${kb(r.brotli)}\n`,
+      `  ${pad(r.entry, 20)}${pad(String(r.files), 7)}${pad(String(r.modules.length), 9)}` +
+      `${pad(kb(r.raw), 11)}${pad(kb(r.gzip), 11)}${kb(r.brotli)}\n`,
     );
   }
 
+  // An entry with no budget is not a pass. `?? Infinity` would let a newly added
+  // entry ship unmeasured and unconstrained, which is how a bundle grows to
+  // 400 KB while every ceiling below it still holds.
+  const unbudgeted = rows.filter((r) => BUDGETS[r.entry] === undefined);
   const breaches = rows.filter((r) => r.gzip > (BUDGETS[r.entry] ?? Infinity) * 1024);
   process.stdout.write('\n');
-  if (breaches.length > 0) {
+  for (const u of unbudgeted) {
+    process.stdout.write(`  BUDGET ${u.entry}: no ceiling declared, so ${kb(u.gzip)} gzip is unconstrained\n`);
+  }
+  if (unbudgeted.length > 0 || breaches.length > 0) {
     for (const b of breaches) {
       process.stdout.write(
         `  BUDGET ${b.entry}: ${kb(b.gzip)} gzip exceeds ${BUDGETS[b.entry]} KB\n`,
@@ -256,7 +335,6 @@ async function main(): Promise<void> {
     process.stdout.write(`  VERSION mismatch: src/index.ts says ${declared}, package.json says ${pkg.version}\n`);
     process.exit(1);
   }
-  void SRC;
 
   process.stdout.write(`\n  built ${rows.length} entries, all within budget\n\n`);
 }

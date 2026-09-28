@@ -22,17 +22,53 @@ export interface Disposable {
   dispose(): void;
 }
 
+/**
+ * The catalog code a released resource reports when it is used again.
+ *
+ * `INTERNAL_INVARIANT` is the fallback for a subclass that has not named
+ * itself: it still fails loudly, which is the important half, but it files the
+ * caller's mistake as apse's. A subclass that can name itself should pass the
+ * specific code to `super()` — a caller who keeps drawing a released material is
+ * not an apse bug, and `MATERIAL_DISPOSED` says so where `INTERNAL_INVARIANT`
+ * says the opposite.
+ */
+export type DisposedCode =
+  | 'MATERIAL_DISPOSED'
+  | 'MESH_DISPOSED'
+  | 'RESOURCE_DISPOSED'
+  | 'INTERNAL_INVARIANT';
+
 export abstract class Resource implements Disposable {
   #refs = 1;
   #disposed = false;
+  readonly #disposedCode: DisposedCode;
+
+  constructor(disposedCode: DisposedCode = 'INTERNAL_INVARIANT') {
+    this.#disposedCode = disposedCode;
+  }
 
   /** Live references. Zero means the GPU resources are gone. */
   get refCount(): number {
     return this.#refs;
   }
 
+  /**
+   * True once the GPU resources are gone. Readable, not just raisable: a
+   * consumer that can ask "is this still alive" does not have to provoke an
+   * error to find out, which is the whole difference between an observable
+   * resource and an unobservable one.
+   */
   get disposed(): boolean {
     return this.#disposed;
+  }
+
+  /**
+   * The code {@link assertLive} raises for this resource. Exposed so a layer
+   * that holds one can name the failure before it happens — in a log line, in a
+   * frame-stats counter, or in a debug overlay — without catching a throw.
+   */
+  get disposedCode(): DisposedCode {
+    return this.#disposedCode;
   }
 
   /**
@@ -41,11 +77,20 @@ export abstract class Resource implements Disposable {
    */
   ref(): this {
     if (this.#disposed) {
-      fail('INTERNAL_INVARIANT',
-        `Tried to take a reference on a disposed ${this.constructor.name}.`, {
-          why: 'Taking a reference on a released resource would hand out a handle to freed GPU memory.',
-          fix: 'Check `.disposed` before re-using, or keep the resource alive with the reference you already hold.',
-        });
+      // Two decisions, one place. The kind comes from the class because the
+      // message is about this resource — though it is minified in a bundle, so
+      // it is a hint and the code is the identifier. And the code is the generic
+      // one rather than this class's own `disposedCode`, because taking a new
+      // reference on something already released is one lifecycle mistake
+      // whatever kind it is; the kind-specific codes describe *drawing* a
+      // released resource.
+      const kind = this.constructor.name;
+      fail('RESOURCE_DISPOSED',
+        `Tried to take a reference on a disposed ${kind}.`, {
+        why: 'The reference count reached zero and the GPU memory behind it was released, so a new reference would hand out a handle to freed memory. Disposal happens when the last reference drops, not when you call dispose().',
+        fix: 'Take the reference before the last one drops, or check `.disposed` before re-using a resource whose lifetime you are not tracking.',
+        detail: { kind: 'lifecycle', resource: kind, state: 'destroyed' },
+      });
     }
     this.#refs++;
     return this;
@@ -73,15 +118,25 @@ export abstract class Resource implements Disposable {
   /** Release GPU resources. Called at most once. */
   protected abstract onDispose(): void;
 
-  /** Throws a typed error if this resource has already been released. */
-  protected assertLive(resource: string): void {
-    if (this.#disposed) {
-      fail('INTERNAL_INVARIANT',
-        `${resource} was used after it was disposed.`, {
-          why: 'The GPU buffers backing it are gone, so the resulting draw is undefined.',
-          fix: 'Hold a reference with `.ref()` for as long as a second object still uses this resource.',
-        });
-    }
+  /**
+   * Throws if this resource has already been released.
+   *
+   * `code` is a parameter rather than a constant because the caller of the check
+   * is the only thing that knows what kind of resource it is holding: a material
+   * reports `MATERIAL_DISPOSED`, a mesh `MESH_DISPOSED`. `INTERNAL_INVARIANT`
+   * remains the fallback for a subclass that has not named itself — it still
+   * fails loudly, which is the important half, but it files the caller's mistake
+   * as apse's. The base class will not guess a kind on its behalf, because a
+   * wrong guess is worse than the code a subclass has always raised: pass one
+   * here, or name the class in its `super()` call.
+   */
+  protected assertLive(resource: string, code: DisposedCode = this.#disposedCode): void {
+    if (!this.#disposed) return;
+    fail(code, `${resource} was used after it was disposed.`, {
+      why: 'The GPU buffers backing it are gone, so the resulting draw reads freed memory — which in WebGPU is not a crash but a silently discarded command, and an empty frame.',
+      fix: 'Hold a reference with `.ref()` for as long as a second object still uses this resource, and check `.disposed` before re-using one.',
+      detail: { kind: 'lifecycle', resource, state: 'destroyed' },
+    });
   }
 }
 

@@ -112,20 +112,13 @@ export const DEFAULT_LAYER = 0b1111;
 // ---------------------------------------------------------------------------
 
 /**
- * Monotonic traversal clock.
- *
- * Incremented once per {@link updateWorldMatrices} pass and stamped into every
- * node whose `world` the pass rewrites. A node carrying the current `clock` in
- * `worldVersion` was written by the pass in flight, which makes a stale write
- * from an earlier frame detectable by identity rather than by comparison.
- */
-let clock = 0;
-
-/**
  * Monotonic count of invalidations anywhere in any graph. Bumped by every
- * transform or structural change. Distinct from `clock`, which ticks per frame:
- * this one ticks per *change*, so "did anything move since I last looked?" is a
- * single integer compare.
+ * transform or structural change. This is the process-wide "did anything move
+ * since I last looked?" counter — one integer compare.
+ *
+ * It is deliberately *not* what stamps {@link Node.worldVersion}. See the note
+ * on that field: a per-change global clock and a per-node write counter look
+ * interchangeable and are not.
  */
 let graphRevision = 0;
 
@@ -202,6 +195,49 @@ function borrowStack(): Node[] {
 
 function releaseStack(): void {
   _stackDepth--;
+}
+
+// ---------------------------------------------------------------------------
+// Reference-counted ownership
+// ---------------------------------------------------------------------------
+
+/**
+ * The reference-counting surface, structurally.
+ *
+ * `GpuMesh`, `GpuInstances` and `Material` all extend `Resource`, so they have
+ * one — but what a node holds is typed as the *interfaces* `DrawableGeometry`
+ * and `Drawable`, which a caller may satisfy with a hand-rolled object that
+ * has no reference counting at all. So the check is on the shape, not on the
+ * constructor: ownership is opt-in for a custom geometry, and mandatory for
+ * anything that counts.
+ */
+interface RefCounted {
+  ref(): unknown;
+  unref(): unknown;
+}
+
+function asRefCounted(value: unknown): RefCounted | null {
+  if (value === null || typeof value !== 'object') return null;
+  const candidate = value as Partial<RefCounted>;
+  return typeof candidate.ref === 'function' && typeof candidate.unref === 'function'
+    ? (candidate as RefCounted)
+    : null;
+}
+
+/** One retained reference to `value`, if it counts references at all. */
+function retain(value: unknown): void {
+  asRefCounted(value)?.ref();
+}
+
+/**
+ * One released reference to `value`, if it counts references at all.
+ *
+ * Paired with exactly one {@link retain} per attach, and only ever reached from
+ * the detach path, so the count returns to where it started however many times
+ * a node is moved. See {@link Node.add}.
+ */
+function release(value: unknown): void {
+  asRefCounted(value)?.unref();
 }
 
 /**
@@ -300,32 +336,50 @@ export class Node {
   /**
    * Increments every time {@link world} is written.
    *
+   * **A per-node counter, not a global clock** — and the difference is a
+   * correctness bug rather than a style preference. The traversal compares
+   * `parentWorldVersion !== parent.worldVersion` to decide whether a child has
+   * to be rewritten, so the counter has one job: *advance on every write, always,
+   * and never otherwise*. A global clock cannot promise that. It ticks once per
+   * pass, while a node's own version is also advanced by every detach, so a node
+   * that has been attached and removed a handful of times carries a token ahead
+   * of the clock. The pass then writes its `world` and stamps `clock` over the
+   * token — which is *not* larger, so the stamp is dropped — and every child
+   * that recorded the old token decides its parent has not moved. The child
+   * keeps a stale world matrix forever, with no error, and the parent visibly
+   * moving without it.
+   *
    * The renderer uses this to avoid re-uploading an object whose transform has
    * not changed. Combined with the identity of the `world` array itself — which
    * is unique per node and never replaced — this is a free, correct invalidation
-   * key. The version alone would not be: it comes from a global clock, so two
-   * different nodes written in the same pass carry the same token with entirely
-   * different matrices.
+   * key. The version alone would not be: two different nodes written in the
+   * same pass can carry the same token with entirely different matrices, so
+   * identity is half the key.
    */
   get worldVersion(): number { return this.#worldVersion; }
 
-  /** Advances the token. Used by the transform pass, which numbers its own. */
+  /**
+   * Advances the token.
+   *
+   * The only way `worldVersion` moves, and it is called from every site that
+   * writes `world` — the constructor, {@link updateWorldMatrices}, the
+   * single-node {@link Node.updateWorldMatrix}, and the detach path. That is what
+   * makes "token unchanged" mean "content unchanged" rather than merely usually
+   * so, and a site that wrote `world` without calling it would be a silent bug.
+   */
   bumpWorldVersion(): void { this.#worldVersion++; }
 
-  /** The transform pass assigns the clock directly, to keep tokens monotonic. */
-  setWorldVersion(v: number): void { if (v > this.#worldVersion) this.#worldVersion = v; }
-
-  /** The parent's {@link worldVersion} as of this node's last world write. */
-  parentWorldVersion = 0;
-
   /**
-   * Value of the global clock when {@link world} was last written. Within the
-   * transform pass a write only happens when the content actually changed, so
-   * this doubles as *when this node's world transform last changed value* — and
-   * that is what makes `parentWorldVersion === parent.worldVersion` a sound
-   * test of "my parent has not moved". A matrix rewritten to the same bytes
-   * never gets a new token, so it never invalidates a child.
+   * The parent's {@link worldVersion} as of this node's last world write.
+   *
+   * This is the whole parent-change test: `parentWorldVersion === parent.worldVersion`
+   * means "my parent has not written its `world` since I last did", and therefore
+   * that everything below this node is still a function of a `world` that did not
+   * change. A matrix rewritten to the same bytes still advances the token, so a
+   * needlessly rewritten parent costs its children one visit and one multiply —
+   * it never makes them believe anything untrue.
    */
+  parentWorldVersion = 0;
 
   /** Half-extent of the local bounding sphere, in local units. */
   boundingRadius: number;
@@ -423,6 +477,26 @@ export class Node {
   /**
    * Attaches `child`, making it a child of this node.
    *
+   * ## Attaching retains, detaching releases
+   *
+   * A node in a graph draws its mesh and its material, so it holds a reference to
+   * both: {@link retainResources} on the way in, {@link releaseResources} on the
+   * way out. Without that, a caller who builds a scene, drops their own handle
+   * to a mesh, and goes on to use the scene is drawing destroyed GPU buffers —
+   * every triangle vanishes and nothing reports it. See
+   * {@link MeshNode.retainResources}.
+   *
+   * It is the *node* that retains, not {@link Scene.add}, so that a node built
+   * into a group before the group is added is covered by exactly the same rule
+   * as one attached to the root directly. Every attach and detach is one
+   * `ref()` and one `unref()` on a pair of integers, and they are always
+   * paired: the retain is the last thing {@link add} does, after both rejection
+   * checks, and the release is reached only from a node that had a parent.
+   * Moving a node between ten parents therefore leaves the count exactly where
+   * it started — which is the property that makes this safe to do on every
+   * attach, and the reason a shared mesh shared by a thousand nodes is not
+   * freed a thousand times when the scene is cleared.
+   *
    * ## `add` is explicit about re-parenting
    *
    * If `child` already has a parent this throws rather than silently moving it.
@@ -461,6 +535,9 @@ export class Node {
     // this node's ancestor chain. Without the last one a clean ancestor would
     // prune straight past the node that was just attached.
     child.#invalidate(true, true);
+    // Last, so a rejected attach cannot leave a retained reference with no
+    // matching release.
+    child.retainResources();
     return this;
   }
 
@@ -718,9 +795,8 @@ export class Node {
     this.worldBoundingRadius = this.boundingRadius * maxAxisScale(this.world);
     this.localVersionWritten = this.localVersion;
     this.parentWorldVersion = parent === null ? 0 : parent.worldVersion;
-    // A fresh world token. Because this is the only path that assigns one, a
-    // token change means the content changed, which is what stops a needlessly
-    // rewritten parent from invalidating its children.
+    // A fresh world token, unconditionally, because the write above was. See
+    // {@link Node.worldVersion} for why a conditional stamp is a latent bug.
     this.bumpWorldVersion();
     transformWrites++;
     // A new world token is a new parent token, which is how the children below
@@ -842,7 +918,15 @@ export class Node {
     r[3] = w * inv;
   }
 
-  /** Unlinks from the parent and leaves `world` self-consistent again. */
+  /**
+   * Unlinks from the parent and leaves `world` self-consistent again.
+   *
+   * Also the release half of the ownership pair: every route out of a graph
+   * funnels through here — `remove`, `removeFromParent`, and `clear` — so there
+   * is exactly one place a reference can be dropped and exactly one place one is
+   * taken. The release goes last so that a detached node is fully consistent
+   * before anything it owns can be freed by the last reference leaving.
+   */
   #detach(): void {
     this.#parent = null;
     // With no parent, the world transform *is* the local one. Writing it here
@@ -850,17 +934,38 @@ export class Node {
     // is still correct on its own terms — and it is the one place this module
     // writes a world matrix outside the traversal.
     this.world.set(this.local);
-    this.#worldVersion++;
     this.worldPosition[0] = this.local[12];
     this.worldPosition[1] = this.local[13];
     this.worldPosition[2] = this.local[14];
     this.worldBoundingRadius = this.boundingRadius * maxAxisScale(this.world);
     this.localVersionWritten = this.localVersion;
     this.parentWorldVersion = 0;
+    // Exactly one bump for the one write above. The write is what makes the
+    // content stale, and a second bump would hand a token to a change that never
+    // happened — harmless, but it means a token change no longer means what the
+    // field says it means.
     this.bumpWorldVersion();
     this.subtreeDirty = true;
     graphRevision++;
+    this.releaseResources();
   }
+
+  /**
+   * Takes a reference to everything this node draws. Called once by
+   * {@link add}; a no-op on a node that draws nothing.
+   *
+   * Overridden rather than reached for by `instanceof` so that a node type added
+   * later gets ownership by extending the hook, not by remembering to be
+   * special-cased at every attach site.
+   */
+  protected retainResources(): void {}
+
+  /**
+   * Drops the reference {@link retainResources} took. Called once per
+   * {@link add} that took one, from {@link #detach}, so the two are always
+   * paired and the count returns to where it started after any number of moves.
+   */
+  protected releaseResources(): void {}
 }
 
 // ---------------------------------------------------------------------------
@@ -909,7 +1014,6 @@ export class Node {
  * resolves against its own.
  */
 export function updateWorldMatrices(root: Node): void {
-  const pass = ++clock;
   const stack = _updateStack;
   stack.length = 0;
   stack.push(root);
@@ -924,7 +1028,6 @@ export function updateWorldMatrices(root: Node): void {
     if (node.localVersion !== node.localVersionWritten || parentChanged) {
       if (parent === null) {
         node.world.set(node.local);
-        node.bumpWorldVersion();
       } else {
         mul(node.world, parent.world, node.local);
       }
@@ -934,10 +1037,14 @@ export function updateWorldMatrices(root: Node): void {
       node.worldBoundingRadius = node.boundingRadius * maxAxisScale(node.world);
       node.localVersionWritten = node.localVersion;
       node.parentWorldVersion = parent === null ? 0 : parent.worldVersion;
-      // A fresh token, and only here: because this is the only path that
-      // assigns one, a token change means the content changed, which is what
-      // keeps a needlessly rewritten parent from invalidating its children.
-      node.setWorldVersion(pass);
+      // Advance the token, always, on every write — never conditionally, and
+      // never from a shared clock. A child decides its parent moved by
+      // comparing two of these numbers, so a write that fails to advance one is
+      // a write the whole subtree below will never learn about. The counter is
+      // per node precisely so that it cannot run out ahead of anything: the
+      // detach path and the constructor also bump it, and none of those know
+      // what the pass's clock says.
+      node.bumpWorldVersion();
       transformWrites++;
     }
     const children = node.children;
@@ -967,26 +1074,116 @@ export interface MeshNodeOptions extends NodeOptions {
  * type the draw-list builder emits, and the only one ever culled: a group
  * node's own bounding sphere says nothing about what is inside it, so bounding
  * a group by its origin would cull its children.
+ *
+ * ## It owns what it draws
+ *
+ * {@link MeshNode.retainResources} holds a reference to the mesh and to the
+ * material for as long as the node is in a graph, and the detach path
+ * releases both. Two consequences worth stating, because the alternative is the
+ * single worst bug in a refcounted renderer:
+ *
+ *   - **A node in a scene is enough to keep its geometry alive.** Build a
+ *     scene, drop your own handle to the mesh, and the mesh is still there —
+ *     the node holds the last reference. Without this, the last `unref()`
+ *     destroys the buffers and every triangle silently disappears while every
+ *     draw call still succeeds.
+ *   - **Detaching releases.** `scene.remove(node)`, `node.removeFromParent()`,
+ *     `parent.remove(node)` and `scene.clear()` all do, through the one detach
+ *     path. So the lifetime of a mesh is tied to the lifetime of the *last*
+ *     graph it is in, not to the first owner who happened to drop it.
+ *
+ * A thousand nodes sharing one mesh therefore hold a thousand references and
+ * release a thousand, and the mesh is freed once — when the thousandth goes.
+ * That is the whole reason this is a reference count and not a boolean.
  */
 export class MeshNode extends Node {
-  readonly mesh: DrawableGeometry;
+  #mesh: DrawableGeometry;
   readonly material: Drawable;
   readonly castShadow: boolean;
   readonly order: number;
 
-  /** `1` for a plain mesh, `n` for an instanced draw. */
-  readonly instanceCount: number;
+  /** The GPU geometry this node draws. Mutable through {@link setMesh}. */
+  get mesh(): DrawableGeometry {
+    return this.#mesh;
+  }
+
+  /**
+   * How many instances one `drawIndexed` on this node covers: `1` for a plain
+   * mesh, `n` for an instanced one.
+   *
+   * Read from the geometry on every access rather than captured in the
+   * constructor, because the geometry is the authority and a `GpuInstances`
+   * buffer is re-uploaded from a moving transform list — a count snapshotted at
+   * construction is a count that is wrong from the second frame, and it is wrong
+   * in the direction that draws the wrong number of objects with no error.
+   */
+  get instanceCount(): number {
+    return this.#mesh.instanceCount;
+  }
 
   /** First instance index, for instanced draws. */
-  readonly firstInstance: number;
+  get firstInstance(): number {
+    return this.#mesh.firstInstance;
+  }
+
+  /**
+   * The per-instance vertex buffer, or `null` for a mesh with none.
+   *
+   * Carried on the node so the draw list never has to reach into the geometry
+   * for it: the renderer binds vertex slot 1 from the draw item and nowhere
+   * else, which is the same "one place a draw item meets the graph" rule that
+   * {@link Node.world} obeys.
+   */
+  get instanceBuffer(): GPUBuffer | null {
+    return this.#mesh.instanceBuffer;
+  }
 
   constructor(options: MeshNodeOptions) {
     super({ ...options, boundingRadius: options.boundingRadius ?? 1 });
-    this.mesh = options.mesh;
+    this.#mesh = options.mesh;
     this.material = options.material;
     this.castShadow = options.castShadow ?? true;
     this.order = options.order ?? 0;
-    this.instanceCount = options.mesh.instanceCount;
-    this.firstInstance = options.mesh.firstInstance;
+  }
+
+  /**
+   * Swaps the geometry, moving the ownership reference with it.
+   *
+   * Releases the old mesh first, then retains the new one, so the count of every
+   * resource involved is unchanged by the call — including the case where the
+   * old and new mesh are the same object, which leaves the count where it was
+   * rather than taking it to zero and disposing a mesh the node is still using.
+   *
+   * Nothing is dirtied: a geometry is not a transform, so no world matrix
+   * changes and no ancestor needs to be told. Culling *is* affected if the new
+   * geometry has a different extent, and `boundingRadius` is the caller's to
+   * update — apse cannot derive a bound from a `DrawableGeometry`, which
+   * deliberately carries only what a draw needs.
+   */
+  setMesh(mesh: DrawableGeometry): this {
+    if (mesh === this.#mesh) return this;
+    const previous = this.#mesh;
+    this.#mesh = mesh;
+    release(previous);
+    if (this.parent !== null) retain(mesh);
+    return this;
+  }
+
+  /**
+   * Takes one reference each to the mesh and the material.
+   *
+   * A structural check, not an `instanceof`: what a node holds is typed as the
+   * `Drawable` / `DrawableGeometry` *interfaces*, and a hand-rolled geometry is
+   * a legitimate thing to draw. It simply has no reference count to participate
+   * in, so nothing is taken and nothing is owed.
+   */
+  protected override retainResources(): void {
+    retain(this.#mesh);
+    retain(this.material);
+  }
+
+  protected override releaseResources(): void {
+    release(this.#mesh);
+    release(this.material);
   }
 }

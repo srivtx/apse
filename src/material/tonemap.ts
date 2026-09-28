@@ -48,6 +48,31 @@
  * So the spec below asks for the target format and emits the encode **only when
  * the target is not an `*-srgb` format**. Both paths are generated from the same
  * source, so they cannot drift.
+ *
+ * # The working space, stated once for the whole library
+ *
+ * ```txt
+ *   shipped materials        write  LINEAR-SRGB RADIANCE, unclamped
+ *     ↓                                (rgba16float intermediate)
+ *   this pass               read   linear, multiply by frame.exposure,
+ *                                   apply an operator, then encode to sRGB
+ *     ↓                                (bgra8unorm canvas, or *-srgb in hardware)
+ *   display                 shows  sRGB
+ * ```
+ *
+ * Three rules follow, and every material in `src/material` obeys all three:
+ *
+ * 1. **No material applies a transfer function, an exposure, or a clamp.** A
+ *    material that did any of the three would be processed twice the moment it
+ *    was drawn into a post chain. `basicMaterial` is the exception that proves
+ *    the rule is about *physical* values: its `color` is documented as 0..1 and
+ *    it is a display-space utility, not a lit surface.
+ * 2. **The intermediate must be `rgba16float`** (`hdr: true`). A `unorm`
+ *    intermediate clips at 1.0, so a lit highlight is destroyed before any curve
+ *    could compress it — the tone map then has nothing left to roll off.
+ * 3. **The sRGB encode happens exactly once**, here, on the way to the display.
+ *    Whether it is in this shader or in hardware is decided by the *destination*
+ *    format and nothing else.
  */
 
 import { fail } from '../core/error.ts';
@@ -133,12 +158,40 @@ export const TONE_MAP_OPERATORS = ['none', 'aces', 'reinhard', 'linear'] as cons
 export type ToneMapOperator = (typeof TONE_MAP_OPERATORS)[number];
 
 /**
- * The `operator` slot's value for each curve.
+ * The operator a present pass gets when the caller does not choose.
  *
- * These numbers are the shader's `switch` cases, generated from this table, so
- * the two cannot drift. They are part of the material's public contract: writing
- * `operator` by name is not possible over the uniform boundary, so this is how a
- * caller converts a string to the 4 bytes that go in the buffer.
+ * **ACES, and the reason it is the default rather than Reinhard** is that ACES
+ * has a toe and a shoulder. Reinhard is `c / (1 + c)`: it lifts nothing, so a
+ * scene whose average luminance is low comes out with all of its detail crushed
+ * into the bottom two code values, and its highlights approach white
+ * asymptotically, so a large bright area never reaches it and reads as flat.
+ * ACES maps linear 0.18 to slightly *above* 0.18 and compresses hard past 1, so
+ * a lit surface has visible midtones and a specular highlight still rolls off to
+ * white. It is not the most accurate curve — see `ACES_COEFFICIENTS` — it is the
+ * one that makes a default frame look right without an exposure pass first.
+ */
+export const DEFAULT_TONE_MAP_OPERATOR: ToneMapOperator = 'aces';
+
+/**
+ * The HDR intermediate format a present pass gets when the caller does not say.
+ *
+ * `rgba16float` and not `rgba32float`: it is renderable, blendable, and
+ * **filterable** on the core profile, which matters because the tone map samples
+ * it, and 16 bits of float carries far more highlight range than 8-bit output can
+ * resolve. `rgba32float` costs twice the bandwidth and is the format most likely
+ * to be refused in compatibility mode.
+ */
+export const DEFAULT_HDR_FORMAT: GPUTextureFormat = 'rgba16float';
+
+/**
+ * The `toneOperator` slot's value for each curve.
+ *
+ * These numbers are the shader's `switch` cases, and the generated WGSL is built
+ * from *this object* rather than from literals beside it, so the two cannot
+ * drift. They are part of the material's public contract: writing `toneOperator` by
+ * name is not possible over the uniform boundary, so this is how a caller
+ * converts a string to the 4 bytes that go in the buffer — or, better, how
+ * {@link writeToneMapSlots} does it for them.
  */
 export const OPERATOR_IDS: Readonly<Record<ToneMapOperator, number>> = Object.freeze({
   none: 0,
@@ -191,14 +244,22 @@ export const HDR_TARGET_FORMATS: readonly GPUTextureFormat[] = [
 const ACES_FIT = Object.freeze({ a: 2.51, b: 0.03, c: 2.43, d: 0.59, e: 0.14 });
 
 /**
- * The sRGB transfer function, IEC 61966-2-1.
+ * The ACES coefficients, exported so a caller converting colours on the CPU
+ * agrees with the shader. The generated WGSL is built from this object, and a
+ * test re-derives the curve from it, so the number a reader sees is the number
+ * the shader has.
+ */
+export const ACES_COEFFICIENTS = ACES_FIT;
+
+/**
+ * The sRGB transfer function, IEC 61966-2-1, exported for the same reason.
  *
- * The piecewise form is not optional: the standard switches from the 12.92×power
- * law to a `1/2.4` power curve at 0.0031308, and using the power law everywhere
- * makes the darkest two or three code values of a gradient visibly wrong. The
- * exponent is written as `1.0 / 2.4` in the generated WGSL rather than as its
- * 17-digit decimal expansion, because the generated program is read by people and
- * the compiler folds the division exactly.
+ * The piecewise form is not optional: the standard switches from the 12.92×
+ * power law to a `1/2.4` power curve at 0.0031308, and using the power law
+ * everywhere makes the darkest two or three code values of a gradient visibly
+ * wrong. The exponent is written as `1.0 / 2.4` in the generated WGSL rather than
+ * as its 17-digit decimal expansion, because the generated program is read by
+ * people and the compiler folds the division exactly.
  */
 const SRGB = Object.freeze({
   linearThreshold: 0.0031308,
@@ -206,6 +267,34 @@ const SRGB = Object.freeze({
   powerScale: 1.055,
   powerOffset: 0.055,
 });
+
+/** The sRGB transfer constants, exported. See {@link ACES_COEFFICIENTS}. */
+export const SRGB_TRANSFER = SRGB;
+
+/**
+ * Linear light → sRGB, the encode half of the transfer function.
+ *
+ * Exists so that CPU-side colour work — a debug overlay, a colour picker, an
+ * averaging pass — produces the same numbers the shader does. It is the same
+ * piecewise form and the same constants, and {@link srgbToLinear} is its exact
+ * inverse for inputs in 0..1.
+ */
+export function linearToSrgb(linear: number): number {
+  if (!Number.isFinite(linear)) return 0;
+  const c = Math.max(0, linear);
+  return c < SRGB.linearThreshold
+    ? c * SRGB.linearScale
+    : SRGB.powerScale * Math.pow(c, 1 / 2.4) - SRGB.powerOffset;
+}
+
+/** sRGB → linear light, the decode half. Out of range, because the shader does. */
+export function srgbToLinear(encoded: number): number {
+  if (!Number.isFinite(encoded)) return 0;
+  const c = Math.max(0, encoded);
+  return c <= SRGB.linearThreshold * SRGB.linearScale
+    ? c / SRGB.linearScale
+    : Math.pow((c + SRGB.powerOffset) / SRGB.powerScale, 2.4);
+}
 
 // ---------------------------------------------------------------------------
 // Options
@@ -256,7 +345,7 @@ export interface TonemapOptions {
 export const TONEMAP_SLOTS: Readonly<{
   toneMap: 'f32';
   exposure: 'f32';
-  operator: 'i32';
+  toneOperator: 'i32';
   gamma: 'f32';
 }> = Object.freeze({
   /** Blend weight between the raw clamped scene (0) and the tone-mapped result (1). */
@@ -264,7 +353,7 @@ export const TONEMAP_SLOTS: Readonly<{
   /** Multiplier applied to the linear scene value before the curve. Read from the frame block. */
   exposure: 'f32',
   /** One of {@link OPERATOR_IDS}. Selected in the shader, not by pipeline. */
-  operator: 'i32',
+  toneOperator: 'i32',
   /** Exponent offset on the display transfer, applied after the sRGB encode. */
   gamma: 'f32',
 });
@@ -275,11 +364,11 @@ export const TONEMAP_SLOTS: Readonly<{
  */
 export const TONEMAP_MATERIAL_SLOTS: Readonly<{
   toneMap: 'f32';
-  operator: 'i32';
+  toneOperator: 'i32';
   gamma: 'f32';
 }> = Object.freeze({
   toneMap: TONEMAP_SLOTS.toneMap,
-  operator: TONEMAP_SLOTS.operator,
+  toneOperator: TONEMAP_SLOTS.toneOperator,
   gamma: TONEMAP_SLOTS.gamma,
 });
 
@@ -305,13 +394,12 @@ export const TONEMAP_BLOCK = buildUniformBlock('MaterialData', TONEMAP_MATERIAL_
 function toneMapPrelude(): string {
   return `
 // --- operator ids ---------------------------------------------------------
-// Generated from OPERATOR_IDS in src/material/tonemap.ts. Changing a number
-// here without changing that table is the one way these could drift, and the
-// two are generated from the same object.
-const OPERATOR_NONE : i32 = 0;
-const OPERATOR_ACES : i32 = 1;
-const OPERATOR_REINHARD : i32 = 2;
-const OPERATOR_LINEAR : i32 = 3;
+// Generated from OPERATOR_IDS in src/material/tonemap.ts, case by case, so
+// renaming a value there renames it here and adding one adds a const, a case,
+// and the entry in TONE_MAP_OPERATORS together. The switch and the id table
+// disagreeing is the kind of bug that takes a user's "Reinhard" dropdown to
+// produce ACES.
+${TONE_MAP_OPERATORS.map((op) => `const OPERATOR_${op.toUpperCase()} : i32 = ${OPERATOR_IDS[op]};`).join('\n')}
 
 // --- the sRGB transfer function -------------------------------------------
 // IEC 61966-2-1. Only referenced on a target that is not an *-srgb format;
@@ -423,7 +511,7 @@ let texel = textureSample(texture, textureSampler, in.clip.xy / vec2f(textureDim
 // alphaMode 'opaque' where the channel is ignored anyway.
 let scene = texel.rgb * frame.exposure;
 
-let mapped = applyOperator(scene, mat.operator);
+let mapped = applyOperator(scene, mat.toneOperator);
 
 // mat.toneMap = 1 is the tone-mapped image, 0 is the raw clamped scene.
 let graded = mix(clamp(scene, vec3f(0.0), vec3f(1.0)), mapped, mat.toneMap);
@@ -475,7 +563,7 @@ export function tonemapMaterialSpec(opts: TonemapOptions = {}): MaterialSpec {
       // a material slot of that name is rejected. The fragment stage reads
       // `frame.exposure` instead, which is the same value the renderer writes.
       toneMap: { type: TONEMAP_MATERIAL_SLOTS.toneMap, default: 1 },
-      operator: { type: TONEMAP_MATERIAL_SLOTS.operator, default: OPERATOR_IDS[operator] },
+      toneOperator: { type: TONEMAP_MATERIAL_SLOTS.toneOperator, default: OPERATOR_IDS[operator] },
       gamma: { type: TONEMAP_MATERIAL_SLOTS.gamma, default: gamma },
     },
     textures: {
@@ -517,6 +605,94 @@ export function tonemapMaterial(
   opts: TonemapOptions = {},
 ): Promise<Material> {
   return Material.create(device, tonemapMaterialSpec(opts));
+}
+
+// ---------------------------------------------------------------------------
+// The renderer-facing surface
+//
+// `PresentPass` is a whole extra module of its own and it is not this file's
+// business, but it cannot wire tone mapping on by default without a documented
+// default and a validated way to build one. That is exactly what is here, and
+// nothing more: two pure functions and four constants.
+// ---------------------------------------------------------------------------
+
+/** {@link TonemapOptions} with every field filled in. */
+export interface ResolvedTonemapOptions {
+  readonly hdrFormat: GPUTextureFormat;
+  readonly operator: ToneMapOperator;
+  readonly exposure: number;
+  readonly gamma: number;
+  readonly targetFormat: GPUTextureFormat;
+}
+
+/**
+ * Fills in every default and validates, so a renderer can turn tone mapping on
+ * with one call and never re-derive what "on" means.
+ *
+ * ```ts
+ * const pass = await PresentPass.create(device, {
+ *   target,
+ *   hdr: true,
+ *   toneMapping: resolveTonemapOptions({ targetFormat: target.format }),
+ * });
+ * ```
+ *
+ * **Pass `targetFormat` from the target you are actually presenting into.** It
+ * is the one option whose wrong value produces no error at all: the field decides
+ * whether the sRGB encode is done in the shader or by the hardware, so a mismatch
+ * is a washed-out or far-too-dark image with nothing to report. Omitting it
+ * falls back to the canvas preferred format, which is the right answer only when
+ * the target *is* the canvas.
+ */
+export function resolveTonemapOptions(opts: TonemapOptions = {}): ResolvedTonemapOptions {
+  const resolved: ResolvedTonemapOptions = {
+    hdrFormat: opts.hdrFormat ?? DEFAULT_HDR_FORMAT,
+    operator: opts.operator ?? DEFAULT_TONE_MAP_OPERATOR,
+    exposure: opts.exposure ?? 1,
+    gamma: opts.gamma ?? 0,
+    targetFormat: opts.targetFormat ?? preferredFormat(),
+  };
+  // The same checks the spec builder makes, so validating here is not optional:
+  // a caller that only ever builds options and never a spec still must not be
+  // able to construct a tone map the shader will reject.
+  assertHDRFormat(resolved.hdrFormat);
+  assertOperator(resolved.operator);
+  assertExposure(resolved.exposure);
+  assertGamma(resolved.gamma);
+  return resolved;
+}
+
+/**
+ * The minimum a target must provide for {@link writeToneMapSlots}.
+ *
+ * `Material` satisfies it structurally, and so does a three-line object literal
+ * in a test — which is the point of declaring an interface here rather than
+ * importing `Material`: this module stays free of a dependency on the compiled
+ * shader type, so a caller can retune a pass without pulling `material.ts` into
+ * their bundle for a type.
+ */
+export interface ToneMapSlots {
+  setSlot(name: string, value: number): void;
+}
+
+/**
+ * Writes a tone map's retunable slots in one call, and nothing else.
+ *
+ * **Exposure is not written here**, and that is not an oversight: `exposure` is
+ * a reserved field of the generated frame block, one value for the whole frame
+ * rather than one per material, and the frame block is written by the renderer
+ * on every frame — so a value written here would be overwritten before the next
+ * draw. `PresentPass.setExposure` exists for exactly that, and re-asserts the
+ * value on every `render()`.
+ *
+ * Three `setSlot` calls, and the material's dirty range collapses to the twelve
+ * bytes of its own block.
+ */
+export function writeToneMapSlots(target: ToneMapSlots, opts: TonemapOptions = {}): void {
+  const resolved = resolveTonemapOptions(opts);
+  target.setSlot('toneMap', 1);
+  target.setSlot('toneOperator', OPERATOR_IDS[resolved.operator]);
+  target.setSlot('gamma', resolved.gamma);
 }
 
 // ---------------------------------------------------------------------------

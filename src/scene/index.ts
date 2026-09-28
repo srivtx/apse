@@ -52,6 +52,7 @@ export {
   OBJECT_UNIFORM_STRIDE,
   OBJECT_UNIFORM_STRIDE_F32,
   OBJECT_UNIFORM_SIZE,
+  MIN_OBJECT_UNIFORM_STRIDE,
   // Types
   type SceneOptions,
 } from './graph.ts';

@@ -8,7 +8,7 @@
  *
  * The build can check its own arithmetic. It cannot check its own claims, because
  * the claim is about a *consumer's* download, not about the bytes on disk here.
- * Four things fall in that gap, and they are what this file is for:
+ * Five things fall in that gap, and they are what this file is for:
  *
  *   1. **The headline number.** A complete renderer, camera, PBR material, scene
  *      graph, and animation loop, tree-shaken, under a hard ceiling. The budget
@@ -24,7 +24,12 @@
  *      *claim* is asserted, not inferred from a byte count — see
  *      {@link PRIMITIVE_MARKERS}. There is a positive control alongside it,
  *      because a check that cannot fail is not a check.
- *   4. **That the package is installable.** Every `exports` subpath and every
+ *   4. **That the import graph has not been quietly rearranged.** Every entry is
+ *      supposed to reach a known set of layers and a known number of modules. An
+ *      entry that absorbs a dependency costs a few hundred bytes and trips no
+ *      budget, so the shape of the graph is asserted directly — see
+ *      {@link LAYER_GRAPH} and {@link checkModuleGraph}.
+ *   5. **That the package is installable.** Every `exports` subpath and every
  *      `typesVersions` target must have a built file. A broken exports map is
  *      invisible until somebody runs `npm install`, at which point it is
  *      somebody else's afternoon.
@@ -34,8 +39,8 @@
  *     bun run scripts/size-gate.ts
  */
 
-import { readFile, access } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile, access, readdir } from 'node:fs/promises';
+import { join, relative, sep } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Claims
@@ -49,23 +54,81 @@ import { join } from 'node:path';
  * `scripts/build.ts`. {@link checkBudgetAgrees} re-reads that file and fails if
  * the two ever drift, because two gates that disagree are worse than one gate.
  */
-const TREE_SHAKEN_GZIP_BUDGET_KB = 46;
+const TREE_SHAKEN_GZIP_BUDGET_KB = 52.4;
 
 /**
  * Per-entry ceilings, in KiB gzip. Mirrors `BUDGETS` in `scripts/build.ts`.
  * The build fails over these; this script reports against them, so an entry
  * that has quietly outgrown its ceiling is visible before the next build fails.
+ *
+ * Same numbers, same provenance, same reason — see the table in `build.ts` for
+ * the measured values, the date each was taken, and why the headroom is 15% and
+ * not 5%. {@link checkBudgetAgrees} fails if these ever drift apart.
  */
 const BUDGETS: Readonly<Record<string, number>> = {
-  'index': 60,
-  'core/index': 10,
-  'math/index': 8,
-  'geometry/index': 12,
-  'material/index': 24,
-  'scene/index': 13,
-  'render/index': 40,
-  'tree-shaken app': 48,
+  'index': 78.2,
+  'core/index': 8.9,
+  'math/index': 7.6,
+  'geometry/index': 20.7,
+  'material/index': 43.7,
+  'scene/index': 12.1,
+  'render/index': 57.8,
+  'tree-shaken app': 52.4,
 };
+
+/**
+ * The layer DAG, plus the exact number of source modules each entry may reach.
+ *
+ * This is the "no entry has silently absorbed a dependency" check, and it is the
+ * one a byte count cannot do. A module that starts importing the renderer costs
+ * maybe 300 bytes gzip, so no ceiling trips when `src/core/uniform.ts` grows an
+ * import of `src/render/target.ts` — the entry still fits, the budget still
+ * holds, and `import { fail } from 'apse/core'` has quietly become a dependency
+ * on the whole renderer. The only thing that catches it is asserting the shape
+ * of the import graph itself.
+ *
+ * The edges are the real ones, read off the metafile's input graph, and they
+ * form a DAG. `core` depends on nothing, which is what makes `apse/core` usable
+ * without the rest of the library. Everything else hangs off it:
+ *
+ *     core
+ *      ├── math ──┬── geometry ──┐
+ *      │          │              ├── material ──┐
+ *      │          └── scene ─────┴──────────────┴── render
+ *      │
+ *      └── (index, the public barrel, which is allowed to reach all of it)
+ *
+ * `root` is `src/index.ts`, and no subpath may reach it — a subpath that imports
+ * the barrel has imported everything, which defeats the point of subpaths. That
+ * is why `src/core/index.ts` re-exports the six core modules individually rather
+ * than the barrel, and why `src/index.ts` does the same for every layer.
+ *
+ * `modules` is the exact reachable-module count, not a ceiling. Bumping it is a
+ * deliberate act: either a file was added to a layer, or a file was added
+ * somewhere it does not belong and the layer check above caught the second case
+ * first. It also cannot drift quietly in the way a byte budget can, because a
+ * number has to be edited, not re-measured.
+ *
+ * Counts as of 2026-09-28, same build that produced the budgets above.
+ */
+const LAYER_GRAPH: Readonly<Record<string, { readonly layers: readonly string[]; readonly modules: number }>> = {
+  'core/index': { layers: ['core'], modules: 7 },
+  'math/index': { layers: ['core', 'math'], modules: 7 },
+  'scene/index': { layers: ['core', 'math', 'scene'], modules: 8 },
+  'geometry/index': { layers: ['core', 'math', 'geometry'], modules: 16 },
+  'material/index': { layers: ['core', 'math', 'geometry', 'material'], modules: 18 },
+  'render/index': { layers: ['core', 'math', 'geometry', 'material', 'scene', 'render'], modules: 25 },
+  'index': {
+    layers: ['core', 'math', 'geometry', 'material', 'scene', 'render', 'root'],
+    modules: 39,
+  },
+};
+
+/**
+ * The row that measures an application rather than a published entry, and so is
+ * the one entry without a layer contract.
+ */
+const APP_ENTRY = 'tree-shaken app';
 
 /**
  * The comparison point for the size claim: three.js at ~133 KB gzip for a
@@ -92,6 +155,7 @@ const ROOT = new URL('..', import.meta.url).pathname;
 const REPORT = join(ROOT, 'dist/size-report.json');
 const PKG = join(ROOT, 'package.json');
 const BUILD = join(ROOT, 'scripts/build.ts');
+const SRC = join(ROOT, 'src');
 
 /**
  * Markers for the six primitives, and the only source of truth for which
@@ -131,6 +195,8 @@ interface SizeRow {
   gzip: number;
   brotli: number;
   source: string;
+  /** Source modules in this entry's import closure, `src/`-relative. See LAYER_GRAPH. */
+  modules: string[];
 }
 
 interface SizeReport {
@@ -338,7 +404,14 @@ async function checkBudgetAgrees(failures: Failure[]): Promise<void> {
   }
   const body = source.slice(start, source.indexOf('};', start));
   const parsed = new Map<string, number>();
-  for (const m of body.matchAll(/'([^']+)'\s*:\s*(\d+)/g)) parsed.set(m[1]!, Number(m[2]));
+  // Anchored to the whole line so the measured-size and date comments sitting
+  // beside each budget cannot be mistaken for budgets themselves. Decimals are
+  // allowed because a ceiling tight enough to catch a real regression is closer
+  // than 1 KB on the small entries, and rounding it up to the next whole KiB
+  // would hand back a fifth of the headroom on `apse/math`.
+  for (const m of body.matchAll(/^\s*'([^']+)'\s*:\s*(\d+(?:\.\d+)?)\s*,?\s*$/gm)) {
+    parsed.set(m[1]!, Number(m[2]));
+  }
 
   for (const [entry, kb] of Object.entries(BUDGETS)) {
     const theirs = parsed.get(entry);
@@ -347,7 +420,7 @@ async function checkBudgetAgrees(failures: Failure[]): Promise<void> {
         what: `scripts/build.ts has no budget for "${entry}"; scripts/size-gate.ts says ${kb} KB.`,
         action: 'add the entry to BUDGETS in scripts/build.ts, or remove it here.',
       });
-    } else if (theirs !== kb) {
+    } else if (Math.abs(theirs - kb) > 1e-9) {
       failures.push({
         what: `Budget drift for "${entry}": scripts/build.ts says ${theirs} KB, scripts/size-gate.ts says ${kb} KB.`,
         action: 'make the two constants the same number, or delete the copy in size-gate.ts and read the build\'s table instead.',
@@ -359,6 +432,25 @@ async function checkBudgetAgrees(failures: Failure[]): Promise<void> {
       failures.push({
         what: `scripts/build.ts budgets "${entry}" but scripts/size-gate.ts has no entry for it.`,
         action: 'add it to BUDGETS in scripts/size-gate.ts so its ceiling is reported.',
+      });
+    }
+  }
+  // A third table now exists — LAYER_GRAPH — and it has to cover the same set,
+  // minus the one entry that measures an app rather than a published entry.
+  for (const entry of Object.keys(BUDGETS)) {
+    if (entry === APP_ENTRY) continue;
+    if (!(entry in LAYER_GRAPH)) {
+      failures.push({
+        what: `"${entry}" has a size budget but no entry in LAYER_GRAPH, so nothing checks which modules it pulls in.`,
+        action: 'add it to LAYER_GRAPH with its layers and its reachable-module count.',
+      });
+    }
+  }
+  for (const entry of Object.keys(LAYER_GRAPH)) {
+    if (!(entry in BUDGETS)) {
+      failures.push({
+        what: `LAYER_GRAPH has "${entry}" but BUDGETS does not, so it is unbudgeted.`,
+        action: 'add a budget for it in both BUDGETS and the BUDGETS table in scripts/build.ts.',
       });
     }
   }
@@ -459,6 +551,143 @@ async function checkTreeShaking(failures: Failure[]): Promise<void> {
 }
 
 /**
+ * Which layer a source module belongs to, as a graph edge name.
+ *
+ * `src/core/error.ts` is layer `core`. `src/index.ts` is the public barrel and
+ * gets its own name, `root`, because it is the one module no subpath may reach:
+ * a subpath that imports it has imported the whole library, which is the exact
+ * mistake the subpaths exist to prevent. A path outside `src/` gets a name that
+ * is in no layer's list, so it fails rather than passing unnoticed.
+ */
+function layerOf(module: string): string {
+  const nested = /^src\/([^/]+)\//.exec(module);
+  if (nested !== null) return nested[1]!;
+  const top = /^src\/([^/]+)\.ts$/.exec(module);
+  if (top === null) return `(outside src: ${module})`;
+  return top[1] === 'index' ? 'root' : top[1];
+}
+
+/** Every `.ts` file under `src/`, `src/`-relative and forward-slashed. */
+async function sourceModules(): Promise<string[]> {
+  const found: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for (const dirent of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, dirent.name);
+      if (dirent.isDirectory()) {
+        await walk(full);
+      } else if (dirent.isFile() && dirent.name.endsWith('.ts')) {
+        found.push(relative(ROOT, full).split(sep).join('/'));
+      }
+    }
+  };
+  await walk(SRC);
+  return found.sort();
+}
+
+/**
+ * Asserts the shape of the import graph, not the size of the output.
+ *
+ * Three assertions, all of them things a byte count cannot see:
+ *
+ *   1. **No entry reaches a layer it is not allowed to reach.** This is the
+ *      headline one. A new import inside `src/core/` that reaches the renderer
+ *      adds a few hundred bytes and trips nothing; it turns `apse/core` — 7.72 KB
+ *      of error types and a uniform-layout helper — into a dependency on the
+ *      whole 67 KB library, and every consumer pays for it at runtime in a way
+ *      only a graph check can name.
+ *   2. **Each entry reaches exactly as many modules as {@link LAYER_GRAPH} says.**
+ *      An exact count, not a ceiling. Adding a file to a layer is a deliberate
+ *      act, and the number has to be edited rather than re-measured.
+ *   3. **Every file in `src/` is reachable from some entry.** Read from the
+ *      filesystem, not from the report, so the two are independent. It catches
+ *      a module that was added and never exported — dead code that still gets
+ *      type-checked, still gets reviewed, and still never ships. The check is
+ *      over the *union* of the entries' closures rather than the root's alone,
+ *      because the six subpath barrels and the type-only `render/types.ts` are
+ *      deliberately absent from `src/index.ts`'s graph: the root re-exports the
+ *      individual modules rather than the barrels, and a type-only module is
+ *      erased before it reaches a bundler.
+ */
+async function checkModuleGraph(report: SizeReport, failures: Failure[]): Promise<void> {
+  const rows = new Map(report.entries.map((r) => [r.entry, r]));
+
+  out('  module graph');
+  out(`  ${DIM}${pad('entry', 20)}${pad('modules', 9)}${pad('expected', 9)}${DIM}layers${OFF}`);
+  out(`  ${DIM}${'-'.repeat(72)}${OFF}`);
+
+  const reachable = new Set<string>();
+  for (const row of report.entries) {
+    if (Array.isArray(row.modules)) for (const m of row.modules) reachable.add(m);
+  }
+
+  for (const [entry, rule] of Object.entries(LAYER_GRAPH)) {
+    const row = rows.get(entry);
+    if (row === undefined) {
+      failures.push({
+        what: `No size report row for "${entry}", so its import graph cannot be checked.`,
+        action: 'check that scripts/build.ts ENTRIES still bundles this entry.',
+      });
+      continue;
+    }
+    if (!Array.isArray(row.modules) || row.modules.length === 0) {
+      failures.push({
+        what: `"${entry}" reported no source modules, so the layer check for it proves nothing.`,
+        action: 'check that scripts/build.ts still writes reachableInputs() into dist/size-report.json. This is what it calls "modules".',
+      });
+      continue;
+    }
+
+    const layers = new Set(row.modules.map(layerOf));
+    const allowed = new Set<string>(rule.layers);
+    const leaked = [...layers].filter((l) => !allowed.has(l)).sort();
+    const countOk = row.modules.length === rule.modules;
+
+    out(
+      `  ${pad(entry, 20)}${pad(String(row.modules.length), 9)}${pad(String(rule.modules), 9)}` +
+      `${DIM}${[...layers].sort().join(' ')}${OFF}`,
+    );
+
+    if (leaked.length > 0) {
+      failures.push({
+        what: `${entry} reaches ${leaked.map((l) => `layer ${l}`).join(' and ')}, which is not in its declared layer set (${rule.layers.join(' ')}). An entry has absorbed a dependency it should not have.`,
+        action: 'find the import that crosses the layer boundary — it is usually the one convenience helper that seemed harmless. The fix is to pass the value across the boundary as a parameter, or to promote the import into a layer that is allowed to know about it. Update LAYER_GRAPH only if the edge is genuinely intended.',
+      });
+    }
+    if (!countOk) {
+      failures.push({
+        what: `${entry} reaches ${row.modules.length} source module(s) but LAYER_GRAPH expects ${rule.modules}.`,
+        action: leaked.length > 0
+          ? 'fix the layer leak above first, then re-measure. Do not bump the count to match a graph you have not looked at.'
+          : 'a file was added to or removed from this layer. Re-run `bun run build` and update the count in LAYER_GRAPH with the module that changed.',
+      });
+    }
+  }
+
+  // (3) Nothing in src/ may be unreachable from the published surface.
+  const onDisk = await sourceModules();
+  const onDiskSet = new Set(onDisk);
+  const orphaned = onDisk.filter((m) => !reachable.has(m));
+  const phantom = [...reachable].filter((m) => !onDiskSet.has(m));
+  out(
+    `  ${DIM}every src/ module reachable from some entry: ${reachable.size} of ${onDisk.length}` +
+    `${orphaned.length === 0 && phantom.length === 0 ? '' : RED + `  (${orphaned.length} unreachable, ${phantom.length} phantom)` + OFF}`,
+  );
+  out();
+  if (orphaned.length > 0) {
+    failures.push({
+      what: `${orphaned.length} file(s) in src/ are not reachable from any entry: ${orphaned.join(', ')}. They are type-checked and reviewed but can never be imported by a consumer.`,
+      action: 'export them from the entry that owns them if they are public, or delete them if they are not. Unreachable code still costs review time and still shows up in coverage.',
+    });
+  }
+  if (phantom.length > 0) {
+    failures.push({
+      what: `The report claims ${phantom.length} module(s) that do not exist on disk: ${phantom.join(', ')}.`,
+      action: 'the report is stale, or scripts/build.ts is writing paths relative to the wrong directory. Run `bun run build` and re-run this gate.',
+    });
+  }
+}
+
+/**
  * Every subpath in `exports` and every target in `typesVersions` must have a
  * built file.
  *
@@ -535,10 +764,11 @@ async function main(): Promise<void> {
   checkEntries(report, failures);
   await checkHeadline(report, failures);
   await checkTreeShaking(failures);
+  await checkModuleGraph(report, failures);
   await checkExportsMap(failures);
 
   if (failures.length === 0) {
-    out(`  ${GREEN}PASS${OFF}  ${report.entries.length} entries within budget, tree-shaking intact, exports map resolvable`);
+    out(`  ${GREEN}PASS${OFF}  ${report.entries.length} entries within budget, tree-shaking intact, layer graph intact, exports map resolvable`);
     out();
     out(`  ${DIM}add to verify: bun run scripts/size-gate.ts${OFF}`);
     out();

@@ -184,6 +184,56 @@ export interface RenderTarget {
 // Frame description
 // ---------------------------------------------------------------------------
 
+/**
+ * The GPU-timing half of `FrameStats`, defined here rather than in
+ * `renderer.ts` so that the *absence* of a measurement is a type decision made
+ * in the layer that owns the absence.
+ *
+ * `gpu` and `averageGpu` are `number | null`, and that is a **breaking change**
+ * from the `number` they were. It is the honest type, and the reason is
+ * structural rather than stylistic:
+ *
+ *   - `timestamp-query` is an optional feature on roughly half of all devices,
+ *     and apse never requires it — requiring it would make `requestDevice()`
+ *     reject on exactly the phones the library exists to serve.
+ *   - A hardcoded `0` reads, to any consumer, as "the GPU was idle". `stats.gpu
+ *     === 0` is a completely ordinary line of instrumentation code, and it
+ *     concludes that the GPU is not the problem — which is the one conclusion a
+ *     renderer must never help someone reach.
+ *   - `null` and `0` are different facts: no measurement, versus a measurement of
+ *     nothing. A driver that quantises timestamps to 100 µs really does report
+ *     0 for a trivial frame, and that 0 is data.
+ *
+ * So a caller migrates by handling the null:
+ *
+ *     stats.gpu === null ? 'no GPU timing on this device' : `${stats.gpu.toFixed(2)} ms`
+ *
+ * `renderer.ts` declares `FrameStats extends FrameTimingStats` so there is one
+ * definition of the shape rather than two that can drift.
+ */
+export interface FrameTimingStats {
+  /**
+   * GPU time for the frame, in milliseconds, or `null` for no measurement.
+   *
+   * Measured by timestamp query and therefore 1–2 frames late: the value comes
+   * from a buffer the GPU writes after the frame is submitted, and the frame
+   * loop never waits for it. Treat it as a trend, not as a per-frame verdict.
+   */
+  readonly gpu: number | null;
+  /** Mean of the last `sampleSize` readings, or `null` while none have arrived. */
+  readonly averageGpu: number | null;
+  /**
+   * True when the device has `timestamp-query` **and** a timer is running.
+   *
+   * A capability flag rather than a derived value, so a caller can say "this
+   * device cannot report GPU time" without inferring it from a `null` that might
+   * also mean "not read back yet". The `gpu` budget in `RenderBudget` is checked
+   * only when this is true, because a budget that cannot be measured must not
+   * report a breach of a number it never had.
+   */
+  readonly gpuTimingAvailable: boolean;
+}
+
 /** Everything that changes once per frame. Written into the frame uniform. */
 export interface FrameState {
   readonly view: Float32Array;

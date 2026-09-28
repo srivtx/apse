@@ -39,7 +39,10 @@
  * descriptor field but not the object that had the bug.
  */
 
-import { fail } from '../core/error.ts';
+import { AseError, fail } from '../core/error.ts';
+import type { AseErrorCode } from '../core/error.ts';
+import { err, ok } from '../core/result.ts';
+import type { Result } from '../core/result.ts';
 
 // ---------------------------------------------------------------------------
 // Feature level
@@ -71,6 +74,27 @@ export const TEXTURE_USAGE = Object.freeze({
   TEXTURE_BINDING: typeof GPUTextureUsage === 'undefined' ? 0x04 : GPUTextureUsage.TEXTURE_BINDING,
   RENDER_ATTACHMENT: typeof GPUTextureUsage === 'undefined' ? 0x10 : GPUTextureUsage.RENDER_ATTACHMENT,
 });
+
+/**
+ * `GPUBufferUsage` and `GPUMapMode`, resolved the same way and for the same
+ * reason as {@link TEXTURE_USAGE}: the spec values are constants, and reading
+ * them through the globals makes every call site untestable outside a browser.
+ * `QUERY_RESOLVE` in particular is the bit that makes a timestamp query set
+ * readable at all, and it has no `TEXTURE_USAGE` equivalent.
+ */
+export const BUFFER_USAGE = Object.freeze({
+  MAP_READ: typeof GPUBufferUsage === 'undefined' ? 0x01 : GPUBufferUsage.MAP_READ,
+  COPY_SRC: typeof GPUBufferUsage === 'undefined' ? 0x04 : GPUBufferUsage.COPY_SRC,
+  COPY_DST: typeof GPUBufferUsage === 'undefined' ? 0x08 : GPUBufferUsage.COPY_DST,
+  QUERY_RESOLVE: typeof GPUBufferUsage === 'undefined' ? 0x200 : GPUBufferUsage.QUERY_RESOLVE,
+});
+
+export const MAP_MODE = Object.freeze({
+  READ: typeof GPUMapMode === 'undefined' ? 0x01 : GPUMapMode.READ,
+});
+
+/** Bytes in one resolved timestamp. A query result is a `uint64`. */
+export const TIMESTAMP_BYTES = 8;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -385,6 +409,193 @@ export function formatLimitRequest(limits: Partial<Record<string, number>>): str
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+/**
+ * The optional device features apse knows how to read.
+ *
+ * **None of them are ever required at device creation**, deliberately: requiring
+ * one means `requestDevice()` rejects on exactly the devices that lack it, which
+ * is the population apse exists to serve. They are *detected* and reported
+ * through {@link DeviceCapabilities}, and a caller that needs one asks for it
+ * with {@link requireFeature} — which returns a failure rather than throwing,
+ * because a phone without `float32-filterable` is a fact, not a bug.
+ */
+export const ASE_FEATURES = [
+  'timestamp-query',
+  'float32-filterable',
+  'depth32float-stencil8',
+  'indirect-first-instance',
+  'texture-compression-bc',
+  'texture-compression-astc',
+  'texture-compression-etc2',
+  'subgroups',
+] as const;
+
+export type AseFeatureName = (typeof ASE_FEATURES)[number];
+
+/** The `Result` failure code {@link requireFeature} returns. */
+export type GpuFeatureFailure = 'GPU_FEATURE_UNSUPPORTED';
+
+/**
+ * Checks for an optional feature, as a value rather than an exception.
+ *
+ * The project rule is that a wrong argument throws and a missing capability
+ * returns, and this is the canonical missing capability in the whole library: a
+ * phone that does not implement `float32-filterable` is the world being what it
+ * is. So this hands back `ok(undefined)` or an `Err` carrying the catalog's
+ * capability detail, and the caller branches.
+ *
+ *     const r = requireFeature(gpu, 'timestamp-query');
+ *     if (isErr(r)) { stats.gpu = null; } else { timer = GpuTimer.create(gpu); }
+ *
+ * A name outside {@link ASE_FEATURES} is a *wrong argument* rather than a
+ * missing capability, and throws `OPTION_UNKNOWN` — the same split apse applies
+ * everywhere else.
+ */
+export function requireFeature(
+  device: GPUDevice,
+  name: AseFeatureName,
+): Result<void, GpuFeatureFailure> {
+  if (!ASE_FEATURES.includes(name)) {
+    fail('OPTION_UNKNOWN',
+      `requireFeature() was given the feature "${name}", which is not one of: ${ASE_FEATURES.join(', ')}.`, {
+      why: 'apse only reports on features it has a fallback for. An unrecognised name would resolve to "not supported" and be indistinguishable from a device that genuinely lacks it, so a typo becomes a silent feature downgrade.',
+      fix: `Use one of: ${ASE_FEATURES.join(', ')}. A feature apse does not know about has no correct behaviour, which is the same rule that keeps requiredLimits curated.`,
+    });
+  }
+  if (hasFeature(device, name)) return ok(undefined);
+  return err('GPU_FEATURE_UNSUPPORTED',
+    `This device does not implement the optional feature "${name}".`,
+    `Carry on without it, or pick a path that needs it only when ${JSON.stringify(name)} is present — AseDevice.capabilities has the answer for every optional feature apse tracks.`,
+    { feature: name, required: name, available: availableFeatures(device).join(', ') || 'none' });
+}
+
+/** True when the device was created with `name`. */
+export function hasFeature(device: GPUDevice, name: AseFeatureName): boolean {
+  const features = device.features as { has(name: GPUFeatureName): boolean };
+  return typeof features?.has === 'function' && features.has(name);
+}
+
+/** Every optional feature this device has, sorted, for diagnostics. */
+export function availableFeatures(device: GPUDevice): string[] {
+  return ASE_FEATURES.filter((name) => hasFeature(device, name));
+}
+
+/** Texture-compression families, as the feature names they arrive under. */
+export type TextureCompressionFamily = 'bc' | 'astc' | 'etc2';
+
+const COMPRESSION_FEATURE: Readonly<Record<TextureCompressionFamily, AseFeatureName>> = Object.freeze({
+  bc: 'texture-compression-bc',
+  astc: 'texture-compression-astc',
+  etc2: 'texture-compression-etc2',
+});
+
+/**
+ * Every capability the renderer branches on, resolved once at device creation.
+ *
+ * Structured rather than a bag of booleans on the device, because the renderer's
+ * decisions are all of the form "which of these two paths may I take", and a
+ * `true` with no explanation is a trap. Each field is a fact about *this*
+ * device, read from the device rather than assumed from the feature level —
+ * except where a value is genuinely per-level, which is said in the field's own
+ * comment.
+ */
+export interface DeviceCapabilities {
+  /** Which set of limits and validation rules the device was created under. */
+  readonly featureLevel: FeatureLevel;
+  /**
+   * `timestamp-query`. `false` on roughly half of all devices, so anything
+   * that reports a GPU time must handle its absence with a *null*, never a 0.
+   */
+  readonly timestampQuery: boolean;
+  /**
+   * Storage buffers a vertex shader may read.
+   *
+   * **Zero in compatibility mode**, and that is the single most portable-bug in
+   * WebGPU: a vertex shader that reads a storage buffer compiles on a laptop and
+   * fails to compile on a phone. apse's instancing path binds per-instance
+   * transforms as a *vertex buffer* with `stepMode: 'instance'` precisely so
+   * this number never has to be greater than zero. See
+   * {@link COMPAT_VERTEX_STAGE_LIMITS}.
+   */
+  readonly storageBuffersInVertexStage: number;
+  /** Storage textures a vertex shader may read. Zero in compatibility mode. */
+  readonly storageTexturesInVertexStage: number;
+  /**
+   * Which compressed texture formats can be sampled here.
+   *
+   * `bc` is desktop, `astc` is modern mobile, `etc2` is the GLES 3.1 baseline
+   * that compatibility mode targets. An empty list means every texture in the
+   * app has to be `rgba8unorm`, which is a real portability constraint and not
+   * something to discover on a device you do not have.
+   */
+  readonly textureCompression: readonly TextureCompressionFamily[];
+  /** `rgba32float` usable as a sampled texture with a linear sampler. */
+  readonly float32Filterable: boolean;
+  /**
+   * Largest single storage-buffer binding. 128 MiB on both profiles, so this is
+   * here because the renderer *asks* what it needs rather than assuming.
+   */
+  readonly maxStorageBufferBindingSize: number;
+  /** Vertex buffer slots available. 8 on both profiles. */
+  readonly maxVertexBuffers: number;
+  /**
+   * Whether per-instance vertex buffers are possible: slot 0 for the mesh and
+   * slot 1 for the instances, so at least 2.
+   */
+  readonly instancing: boolean;
+  /** The 2D texture extent ceiling. 4096 in compatibility mode, 8192 in core. */
+  readonly maxTextureDimension2D: number;
+}
+
+/**
+ * Resolves {@link DeviceCapabilities} from a live device.
+ *
+ * The two per-stage vertex limits are read defensively and fall back by feature
+ * level, because the IDL marks them as not yet universally implemented: an
+ * implementation that omits the property entirely would otherwise read as
+ * `undefined`, and `undefined >= 1` is false, so the fallback is the safe
+ * direction — a capability claimed absent is a path not taken, while one claimed
+ * present is a shader that fails to compile.
+ */
+export function readCapabilities(device: GPUDevice, featureLevel: FeatureLevel): DeviceCapabilities {
+  const limits = device.limits as unknown as Partial<Record<string, number>>;
+  const vertexStorage = numberOr(
+    limits.maxStorageBuffersInVertexStage,
+    featureLevel === 'compatibility'
+      ? COMPAT_VERTEX_STAGE_LIMITS.maxStorageBuffersInVertexStage
+      : (limits.maxStorageBuffersPerShaderStage ?? 0),
+  );
+  const vertexTextures = numberOr(
+    limits.maxStorageTexturesInVertexStage,
+    featureLevel === 'compatibility'
+      ? COMPAT_VERTEX_STAGE_LIMITS.maxStorageTexturesInVertexStage
+      : (limits.maxStorageTexturesPerShaderStage ?? 0),
+  );
+  const maxVertexBuffers = numberOr(limits.maxVertexBuffers, 0);
+  return Object.freeze({
+    featureLevel,
+    timestampQuery: hasFeature(device, 'timestamp-query'),
+    storageBuffersInVertexStage: vertexStorage,
+    storageTexturesInVertexStage: vertexTextures,
+    textureCompression: (Object.keys(COMPRESSION_FEATURE) as TextureCompressionFamily[])
+      .filter((family) => hasFeature(device, COMPRESSION_FEATURE[family])),
+    float32Filterable: hasFeature(device, 'float32-filterable'),
+    maxStorageBufferBindingSize: numberOr(limits.maxStorageBufferBindingSize, 0),
+    maxVertexBuffers,
+    // Two slots: mesh in 0, instances in 1. See the slot-1 comment in types.ts.
+    instancing: maxVertexBuffers >= 2,
+    maxTextureDimension2D: numberOr(limits.maxTextureDimension2D, COMPAT_LIMITS.maxTextureDimension2D),
+  });
+}
+
+function numberOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+// ---------------------------------------------------------------------------
 // Options and the device handle
 // ---------------------------------------------------------------------------
 
@@ -430,6 +641,19 @@ export interface DeviceOptions {
   /** Receive GPU validation errors. Development aid. */
   onValidationError?: (message: string) => void;
   /**
+   * Receive every uncaptured WebGPU error, already classified into an
+   * {@link AseError} from the catalog.
+   *
+   * The difference from `onValidationError`: this one carries a `code`, a `why`,
+   * a `fix`, and the raw driver text as structured detail, so a bug report does
+   * not need a human to classify the message. An out-of-memory condition becomes
+   * `BUDGET_EXCEEDED` and a driver-internal error becomes `INTERNAL_INVARIANT`,
+   * because those are what they are — a validation error naming two format enums
+   * is not the only thing that can go wrong on a device, and treating an OOM as
+   * a "validation error" sends the reader looking in the wrong place.
+   */
+  onUncapturedError?: (error: AseError) => void;
+  /**
    * Called when the device is lost.
    *
    * This fires for `reason === 'destroyed'` too, because that is what
@@ -449,8 +673,31 @@ export interface AseDevice {
   /** The limits apse depends on, copied field by field. */
   readonly limits: AseLimits;
   readonly adapterInfo: { vendor: string; architecture: string; device: string; description: string };
+  /**
+   * Every capability the renderer branches on, resolved at creation.
+   *
+   * Branch on this rather than on the adapter: a capability is a property of the
+   * *device*, and the device is what a pipeline is compiled against.
+   */
+  readonly capabilities: DeviceCapabilities;
+  /** Kept for callers written against the first device API. See `capabilities`. */
   readonly hasTimestampQuery: boolean;
   readonly hasSubgroups: boolean;
+  /**
+   * The most recent uncaptured error or device loss, as a catalog-typed error.
+   *
+   * Non-null means the driver told this device something was wrong. It is kept
+   * rather than only reported, because the usual failure is nobody listening: a
+   * console warning scrolls away and the frame is still black an hour later.
+   */
+  readonly lastError: AseError | null;
+  /**
+   * Checks an optional feature without throwing on its absence.
+   *
+   * `requireFeature('float32-filterable')` returns `ok(undefined)` or an `Err`
+   * naming the feature. See the free function for the reasoning.
+   */
+  requireFeature(name: AseFeatureName): Result<void, GpuFeatureFailure>;
   /** Live objects in the shared object-uniform buffer. */
   readonly maxObjects: number;
   /** MSAA level this device was configured with. Pipelines must match it. */
@@ -509,6 +756,35 @@ const RENDERABLE_COLOR_FORMATS: readonly GPUTextureFormat[] = [
   'rgba8unorm-srgb',
   'rgba16float',
 ];
+
+/**
+ * The three `GPUError` classes, and what each one actually is.
+ *
+ * A tuple rather than an object per row because there are four fields and
+ * nothing here is read by name outside this file.
+ */
+const UNCAPTURED_ERRORS: Readonly<Record<string, {
+  code: AseErrorCode; label: string; why: string; fix: string;
+}>> = Object.freeze({
+  GPUValidationError: {
+    code: 'GPU_VALIDATION_FAILED',
+    label: 'Uncaptured WebGPU validation error',
+    why: 'Raised on the device timeline rather than through an error scope, so nothing on the call stack raised it. The object it names is invalid, and so is everything derived from it.',
+    fix: 'Read the raw driver text above: it names the object and the field. Nearly all of these are a descriptor apse built, and the label apse gave it is in the message.',
+  },
+  GPUOutOfMemoryError: {
+    code: 'BUDGET_EXCEEDED',
+    label: 'The GPU ran out of memory',
+    why: 'The device could not satisfy an allocation. On the hardware apse targets that is nearly always a framebuffer: a 4x rgba16float target at 4K is 132 MB of colour plus a resolve.',
+    fix: 'Lower maxPixelRatio, drop sampleCount to 1, or render at a lower internal resolution. maxBufferSize and maxTextureDimension2D in AseDevice.limits decide it.',
+  },
+  GPUInternalError: {
+    code: 'INTERNAL_INVARIANT',
+    label: 'The GPU driver raised an internal error',
+    why: 'The driver lost track of its own state. No descriptor apse built is wrong, and no amount of fixing apse code addresses it.',
+    fix: 'Report it with the adapter description from describeGpu(). A driver update usually fixes it; device.recover() clears it meanwhile.',
+  },
+});
 
 // ---------------------------------------------------------------------------
 // Development error scopes
@@ -613,8 +889,10 @@ class AseDeviceImpl implements AseDevice {
   readonly featureLevel: FeatureLevel;
   readonly limits: AseLimits;
   readonly adapterInfo: { vendor: string; architecture: string; device: string; description: string };
+  readonly capabilities: DeviceCapabilities;
   readonly hasTimestampQuery: boolean;
   readonly hasSubgroups: boolean;
+  lastError: AseError | null = null;
   readonly maxObjects: number;
   readonly sampleCount: 1 | 4;
   readonly maxPixelRatio: number;
@@ -663,8 +941,14 @@ class AseDeviceImpl implements AseDevice {
     // 44% of devices and its values are quantised to 100 us, so it is useless
     // as a gate; `subgroups` is Chromium-only. Requesting either would make
     // device creation fail outright on exactly the devices that lack them.
-    this.hasTimestampQuery = init.device.features.has('timestamp-query');
-    this.hasSubgroups = init.device.features.has('subgroups');
+    this.capabilities = readCapabilities(init.device, init.featureLevel);
+    this.hasTimestampQuery = this.capabilities.timestampQuery;
+    this.hasSubgroups = hasFeature(init.device, 'subgroups');
+  }
+
+  requireFeature(name: AseFeatureName): Result<void, GpuFeatureFailure> {
+    this.assertLive();
+    return requireFeature(this.device, name);
   }
 
   /**
@@ -685,6 +969,10 @@ class AseDeviceImpl implements AseDevice {
         // A destroyed device is an expected event, not a fault, but the canvas
         // is free either way once the device is gone.
         CONFIGURED.delete(this.canvas);
+        // Recorded before the callback so a handler that inspects `lastError`
+        // sees the loss, and so a silent device (no handler at all) still leaves
+        // a diagnosable trace on the handle.
+        if (info.reason !== 'destroyed') this.lastError = this.#lostError();
         const cb = this.#opts.onDeviceLost;
         if (cb === undefined) return;
         try {
@@ -696,23 +984,65 @@ class AseDeviceImpl implements AseDevice {
       .catch(() => {
         this.#lost = true;
         this.#lostMessage = 'the device was lost and the reason was not reported';
+        this.lastError = this.#lostError();
       });
 
     const onUncaptured = (event: GPUUncapturedErrorEvent): void => {
-      const name = event.error.constructor.name;
-      const message = `[${name}] ${event.error.message}`;
-      const cb = this.#opts.onValidationError;
-      if (cb === undefined) {
-        if (isDevelopmentMode()) console.warn(`apse: uncaptured WebGPU error — ${message}`);
+      const error = this.#classifyUncaptured(event.error);
+      this.lastError = error;
+      const cb = this.#opts.onUncapturedError;
+      if (cb !== undefined) {
+        try {
+          cb(error);
+        } catch {
+          /* ditto */
+        }
+      }
+      const legacy = this.#opts.onValidationError;
+      if (legacy === undefined) {
+        if (isDevelopmentMode()) console.warn(`apse: uncaptured WebGPU error — ${error.message}`);
         return;
       }
       try {
-        cb(message);
+        legacy(error.message);
       } catch {
         /* ditto */
       }
     };
     this.device.addEventListener('uncapturederror', onUncaptured);
+  }
+
+  #lostError(): AseError {
+    return new AseError('DEVICE_LOST', `The GPU device was lost: ${this.#lostMessage}.`, {
+      why: 'A device is a lease on a driver context, not an object. After a loss every buffer, texture, pipeline and bind group made from it is invalid, and touching one does not throw — it silently does nothing.',
+      fix: 'Handle onDeviceLost, then call device.recover() and rebuild every GPU resource. Reassign the returned handle. Ignore reason "destroyed": that is your own teardown.',
+      detail: { kind: 'lifecycle', resource: 'GPUDevice', state: 'destroyed' },
+    });
+  }
+
+  /**
+   * Turns a `GPUError` into a catalog error, by the class the driver used.
+   *
+   * A table rather than three branches, for two reasons. The rule is that the
+   * three classes are three different problems: a validation error is a
+   * descriptor that is wrong, an out-of-memory error is a budget nobody
+   * declared, and an internal error is the driver saying it lost track of its
+   * own state. Filing all three as "a validation error" sends the reader to the
+   * wrong place, and an OOM investigated as a descriptor is an afternoon
+   * wasted. And one record compresses better than three near-copies, which
+   * matters when the strings are the bulk of the code.
+   *
+   * An unrecognised class is treated as a validation error: it is the only one
+   * of the three whose fix is "read what the driver said".
+   */
+  #classifyUncaptured(error: GPUError): AseError {
+    const raw = error.message;
+    const row = UNCAPTURED_ERRORS[error.constructor.name] ?? UNCAPTURED_ERRORS.GPUValidationError;
+    return new AseError(row.code, `${row.label}: ${raw}`, {
+      why: row.why,
+      fix: row.fix,
+      detail: { kind: 'gpu-validation', scope: 'uncaptured', raw },
+    });
   }
 
   assertLive(): void {

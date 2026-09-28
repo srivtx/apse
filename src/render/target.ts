@@ -89,6 +89,25 @@ export interface CanvasTargetDevice extends RenderTargetDevice {
   readonly format: GPUTextureFormat;
 }
 
+/**
+ * The part of a material this layer needs in order to check it can be drawn here.
+ *
+ * Structural rather than the `Drawable` interface, so a test needs no material at
+ * all and a caller can pass a two-field object. The renderer's `Material`
+ * satisfies it without a change.
+ */
+export interface TargetCompatibility {
+  /** Named in the error message, because that is how a human identifies it. */
+  readonly name: string;
+  /**
+   * Colour formats the material's pipeline was compiled for, in attachment
+   * order. One entry, because apse materials have one colour attachment; a
+   * length that is not 1 is a mismatch as surely as a wrong format is, and is
+   * reported as one.
+   */
+  readonly targetFormats: readonly GPUTextureFormat[];
+}
+
 /** Options for {@link createCanvasTarget}. */
 export interface CanvasTargetOptions {
   /**
@@ -209,6 +228,17 @@ export class RenderTargetImpl extends Resource implements RenderTarget {
   }) {
     super();
     assertSize(init.width, init.height, init.device.limits, init.label);
+    // The canvas invariant, checked here rather than left to the factory, so
+    // that a *new* factory cannot quietly reintroduce it: `getCurrentTexture()`
+    // never returns a multisampled texture, so a canvas target with sampleCount 4
+    // could never be drawn into and would only fail at pass-begin.
+    if (init.canvas !== null && init.sampleCount !== 1) {
+      fail('OPTION_UNKNOWN',
+        `Canvas render target "${init.label}" was built with sampleCount ${init.sampleCount}.`, {
+        why: 'The canvas backbuffer comes from getCurrentTexture(), which always returns a single-sample attachment. A 4x canvas target asks a pass to resolve into a texture that cannot be one, and the frame is discarded with no exception.',
+        fix: 'Build MSAA by hand: an offscreen createColorTarget(device, { sampleCount: 4 }) as the scene target, with a PresentPass whose destination is the canvas.',
+      });
+    }
     this.#device = init.device;
     this.#label = init.label;
     this.#format = init.format;
@@ -291,6 +321,86 @@ export class RenderTargetImpl extends Resource implements RenderTarget {
       });
     }
     return t;
+  }
+
+  /**
+   * The colour texture, checked to be readable by the CPU. See
+   * {@link assertCopySource}.
+   */
+  get readableColorTexture(): GPUTexture {
+    this.assertCopySource();
+    return this.colorTexture;
+  }
+
+  /**
+   * Fails unless this target's colour texture was created with `COPY_SRC`.
+   *
+   * **A copy out of a texture without `COPY_SRC` is a validation error that
+   * invalidates the whole command buffer**, so the symptom is a black screenshot
+   * and a frame that stopped drawing, with an error naming a usage flag rather
+   * than the mistake. Usage bits are not inherited: `RENDER_ATTACHMENT` is on by
+   * default and `COPY_SRC` is not, precisely because a flag nobody asked for is a
+   * flag nobody is paying for.
+   */
+  assertCopySource(): void {
+    this.assertUsable('assertCopySource');
+    if (this.#isCanvas) {
+      fail('INTERNAL_INVARIANT',
+        `Canvas render target "${this.#label}" cannot be read back.`, {
+        why: 'The swapchain texture is created by the browser and expires at present, so copying out of it is legal only inside the task that drew it. The presented image is not something the CPU can go and fetch.',
+        fix: 'Render into an offscreen target with `usage: GPUTextureUsage.COPY_SRC` and copy out of that — what Renderer.capture() does.',
+        detail: { kind: 'lifecycle', resource: 'RenderTargetImpl', state: 'in-flight' },
+      });
+    }
+    if (this.#ownsColor && (this.#usage & TEXTURE_USAGE.COPY_SRC) === 0) {
+      fail('OPTION_UNKNOWN',
+        `Render target "${this.#label}" was created without COPY_SRC, so it cannot be copied out of.`, {
+        why: 'COPY_SRC is off by default: a target nobody reads back should not pay for the copy path, and on a tiled GPU granting it can change how the allocation lands. A copy without it is a validation error that invalidates the whole command buffer, taking the frame\'s draws with it.',
+        fix: 'createColorTarget(device, { ..., usage: GPUTextureUsage.COPY_SRC }), ORed with whatever else the target needs. It has to be requested at creation.',
+      });
+    }
+  }
+
+  /**
+   * Fails unless a material compiled for this target's formats can be drawn here.
+   *
+   * **Call this before `setPipeline`**, which is the only point at which the
+   * mistake is still preventable. A `GPURenderPipeline` bakes its colour
+   * attachment format in at creation, and using it with a pass whose format
+   * differs invalidates the *whole command buffer* — every draw in the frame, not
+   * just this one — while throwing no exception anywhere in JavaScript. The frame
+   * is simply never submitted, and the driver reports two format enums on the
+   * error timeline hours later.
+   *
+   * The check is cheap and it is not a substitute for a debug-mode assertion:
+   * `targetFormats.includes(format)` is one pointer compare on a per-pipeline
+   * change, which is once per material per frame at worst.
+   */
+  assertDrawable(material: TargetCompatibility): void {
+    this.assertUsable('assertDrawable');
+    const declared = material.targetFormats;
+    if (declared.length === 1 && declared[0] === this.#format) return;
+    const expected = declared.length === 0 ? 'none' : declared.join(', ');
+    fail('RENDER_TARGET_FORMAT_MISMATCH',
+      `Material "${material.name}" was compiled for colour format [${expected}] but is being drawn ` +
+      `into "${this.#label}", whose colour format is "${this.#format}".`, {
+      why: 'A render pipeline bakes its colour attachment format in at creation. A pass whose format differs invalidates the whole command buffer — not just this draw — so nothing reaches the screen and nothing is thrown.',
+      fix: declared.length === 1 && (declared[0] === 'rgba8unorm' || declared[0] === 'bgra8unorm')
+        ? `Pass the target's format when creating the material: pbrMaterial(device, { targetFormat: "${this.#format}" }). The canvas default is getPreferredCanvasFormat() — bgra8unorm on desktop, rgba8unorm on Android.`
+        : `Recreate the material with \`targetFormat: "${this.#format}"\`, or draw it into a target of format "${declared[0] ?? 'unknown'}".`,
+    });
+  }
+
+  /**
+   * How many colour textures this target owns: 1, or 2 when multisampled.
+   *
+   * The two-texture case is the whole reason MSAA exists in this layer: a
+   * multisampled texture cannot be sampled, so the resolve destination is the
+   * only thing a later pass may read, and a target that allocated one texture
+   * instead of two has no resolve at all.
+   */
+  get colorTextureCount(): 1 | 2 {
+    return this.#sampleCount > 1 && this.#ownsColor && !this.#isCanvas ? 2 : 1;
   }
 
   get depthView(): GPUTextureView | undefined {
@@ -506,6 +616,28 @@ export class RenderTargetImpl extends Resource implements RenderTarget {
         this.#sampleView = this.#resolve.createView({ label: `${this.#label}:colorResolve` });
       } else {
         this.#sampleView = this.#colorView;
+      }
+    }
+
+    // The MSAA invariant, asserted on every allocation rather than assumed.
+    //
+    // Three things have to hold together for 4x to work, and each of them fails
+    // differently and silently: a multisampled target needs a *second*
+    // single-sample colour texture to resolve into (without one there is no
+    // resolve at all, and `resolveTarget: undefined` silently drops every
+    // fragment's other three samples), that texture must be the sampleable one
+    // (a multisampled texture cannot be bound as a sampled texture — that is a
+    // validation error, not a blurry result), and the canvas must never be
+    // multisampled at all. `colorTextureCount` reports the count so a caller can
+    // check it without reaching into the class.
+    if (this.#ownsColor && !this.#isCanvas && this.#sampleCount > 1) {
+      if (this.#resolve === null || this.#sampleView === null || this.#colorView === this.#sampleView) {
+        fail('INTERNAL_INVARIANT',
+          `Render target "${this.#label}" is ${this.#sampleCount}x but allocated ${this.#resolve === null ? 1 : 2} colour textures.`, {
+          why: 'A multisampled attachment cannot be sampled, so 4x needs two colour textures: the one drawn into and a single-sample one the resolve writes. With one, the resolve has nowhere to go, the other three samples per pixel are dropped, and the image looks aliased with no error anywhere.',
+          fix: 'A bug in apse: createColorTarget must allocate a resolve for any sampleCount > 1. Please report it with the options you passed.',
+          detail: { kind: 'lifecycle', resource: 'RenderTargetImpl', state: 'created' },
+        });
       }
     }
 

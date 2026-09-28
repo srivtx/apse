@@ -16,17 +16,28 @@
 import { describe, expect, test } from 'bun:test';
 import {
   box,
+  capsule,
+  cone,
+  computeTangents,
   cylinder,
   grid,
   layout,
+  mergeMeshes,
   MeshData,
   plane,
   POSITION_LAYOUT,
+  roundedBox,
   sphere,
   STANDARD_LAYOUT,
+  TANGENT_ATTRIBUTES,
+  TANGENT_LAYOUT,
   torus,
   upload,
+  uploadBatch,
+  withTangents,
+  type BatchedRange,
 } from '../src/geometry/index.ts';
+import { recordingDevice } from './fake-geometry-device.ts';
 import { AseError } from '../src/core/error.ts';
 
 // ---------------------------------------------------------------------------
@@ -950,3 +961,1027 @@ describe('upload', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// cone
+// ---------------------------------------------------------------------------
+
+describe('cone', () => {
+  test('is the cylinder with a zero top radius, byte for byte', () => {
+    // The delegated definition is the point: one swept-surface generator, so
+    // there is no second one to get the apex collapse or the slope normal wrong.
+    const a = cone({ radius: 2, height: 3, radialSegments: 16 });
+    const b = cylinder({ radiusTop: 0, radiusBottom: 2, height: 3, radialSegments: 16 });
+    expect(a.vertexCount).toBe(b.vertexCount);
+    expect(a.indexCount).toBe(b.indexCount);
+    expect(Array.from(a.vertexData)).toEqual(Array.from(b.vertexData));
+    expect(Array.from(a.indexData!)).toEqual(Array.from(b.indexData!));
+  });
+
+  test('has a single apex vertex and no zero-area triangles', () => {
+    const m = cone({ radius: 1, height: 2, radialSegments: 16 });
+    let apex = 0;
+    for (let i = 0; i < m.vertexCount; i++) if (pos(m, i)[1] > 0.999) apex++;
+    expect(apex, 'exactly one apex vertex').toBe(1);
+    expect(degenerateTriangles(m)).toEqual([]);
+  });
+
+  test('is a closed surface whose side normals tilt with the slope', () => {
+    const m = cone({ radius: 1, height: 2, radialSegments: 12 });
+    assertClosedManifold(m);
+    let tilted = 0;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const p = pos(m, i);
+      const n = nrm(m, i);
+      expect(length(n), `normal ${i} unit`).toBeCloseTo(1, 6);
+      // Above the midpoint the wall leans inward, so its normal has a positive
+      // y component; on a straight cylinder it would be exactly zero.
+      if (p[1] > 0.4) {
+        expect(n[1], `side normal ${i} tilts up`).toBeGreaterThan(0);
+        tilted++;
+      }
+    }
+    expect(tilted, 'some vertices are on the sloping wall').toBeGreaterThan(0);
+  });
+
+  test('the base disc is capped and faces -Y', () => {
+    const capped = cone({ radialSegments: 8 });
+    const open = cone({ radialSegments: 8, capped: false });
+    // A cap is a centre plus a ring of `radialSegments` — 9 more vertices and
+    // `radialSegments` more triangles.
+    expect(capped.vertexCount).toBe(open.vertexCount + 9);
+    expect(capped.indexCount).toBe(open.indexCount + 8 * 3);
+    let down = 0;
+    for (let i = 0; i < capped.vertexCount; i++) {
+      if (nrm(capped, i)[1] < -0.5) down++;
+    }
+    expect(down, 'base-cap vertices').toBe(9);
+    expect(degenerateTriangles(open)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// capsule
+// ---------------------------------------------------------------------------
+
+describe('capsule', () => {
+  test('has the documented counts and a closed surface', () => {
+    const rs = 12, capSeg = 4, hSeg = 1;
+    const m = capsule({ radialSegments: rs, capSegments: capSeg, heightSegments: hSeg });
+    const rings = 2 * capSeg + hSeg - 2;
+    expect(m.vertexCount).toBe(2 + rings * (rs + 1));
+    expect(m.indexCount / 3).toBe(2 * rs * rings);
+    expect(degenerateTriangles(m)).toEqual([]);
+    // Topologically a sphere, so the same Euler characteristic the sphere has.
+    assertClosedManifold(m);
+  });
+
+  test('is taller than it is wide by exactly the two caps, and its bounds say so', () => {
+    const radius = 0.5, height = 4;
+    const m = capsule({ radius, height, radialSegments: 16, capSegments: 6 });
+    let minY = Infinity, maxY = -Infinity, maxR = 0;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const p = pos(m, i);
+      minY = Math.min(minY, p[1]);
+      maxY = Math.max(maxY, p[1]);
+      maxR = Math.max(maxR, Math.hypot(p[0], p[2]));
+    }
+    expect(maxY - minY).toBeCloseTo(height + 2 * radius, 6);
+    expect(maxY).toBeCloseTo(height / 2 + radius, 6);
+    expect(minY).toBeCloseTo(-height / 2 - radius, 6);
+    expect(maxR).toBeCloseTo(radius, 6);
+    // The bound is the pole, not the equator: |pole| = h/2 + r.
+    expect(m.boundingSphere[3]).toBeCloseTo(height / 2 + radius, 5);
+    expect(m.boundingSphere[0]).toBeCloseTo(0, 6);
+  });
+
+  test('the poles are single vertices and the fans face outward', () => {
+    const m = capsule({ radius: 1, height: 1, radialSegments: 12, capSegments: 4 });
+    let north = 0, south = 0;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const p = pos(m, i);
+      if (p[1] > 1.499) north++;
+      if (p[1] < -1.499) south++;
+    }
+    expect([north, south], 'one vertex per pole').toEqual([1, 1]);
+    const idx = indicesOf(m);
+    for (let t = 0; t < idx.length; t += 3) {
+      const a = pos(m, idx[t]), b = pos(m, idx[t + 1]), c = pos(m, idx[t + 2]);
+      const face = cross(sub(b, a), sub(c, a));
+      const centre = [(a[0] + b[0] + c[0]) / 3, (a[1] + b[1] + c[1]) / 3, (a[2] + b[2] + c[2]) / 3];
+      expect(dot(face, centre), `triangle ${t / 3} faces away from the axis`).toBeGreaterThan(0);
+    }
+  });
+
+  test('normals are unit everywhere and horizontal on the cylindrical section', () => {
+    const m = capsule({ radius: 1, height: 2, radialSegments: 12, capSegments: 4, heightSegments: 3 });
+    let wall = 0;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const n = nrm(m, i);
+      expect(length(n), `normal ${i} unit`).toBeCloseTo(1, 6);
+      if (n[1] === 0) {
+        wall++;
+        const p = pos(m, i);
+        // A wall normal is radial, so it has no y at all and points outwards.
+        expect(dot(n, [p[0], 0, p[2]]), `wall normal ${i} is radial`).toBeGreaterThan(0);
+      }
+    }
+    expect(wall, 'the wall has at least one row').toBeGreaterThan(0);
+  });
+
+  test('height 0 is a sphere, not a stack of coincident rings', () => {
+    // The interesting part is that it does not degenerate: more than one wall
+    // row at zero height would be several coincident rings, which is a band of
+    // zero-area triangles rather than a sphere.
+    const m = capsule({ radius: 0.75, height: 0, radialSegments: 12, capSegments: 4, heightSegments: 8 });
+    expect(m.boundingSphere[3]).toBeCloseTo(0.75, 5);
+    expect(degenerateTriangles(m)).toEqual([]);
+    assertClosedManifold(m);
+  });
+
+  test('v runs pole to pole and u wraps', () => {
+    const m = capsule({ radialSegments: 8, capSegments: 4, heightSegments: 1 });
+    expect(uv(m, 0)).toEqual([0.5, 0]);
+    expect(uv(m, m.vertexCount - 1)).toEqual([0.5, 1]);
+    for (let i = 0; i < m.vertexCount; i++) {
+      const t = uv(m, i);
+      expect(t[0], `u ${i}`).toBeGreaterThanOrEqual(0);
+      expect(t[0], `u ${i}`).toBeLessThanOrEqual(1);
+      expect(t[1], `v ${i}`).toBeGreaterThanOrEqual(0);
+      expect(t[1], `v ${i}`).toBeLessThanOrEqual(1);
+    }
+  });
+
+  test('clamps its segment counts and honours POSITION_LAYOUT', () => {
+    expect(capsule({ radialSegments: 1, capSegments: 0, heightSegments: 0 }).vertexCount)
+      .toBe(capsule({ radialSegments: 3, capSegments: 2, heightSegments: 1 }).vertexCount);
+    const m = capsule({ layout: POSITION_LAYOUT, radialSegments: 8, capSegments: 3 });
+    expect(m.layout.stride).toBe(12);
+    expect(m.vertexData.length).toBe(m.vertexCount * 3);
+    expect(degenerateTriangles(m)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rounded box
+// ---------------------------------------------------------------------------
+
+describe('roundedBox', () => {
+  /** The exact farthest point of a filleted box: the corner along a body diagonal. */
+  const cornerDistance = (radius: number, half: number): number =>
+    Math.SQRT2 * 0 + Math.sqrt(3) * (half - radius) + radius;
+
+  test('has the documented counts and a closed surface', () => {
+    const seg = 3;
+    const side = 2 * seg + 2;
+    const m = roundedBox({ segments: seg });
+    expect(m.vertexCount).toBe(6 * side * side);
+    expect(m.indexCount / 3).toBe(12 * (side - 1) * (side - 1));
+    expect(degenerateTriangles(m)).toEqual([]);
+    assertClosedManifold(m);
+  });
+
+  test('the corners are sphere octants of exactly the requested radius', () => {
+    const radius = 0.2;
+    const m = roundedBox({ radius, segments: 4 });
+    const s = m.layout.stride >> 2;
+    let sawOctant = false;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const o = i * s;
+      const p = [m.vertexData[o], m.vertexData[o + 1], m.vertexData[o + 2]];
+      // Distance from the inner box's corner to the point, on the three axes that
+      // the point is rounded on. On the octant that is exactly the radius.
+      const cx = Math.min(0.5 - radius, Math.max(-(0.5 - radius), p[0]));
+      const cy = Math.min(0.5 - radius, Math.max(-(0.5 - radius), p[1]));
+      const cz = Math.min(0.5 - radius, Math.max(-(0.5 - radius), p[2]));
+      const d = Math.hypot(p[0] - cx, p[1] - cy, p[2] - cz);
+      if (d < 1e-9) continue; // a vertex in the flat middle: distance 0 by construction
+      expect(d, `vertex ${i} lies on the fillet surface`).toBeCloseTo(radius, 5);
+      sawOctant = true;
+    }
+    expect(sawOctant, 'some vertices are on the fillet').toBe(true);
+  });
+
+  test('reaches the same far corner a sharp box does, minus the fillet', () => {
+    for (const radius of [0.05, 0.1, 0.25]) {
+      const m = roundedBox({ radius });
+      let max = 0;
+      for (let i = 0; i < m.vertexCount; i++) {
+        const p = pos(m, i);
+        max = Math.max(max, length(p));
+      }
+      expect(max, `radius ${radius}`).toBeCloseTo(cornerDistance(radius, 0.5), 5);
+      // And the bound is that vertex, because the AABB centre is the origin.
+      expect(m.boundingSphere[3], `bound for radius ${radius}`).toBeCloseTo(max, 5);
+    }
+  });
+
+  test('the silhouette is the sharp box\'s: every axis still reaches half its extent', () => {
+    // The defining property of a fillet rather than a chamfer or a squashed
+    // box: the flat faces are untouched, so the outline is the same rectangle.
+    const m = roundedBox({ radius: 0.3, segments: 3 });
+    let maxX = 0, maxY = 0, maxZ = 0;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const p = pos(m, i);
+      maxX = Math.max(maxX, Math.abs(p[0]));
+      maxY = Math.max(maxY, Math.abs(p[1]));
+      maxZ = Math.max(maxZ, Math.abs(p[2]));
+      expect(length(nrm(m, i)), `normal ${i} unit`).toBeCloseTo(1, 6);
+    }
+    expect(maxX).toBeCloseTo(0.5, 6);
+    expect(maxY).toBeCloseTo(0.5, 6);
+    expect(maxZ).toBeCloseTo(0.5, 6);
+    // And the middle of the +Y face is exactly on the plane, with the face
+    // normal: the projection is the identity where the fillet is not.
+    const centres = pos(m, 0).map((_, i) => i);
+    expect(centres.length).toBe(3);
+    let onTopFace = 0;
+    for (let i = 0; i < m.vertexCount; i++) {
+      const p = pos(m, i);
+      if (p[1] === 0.5 && p[0] === 0 && p[2] === 0) {
+        expect(nrm(m, i).join(','), 'the face centre is planar and outward').toBe('0,1,0');
+        onTopFace++;
+      }
+    }
+    expect(onTopFace, 'the +Y face has a vertex at its centre').toBeGreaterThan(0);
+  });
+
+  test('every triangle winds CCW as seen from outside', () => {
+    const m = roundedBox({ segments: 2 });
+    const idx = indicesOf(m);
+    for (let t = 0; t < idx.length; t += 3) {
+      const a = pos(m, idx[t]), b = pos(m, idx[t + 1]), c = pos(m, idx[t + 2]);
+      const face = cross(sub(b, a), sub(c, a));
+      expect(dot(face, nrm(m, idx[t])), `triangle ${t / 3}`).toBeGreaterThan(0);
+    }
+  });
+
+  test('honours non-uniform extents and a POSITION_LAYOUT', () => {
+    const m = roundedBox({ width: 4, height: 2, depth: 1, radius: 0.2, segments: 2 });
+    for (let i = 0; i < m.vertexCount; i++) {
+      const p = pos(m, i);
+      expect(Math.abs(p[0])).toBeLessThanOrEqual(2 + 1e-6);
+      expect(Math.abs(p[1])).toBeLessThanOrEqual(1 + 1e-6);
+      expect(Math.abs(p[2])).toBeLessThanOrEqual(0.5 + 1e-6);
+    }
+    expect(m.boundingSphere[3]).toBeCloseTo(cornerDistance(0.2, 0.5), 4);
+    const flat = roundedBox({ layout: POSITION_LAYOUT, segments: 2 });
+    expect(flat.vertexData.length).toBe(flat.vertexCount * 3);
+  });
+
+  test('a radius at or past half the smallest extent is refused, with the number', () => {
+    const e = err(() => roundedBox({ width: 1, height: 1, depth: 1, radius: 0.5 }));
+    expect(e.code).toBe('OPTION_UNKNOWN');
+    expect(e.message).toContain('0.5');
+    expect(() => roundedBox({ radius: 0.75 })).toThrow(/0.375|fillet/);
+    expect(() => roundedBox({ radius: 0 })).toThrow(/positive/);
+    expect(() => roundedBox({ radius: -1 })).toThrow(/positive/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bounds audit
+// ---------------------------------------------------------------------------
+
+describe('bounds: the audit', () => {
+  test('a single non-finite position is caught, not silently averaged away', () => {
+    // The bug this exists for: NaN fails every `<` and every `>`, so a mesh with
+    // one NaN vertex produces a *finite* AABB that is missing it — a bound that
+    // does not contain the mesh, which culls a visible object with no error.
+    const floats = new Float32Array(9);
+    floats.set([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const e = err(() => new MeshData({
+      layout: POSITION_LAYOUT,
+      vertices: { interleaved: floats, vertexCount: 3 },
+    }));
+    expect(e.code).toBe('INTERNAL_INVARIANT');
+    expect(e.message).toContain('non-finite');
+    expect(e.message).toContain('vertex 2');
+  });
+
+  test('an Infinity position is caught the same way', () => {
+    const floats = new Float32Array(9);
+    floats.set([0, 0, 0, Infinity, 0, 0, 0, 1, 0]);
+    expect(err(() => new MeshData({
+      layout: POSITION_LAYOUT,
+      vertices: { interleaved: floats, vertexCount: 3 },
+    })).code).toBe('INTERNAL_INVARIANT');
+  });
+
+  test('a two-component position is refused, because the bounds pass would read the wrong floats', () => {
+    const e = err(() => new MeshData({
+      layout: layout({ position: 'float32x2', uv: 'float32x2' }),
+      vertices: { attributes: { position: [0, 0, 1, 1], uv: [0, 0, 1, 1] }, vertexCount: 2 },
+    }));
+    expect(e.code).toBe('MESH_NO_POSITION');
+    expect(e.message).toContain('2 components');
+  });
+
+  test('a bounding-sphere override has to be finite and non-negative', () => {
+    const base = { layout: POSITION_LAYOUT, vertices: { interleaved: new Float32Array(9), vertexCount: 3 } };
+    const negative = err(() => new MeshData({ ...base, boundingSphere: [0, 0, 0, -1] }));
+    expect(negative.code).toBe('INTERNAL_INVARIANT');
+    expect(negative.message).toContain('-1');
+    expect(err(() => new MeshData({ ...base, boundingSphere: [0, 0, 0, NaN] })).code)
+      .toBe('INTERNAL_INVARIANT');
+    expect(err(() => new MeshData({ ...base, boundingSphere: [Infinity, 0, 0, 1] })).code)
+      .toBe('INTERNAL_INVARIANT');
+    expect(err(() => new MeshData({ ...base, boundingSphere: [0, 0, 1] })).code)
+      .toBe('INTERNAL_INVARIANT');
+  });
+
+  test('every primitive\'s bound contains every one of its own vertices', () => {
+    // Conservative means never an under-estimate, on all nine: a bound that is
+    // tight to 1e-7 is fine, a bound that is 1e-7 short drops the object.
+    for (const [name, m] of Object.entries({
+      box: box(),
+      sphere: sphere({ widthSegments: 16, heightSegments: 8 }),
+      plane: plane({ widthSegments: 4, depthSegments: 4 }),
+      torus: torus({ radialSegments: 16, tubularSegments: 12 }),
+      cylinder: cylinder({ radialSegments: 16 }),
+      cone: cone({ radialSegments: 16 }),
+      capsule: capsule({ radialSegments: 16 }),
+      roundedBox: roundedBox({ segments: 2 }),
+      grid: grid(),
+    })) {
+      for (let i = 0; i < m.vertexCount; i++) {
+        const p = pos(m, i);
+        const d = Math.hypot(p[0] - m.boundingSphere[0], p[1] - m.boundingSphere[1], p[2] - m.boundingSphere[2]);
+        expect(d, `${name} vertex ${i} is inside the bound`).toBeLessThanOrEqual(m.boundingSphere[3] + 1e-6);
+      }
+    }
+  });
+
+  test('the attributes source refuses a packed format rather than writing the wrong bytes', () => {
+    // A `Float32Array` destination and an `unorm8x4` attribute are a mismatch
+    // that compiles, uploads, and shades: the GPU reads four f32 bytes as one
+    // byte plus three zero bytes, so 1.0 arrives as 14/255.
+    const e = err(() => new MeshData({
+      layout: layout({ position: 'float32x3', colour: 'unorm8x4' }),
+      vertices: {
+        attributes: { position: [0, 0, 0, 1, 0, 0, 0, 1, 0], colour: [1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1] },
+        vertexCount: 3,
+      },
+    }));
+    expect(e.code).toBe('LAYOUT_MISMATCH');
+    expect(e.message).toContain('colour');
+    expect(e.message).toContain('unorm8x4');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tangents
+// ---------------------------------------------------------------------------
+
+describe('computeTangents', () => {
+  test('a flat quad gets the tangent the uv gradient says it should', () => {
+    // A unit quad in XZ with u running +X and v running +Z: the tangent is
+    // +X, exactly, and the handedness is +1 because cross(N, T) · B is positive
+    // with N = +Y, T = +X, B = +Z.
+    const m = plane({ layout: TANGENT_LAYOUT });
+    const r = withTangents(m);
+    expect(r.degenerateTriangles).toBe(0);
+    expect(r.fallbackVertices).toBe(0);
+    for (let i = 0; i < r.mesh.vertexCount; i++) {
+      const t = tangent(r.mesh, i);
+      expect(Math.abs(t[0]), `tangent ${i} x`).toBeCloseTo(1, 5);
+      expect(Math.abs(t[1]), `tangent ${i} y`).toBeCloseTo(0, 5);
+      expect(Math.abs(t[2]), `tangent ${i} z`).toBeCloseTo(0, 5);
+      expect(t[3], `handedness ${i}`).toBe(1);
+    }
+  });
+
+  test('every tangents that are unit, orthogonal to the normal, and ±1', () => {
+    // The property that actually matters, over all nine primitives: a normal map
+    // multiplies a non-unit tangent by a non-orthogonal frame and the surface
+    // lights as if it were somewhere else.
+    for (const [name, m] of Object.entries({
+      box: box({ layout: TANGENT_LAYOUT }),
+      sphere: sphere({ layout: TANGENT_LAYOUT, widthSegments: 16, heightSegments: 8 }),
+      torus: torus({ layout: TANGENT_LAYOUT, radialSegments: 12, tubularSegments: 8 }),
+      cylinder: cylinder({ layout: TANGENT_LAYOUT, radialSegments: 12 }),
+      cone: cone({ layout: TANGENT_LAYOUT, radialSegments: 12 }),
+      capsule: capsule({ layout: TANGENT_LAYOUT, radialSegments: 12 }),
+      roundedBox: roundedBox({ layout: TANGENT_LAYOUT, segments: 2 }),
+      plane: plane({ layout: TANGENT_LAYOUT }),
+      grid: grid({ layout: TANGENT_LAYOUT }),
+    })) {
+      const r = withTangents(m);
+      expect(r.degenerateTriangles, `${name} has no singular uv triangles`).toBe(0);
+      expect(r.fallbackVertices, `${name} has no invented tangents`).toBe(0);
+      for (let i = 0; i < r.mesh.vertexCount; i++) {
+        const t = tangent(r.mesh, i);
+        const n = nrm(r.mesh, i);
+        expect(Math.abs(length(t) - 1), `${name} tangent ${i} unit`).toBeLessThan(1e-5);
+        expect(Math.abs(dot(t, n)), `${name} tangent ${i} ⟂ normal`).toBeLessThan(1e-5);
+        expect(t[3] === 1 || t[3] === -1, `${name} handedness ${i}`).toBe(true);
+      }
+    }
+  });
+
+  test('a sphere\'s tangent is the direction of increasing longitude', () => {
+    // Analytic, and the reason this test exists: a wrong tangent direction is
+    // invisible until a normal map is on it.
+    const r = withTangents(sphere({ layout: TANGENT_LAYOUT, widthSegments: 24, heightSegments: 12 }));
+    // The seam and the poles are the vertices where "the direction of
+    // increasing u" is a matter of convention; every other vertex has an exact
+    // answer, (-sin phi, 0, cos phi) for the sphere's own parameterisation.
+    let checked = 0;
+    for (let i = 0; i < r.mesh.vertexCount; i++) {
+      const p = pos(r.mesh, i);
+      if (Math.abs(p[1]) > 0.999) continue; // poles
+      const uvHere = uv(r.mesh, i);
+      if (uvHere[0] === 0) continue; // the seam column
+      const phi = uvHere[0] * Math.PI * 2;
+      const t = tangent(r.mesh, i);
+      expect(t[0], `vertex ${i} x`).toBeCloseTo(-Math.sin(phi), 4);
+      expect(t[1], `vertex ${i} y`).toBeCloseTo(0, 4);
+      expect(t[2], `vertex ${i} z`).toBeCloseTo(Math.cos(phi), 4);
+      checked++;
+    }
+    expect(checked, 'a real number of vertices were checked').toBeGreaterThan(100);
+  });
+
+  test('a duplicated uv is skipped and counted, never divided by', () => {
+    // Two triangles' worth of vertices with every uv equal: the 2×2 uv system
+    // is singular, `1/det` is Infinity, and an Infinity that lands in a tangent
+    // survives normalisation as NaN across a whole patch of the mesh.
+    const flat = layout({ position: 'float32x3', normal: 'float32x3', uv: 'float32x2' });
+    const data = flat.allocate(3);
+    const s = flat.stride >> 2;
+    for (let i = 0; i < 3; i++) {
+      const o = i * s;
+      data[o] = i; data[o + 1] = 0; data[o + 2] = 0;
+      data[o + 3] = 0; data[o + 4] = 1; data[o + 5] = 0;
+      data[o + 6] = 0; data[o + 7] = 0;
+    }
+    const r = computeTangents({
+      layout: flat, vertexData: data, vertexCount: 3, indices: new Uint16Array([0, 1, 2]),
+    });
+    expect(r.triangles).toBe(1);
+    expect(r.degenerateTriangles, 'the whole triangle is skipped').toBe(1);
+    expect(r.fallbackVertices, 'and all three of its vertices are invented').toBe(3);
+    for (let i = 0; i < 3; i++) {
+      const t = r.tangents.subarray(i * 4, i * 4 + 4);
+      for (const c of t) expect(Number.isFinite(c), `tangent ${i} is finite`).toBe(true);
+      expect(Math.abs(length([t[0], t[1], t[2]]) - 1)).toBeLessThan(1e-5);
+      expect(t[3]).toBe(1);
+    }
+  });
+
+  test('a vertex no triangle reaches gets an invented tangent, not a NaN', () => {
+    const flat = layout({ position: 'float32x3', normal: 'float32x3', uv: 'float32x2' });
+    const m = new MeshData({
+      layout: flat,
+      vertices: { attributes: { position: [0, 0, 0, 1, 0, 0, 0, 1, 0, 5, 5, 5], normal: [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0], uv: [0, 0, 1, 0, 0, 1, 9, 9] }, vertexCount: 4 },
+      indices: new Uint16Array([0, 1, 2]),
+    });
+    const r = computeTangents({ layout: flat, vertexData: m.vertexData, vertexCount: 4, indices: m.indexData });
+    expect(r.degenerateTriangles).toBe(0);
+    expect(r.fallbackVertices, 'exactly the orphan').toBe(1);
+    const orphan = r.tangents.subarray(12, 16);
+    for (const c of orphan) expect(Number.isFinite(c)).toBe(true);
+    // The fallback is perpendicular to the normal, which is what makes it usable.
+    expect(orphan[1]).toBeCloseTo(0, 6);
+    expect(Math.hypot(orphan[0], orphan[1], orphan[2])).toBeCloseTo(1, 6);
+  });
+
+  test('a tangent parallel to the normal falls back rather than normalising a zero', () => {
+    // A uv that varies along the normal direction: the solver's tangent is
+    // parallel to the normal, so Gram-Schmidt produces the zero vector and
+    // normalising it would be 0/0.
+    const flat = layout({ position: 'float32x3', normal: 'float32x3', uv: 'float32x2' });
+    const m = new MeshData({
+      layout: flat,
+      vertices: {
+        attributes: {
+          position: [0, 0, 0, 0, 1, 0, 0, 2, 0],
+          normal: [0, 1, 0, 0, 1, 0, 0, 1, 0],
+          uv: [0, 0, 1, 1, 2, 2],
+        },
+        vertexCount: 3,
+      },
+      indices: new Uint16Array([0, 1, 2]),
+    });
+    const r = computeTangents({ layout: flat, vertexData: m.vertexData, vertexCount: 3, indices: m.indexData });
+    expect(r.degenerateTriangles, 'the uv triangle is not singular, it is just vertical').toBe(0);
+    expect(r.fallbackVertices, 'all three vertices fall back').toBe(3);
+    for (let i = 0; i < 3; i++) {
+      const t = r.tangents.subarray(i * 4, i * 4 + 4);
+      expect(Number.isFinite(t[0])).toBe(true);
+      expect(Math.hypot(t[0], t[1], t[2])).toBeCloseTo(1, 6);
+      expect(t[1], 'and it is perpendicular to the +Y normal').toBeCloseTo(0, 6);
+    }
+  });
+
+  test('a mirrored uv produces a negative handedness', () => {
+    // The same quad twice, with v running the other way. The tangent direction
+    // is the same and the handedness is the other sign — which is the entire
+    // reason the fourth component exists: without it a mirrored uv lights the
+    // wrong side of every normal map and nothing in the geometry says so.
+    const quad = (mirror: boolean): MeshData => {
+      const src = plane({ layout: TANGENT_LAYOUT });
+      const out = src.vertexData.slice();
+      const s = TANGENT_LAYOUT.stride >> 2;
+      const at = TANGENT_LAYOUT.attribute('uv')!.offset >> 2;
+      if (mirror) {
+        for (let i = 0; i < src.vertexCount; i++) out[i * s + at + 1] = 1 - out[i * s + at + 1];
+      }
+      return new MeshData({
+        layout: TANGENT_LAYOUT,
+        vertices: { interleaved: out, vertexCount: src.vertexCount },
+        indices: src.indexData,
+      });
+    };
+    const plain = withTangents(quad(false));
+    const flipped = withTangents(quad(true));
+    expect(tangent(plain.mesh, 0)[3]).toBe(1);
+    expect(tangent(flipped.mesh, 0)[3], 'mirrored v flips the handedness').toBe(-1);
+    // The tangent direction is unchanged, which proves the sign is not a
+    // by-product of a different solve.
+    expect(tangent(flipped.mesh, 0)[0]).toBeCloseTo(tangent(plain.mesh, 0)[0], 5);
+    expect(flipped.degenerateTriangles).toBe(0);
+  });
+
+  test('an unindexed triangle-list works, with the triangles read in order', () => {
+    const m = new MeshData({
+      layout: layout({ position: 'float32x3', normal: 'float32x3', uv: 'float32x2' }),
+      vertices: {
+        attributes: {
+          position: [0, 0, 0, 1, 0, 0, 0, 1, 0],
+          normal: [0, 1, 0, 0, 1, 0, 0, 1, 0],
+          uv: [0, 0, 1, 0, 0, 1],
+        },
+        vertexCount: 3,
+      },
+    });
+    expect(m.indexed).toBe(false);
+    const r = computeTangents({ layout: m.layout, vertexData: m.vertexData, vertexCount: 3 });
+    expect(r.triangles).toBe(1);
+    expect(r.degenerateTriangles).toBe(0);
+    expect(r.fallbackVertices).toBe(0);
+    expect(r.tangents[0]).toBeCloseTo(1, 5);
+  });
+
+  test('a layout with no uv, no normal or no position is refused by name', () => {
+    const p = new Float32Array(9);
+    expect(err(() => computeTangents({ layout: layout({ position: 'float32x3' }), vertexData: p, vertexCount: 3 }))
+      .message).toContain('uv');
+    expect(err(() => computeTangents({ layout: layout({ position: 'float32x3', uv: 'float32x2' }), vertexData: p, vertexCount: 3 }))
+      .message).toContain('normal');
+    expect(err(() => computeTangents({ layout: layout({ uv: 'float32x2', normal: 'float32x3' }), vertexData: p, vertexCount: 3 }))
+      .message).toContain('position');
+  });
+});
+
+describe('withTangents', () => {
+  test('a layout with no tangent attribute is refused, naming TANGENT_LAYOUT', () => {
+    const e = err(() => withTangents(box()));
+    expect(e.code).toBe('ATTRIBUTE_MISSING');
+    expect(e.message).toContain('tangent');
+    expect(e.message).toContain('TANGENT_LAYOUT');
+  });
+
+  test('a vec3 tangent is refused: there is nowhere to put the handedness', () => {
+    const noHandedness = layout({ ...TANGENT_ATTRIBUTES, tangent: 'float32x3' });
+    const m = box({ layout: noHandedness });
+    const e = err(() => withTangents(m));
+    expect(e.code).toBe('LAYOUT_MISMATCH');
+    expect(e.message).toContain('float32x4');
+  });
+
+  test('the input mesh is untouched and the result shares its bounds exactly', () => {
+    const m = box({ layout: TANGENT_LAYOUT });
+    const before = Array.from(m.vertexData);
+    const r = withTangents(m);
+    expect(Array.from(m.vertexData), 'the source is not written through').toEqual(before);
+    // Adding a tangent cannot move a vertex, and a bound that moved by a
+    // rounding error is a bound that can drop a visible object.
+    expect(Array.from(r.mesh.boundingSphere)).toEqual(Array.from(m.boundingSphere));
+    expect(Array.from(r.mesh.indexData!)).toEqual(Array.from(m.indexData!));
+    expect(r.mesh.layout).toBe(m.layout);
+    expect(r.mesh.name).toBe('box:tangent');
+  });
+
+  test('only the tangent attribute differs from the input', () => {
+    const m = box({ layout: TANGENT_LAYOUT });
+    const r = withTangents(m);
+    const at = TANGENT_LAYOUT.attribute('tangent')!.offset >> 2;
+    const s = TANGENT_LAYOUT.stride >> 2;
+    let differing = 0;
+    for (let i = 0; i < r.mesh.vertexData.length; i++) {
+      if (i % s === at || (i % s) > at) continue;
+      expect(r.mesh.vertexData[i], `float ${i} is unchanged`).toBe(m.vertexData[i]);
+    }
+    for (let i = 0; i < m.vertexCount; i++) {
+      const t = tangent(r.mesh, i);
+      if (t[0] !== 0 || t[1] !== 0 || t[2] !== 0) differing++;
+    }
+    expect(differing, 'and the tangents are actually written').toBe(m.vertexCount);
+  });
+
+  test('the layout is the single source: 48 bytes a vertex, tangent at 36', () => {
+    expect(TANGENT_LAYOUT.stride).toBe(48);
+    expect(TANGENT_LAYOUT.attribute('tangent')?.offset).toBe(36);
+    expect(TANGENT_LAYOUT.wgslStruct()).toContain('@location(3) tangent : vec4<f32>,');
+    const r = withTangents(box({ layout: TANGENT_LAYOUT }));
+    expect(r.mesh.vertexData.length).toBe(r.mesh.vertexCount * 12);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mergeMeshes
+// ---------------------------------------------------------------------------
+
+describe('mergeMeshes', () => {
+  const at = (originX: number) => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, originX, 0, 0, 1]);
+
+  test('rebases every source onto one vertex buffer and one index buffer', () => {
+    const a = box();
+    const b = box({ width: 2 });
+    const batch = mergeMeshes([{ mesh: a }, { mesh: b, matrix: at(10) }]);
+    expect(batch.mesh.vertexCount).toBe(a.vertexCount + b.vertexCount);
+    expect(batch.mesh.indexCount).toBe(a.indexCount + b.indexCount);
+    expect(batch.mesh.layout).toBe(a.layout);
+    const idx = indicesOf(batch.mesh);
+    expect(Math.max(...idx), 'no index runs past the merged vertex count').toBe(batch.mesh.vertexCount - 1);
+    // Source 1's first three indices are source 0's, shifted by 24.
+    expect(idx.slice(0, 6)).toEqual(Array.from(a.indexData!));
+    expect(idx.slice(a.indexCount, a.indexCount + 6))
+      .toEqual(Array.from(b.indexData!).map((v) => v + a.vertexCount));
+  });
+
+  test('keeps one range per source, in order, with the draw arguments in it', () => {
+    const parts = [box(), sphere({ widthSegments: 8, heightSegments: 4 }), plane()];
+    const batch = mergeMeshes(parts.map((m) => ({ mesh: m })), { name: 'kit' });
+    expect(batch.name).toBe('kit');
+    expect(batch.ranges).toHaveLength(3);
+    let firstVertex = 0, firstIndex = 0;
+    parts.forEach((m, i) => {
+      const r: BatchedRange = batch.range(i);
+      expect(r.name).toBe(m.name);
+      expect(r.firstVertex).toBe(firstVertex);
+      expect(r.firstIndex).toBe(firstIndex);
+      expect(r.indexCount).toBe(m.indexCount);
+      expect(r.vertexCount).toBe(m.vertexCount);
+      firstVertex += m.vertexCount;
+      firstIndex += m.indexCount;
+    });
+  });
+
+  test('the combined bound contains every source, at every offset', () => {
+    const batch = mergeMeshes([
+      { mesh: box(), matrix: at(0) },
+      { mesh: box(), matrix: at(100) },
+      { mesh: box(), matrix: at(-50) },
+    ]);
+    const b = batch.mesh.boundingSphere;
+    for (const r of batch.ranges) {
+      const c = r.boundingSphere[0];
+      expect([0, 100, -50].some((x) => Math.abs(c - x) < 1e-5), `range centre ${c}`).toBe(true);
+    }
+    for (let i = 0; i < batch.mesh.vertexCount; i++) {
+      const p = pos(batch.mesh, i);
+      const d = Math.hypot(p[0] - b[0], p[1] - b[1], p[2] - b[2]);
+      expect(d, `merged vertex ${i} inside the combined bound`).toBeLessThanOrEqual(b[3] + 1e-6);
+    }
+    // Three boxes of half-extent 0.5 spanning -50..100: a bound that forgot the
+    // offset one would be off by 50.
+    expect(b[3]).toBeGreaterThan(50);
+  });
+
+  test('bakes the matrix into the vertices, with the normal through the inverse transpose', () => {
+    const uniform = mergeMeshes([{ mesh: box(), matrix: at(5) }]);
+    const full = box();
+    for (let i = 0; i < full.vertexCount; i++) {
+      expect(pos(uniform.mesh, i)[0], `vertex ${i} moved`).toBeCloseTo(pos(full, i)[0] + 5, 5);
+    }
+    // A non-uniform scale: a 2:1:1 box. The plain 3x3 would leave the normals
+    // the wrong length and the wrong angle, which is a shading bug that no
+    // geometry test can see.
+    const squash = new Float32Array([2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const baked = mergeMeshes([{ mesh: box(), matrix: squash }]);
+    for (let i = 0; i < baked.mesh.vertexCount; i++) {
+      const n = nrm(baked.mesh, i);
+      const p = pos(baked.mesh, i);
+      // An axis normal survives a non-uniform scale in *direction* but not in
+      // length, so the inverse transpose is only right if the result is still
+      // unit. A plain 3x3 would leave these at 1.0 anyway, so the check that
+      // matters is the non-axis case below.
+      expect(length(n), `normal ${i} unit`).toBeCloseTo(1, 5);
+      if (p[0] > 0.9) expect(Math.abs(n[0]), `+X face ${i}`).toBeCloseTo(1, 5);
+      if (p[1] > 0.9) expect(Math.abs(n[1]), `+Y face ${i}`).toBeCloseTo(1, 5);
+    }
+    // And the one that a 2:1:1 scale actually changes: a normal that is neither
+    // axis-aligned nor unit after the plain product.
+    const skew = new Float32Array([2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const spun = mergeMeshes([{ mesh: box({ segments: 1 }), matrix: skew }]);
+    let sawSkew = false;
+    for (let i = 0; i < spun.mesh.vertexCount; i++) {
+      const n = nrm(spun.mesh, i);
+      if (Math.abs(n[0]) > 1e-6 && Math.abs(n[0]) < 0.999) sawSkew = true;
+      expect(length(n)).toBeCloseTo(1, 5);
+    }
+    expect(sawSkew, 'a face normal was re-scaled by the inverse transpose').toBe(true);
+  });
+
+  test('a mirroring matrix flips the tangent handedness', () => {
+    const mirror = new Float32Array([-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const m = withTangents(box({ layout: TANGENT_LAYOUT }));
+    const baked = mergeMeshes([{ mesh: m.mesh, matrix: mirror }]);
+    const at = TANGENT_LAYOUT.attribute('tangent')!.offset >> 2;
+    const s = TANGENT_LAYOUT.stride >> 2;
+    let flipped = 0;
+    for (let i = 0; i < m.mesh.vertexCount; i++) {
+      const before = m.mesh.vertexData[i * s + at + 3];
+      const after = baked.mesh.vertexData[i * s + at + 3];
+      if (before === -after) flipped++;
+    }
+    expect(flipped, 'every handedness flipped').toBe(m.mesh.vertexCount);
+  });
+
+  test('a non-indexed source is given a generated index run', () => {
+    const flat = new MeshData({
+      layout: STANDARD_LAYOUT,
+      vertices: {
+        attributes: {
+          position: [0, 0, 0, 1, 0, 0, 0, 1, 0],
+          normal: [0, 1, 0, 0, 1, 0, 0, 1, 0],
+          uv: [0, 0, 1, 0, 0, 1],
+        },
+        vertexCount: 3,
+      },
+    });
+    const batch = mergeMeshes([{ mesh: box() }, { mesh: flat }]);
+    expect(batch.mesh.indexed).toBe(true);
+    expect(indicesOf(batch.mesh).slice(24, 27)).toEqual([24, 25, 26]);
+  });
+
+  test('refuses mismatched layouts, topologies and a singular matrix, by name', () => {
+    const a = box();
+    const e = err(() => mergeMeshes([{ mesh: a }, { mesh: box({ layout: TANGENT_LAYOUT }) }]));
+    expect(e.code).toBe('LAYOUT_MISMATCH');
+    expect(e.message).toContain('tangent');
+
+    const strip = new MeshData({
+      layout: STANDARD_LAYOUT,
+      vertices: { attributes: { position: [0, 0, 0, 1, 0, 0, 0, 1, 0], normal: [0, 1, 0, 0, 1, 0, 0, 1, 0], uv: [0, 0, 1, 0, 0, 1] }, vertexCount: 3 },
+      topology: 'triangle-strip',
+    });
+    expect(err(() => mergeMeshes([{ mesh: a }, { mesh: strip }])).code).toBe('MESH_INDEX_MISALIGNED');
+
+    const singular = new Float32Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const s = err(() => mergeMeshes([{ mesh: a, matrix: singular }]));
+    expect(s.code).toBe('INTERNAL_INVARIANT');
+    expect(s.message).toContain('singular');
+
+    expect(err(() => mergeMeshes([])).code).toBe('MESH_EMPTY');
+    expect(err(() => mergeMeshes([{ mesh: a, matrix: new Float32Array(4) }])).message).toContain('16');
+  });
+
+  test('more than 65535 vertices is refused, with the number', () => {
+    const e = err(() => mergeMeshes(Array.from({ length: 3000 }, () => ({ mesh: plane({ widthSegments: 3, depthSegments: 3 }) }))));
+    expect(e.code).toBe('MESH_DATA_TOO_LARGE');
+    expect(e.message).toContain('65535');
+  });
+
+  test('an out-of-range range names the count', () => {
+    const batch = mergeMeshes([{ mesh: box() }]);
+    const e = err(() => batch.range(1));
+    expect(e.code).toBe('INTERNAL_INVARIANT');
+    expect(e.message).toContain('1 range');
+    expect(e.message).toContain('0..0');
+  });
+});
+
+describe('uploadBatch', () => {
+  test('the whole batch is one draw, and a source is a sub-range of the same buffers', () => {
+    const fake = recordingDevice();
+    const parts = [box(), sphere({ widthSegments: 8, heightSegments: 4 })];
+    const batch = mergeMeshes(parts.map((m) => ({ mesh: m })));
+    const gpu = uploadBatch(fake.device, batch);
+
+    // Two buffers. Not one per source: that is the entire point.
+    expect(fake.buffers).toHaveLength(2);
+    expect(gpu.indexFormat).toBe('uint16');
+    expect(gpu.firstIndex).toBe(0);
+    expect(gpu.baseVertex).toBe(0);
+    expect(gpu.instanceCount).toBe(1);
+
+    const sub = gpu.sub(1);
+    // A view, not a copy: the same three GPU objects.
+    expect(sub.vertexBuffer).toBe(gpu.vertexBuffer);
+    expect(sub.indexBuffer).toBe(gpu.indexBuffer);
+    expect(sub.layout).toBe(gpu.layout);
+    // And the two numbers that make it a *sub*-range draw.
+    expect(sub.indexCount).toBe(parts[1].indexCount);
+    expect(sub.firstIndex).toBe(parts[0].indexCount);
+    expect(sub.baseVertex).toBe(parts[0].vertexCount);
+    expect(sub.instanceCount).toBe(1);
+  });
+
+  test('the encoded plan is one drawIndexed for the batch and one per sub-range', () => {
+    const fake = recordingDevice();
+    const parts = [box(), sphere({ widthSegments: 8, heightSegments: 4 })];
+    const batch = mergeMeshes(parts.map((m) => ({ mesh: m })));
+    const gpu = uploadBatch(fake.device, batch);
+
+    // Exactly the sequence in the GpuMesh contract, recorded rather than assumed.
+    const enc = fake.encoder();
+    enc.setVertexBuffer(0, gpu.vertexBuffer);
+    enc.setIndexBuffer(gpu.indexBuffer!, gpu.indexFormat!);
+    enc.drawIndexed(gpu.indexCount, gpu.instanceCount, gpu.firstIndex, gpu.baseVertex, gpu.firstInstance);
+    expect(enc.draws).toHaveLength(1);
+    expect(enc.draws[0]).toMatchObject({
+      kind: 'drawIndexed', vertexCount: batch.mesh.indexCount, instanceCount: 1, firstIndex: 0, baseVertex: 0,
+    });
+
+    const enc2 = fake.encoder();
+    const s = gpu.sub(1);
+    enc2.setVertexBuffer(0, s.vertexBuffer);
+    enc2.setIndexBuffer(s.indexBuffer!, s.indexFormat!);
+    enc2.drawIndexed(s.indexCount, s.instanceCount, s.firstIndex, s.baseVertex, s.firstInstance);
+    expect(enc2.draws[0]).toMatchObject({
+      vertexCount: parts[1].indexCount, instanceCount: 1,
+      firstIndex: parts[0].indexCount, baseVertex: parts[0].vertexCount,
+    });
+    // Slot 0 only: a batch has no instance buffer, and binding slot 1 on a
+    // one-slot pipeline is a validation error.
+    expect(enc2.vertexBindings.map((b) => b.slot)).toEqual([0]);
+  });
+
+  test('disposing the batch destroys exactly the two buffers it owns', () => {
+    const fake = recordingDevice();
+    const batch = mergeMeshes([{ mesh: box() }, { mesh: box() }]);
+    const gpu = uploadBatch(fake.device, batch);
+    gpu.dispose();
+    expect(fake.buffers.every((b) => b.destroyed)).toBe(true);
+    expect(gpu.disposed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GpuMesh: the draw contract and partial re-upload
+// ---------------------------------------------------------------------------
+
+describe('GpuMesh draw contract', () => {
+  test('a plain mesh reports the whole-draw defaults', () => {
+    const fake = recordingDevice();
+    const m = upload(fake.device, box());
+    expect(m.instanceCount).toBe(1);
+    expect(m.firstInstance).toBe(0);
+    expect(m.instanceBuffer).toBeNull();
+    expect(m.instanced).toBe(false);
+    expect(m.instanceStride).toBe(0);
+    expect(m.firstIndex).toBe(0);
+    expect(m.baseVertex).toBe(0);
+    expect(m.indexFormat).toBe('uint16');
+    expect(m.indexCount).toBe(36);
+    // One vertex buffer slot, and the layout is the single source for it.
+    expect(m.gpuLayouts).toHaveLength(1);
+    expect(m.layout.gpuLayouts()).toHaveLength(1);
+  });
+
+  test('an unindexed mesh reports indexFormat null, so the renderer calls draw', () => {
+    const fake = recordingDevice();
+    const flat = new MeshData({
+      layout: POSITION_LAYOUT,
+      vertices: { attributes: { position: [0, 0, 0, 1, 0, 0, 0, 1, 0] }, vertexCount: 3 },
+    });
+    const m = upload(fake.device, flat);
+    expect(m.indexBuffer).toBeNull();
+    expect(m.indexFormat).toBeNull();
+    expect(m.indexCount).toBe(3);
+  });
+
+  test('the vertex and index buffers are two VERTEX|INDEX|COPY_DST buffers', () => {
+    const fake = recordingDevice();
+    upload(fake.device, box());
+    expect(fake.buffers).toHaveLength(2);
+    const [vertex, index] = fake.buffers;
+    expect(vertex.label).toBe('box:vertex');
+    expect(index.label).toBe('box:index');
+    expect(vertex.size).toBe(24 * 32);
+    expect(index.size).toBe(36 * 2);
+    // `mappedAtCreation` is the one-time fast path, and it is why the fake can
+    // read the uploaded bytes back at all.
+    expect(fake.descriptors.map((d) => d.mappedAtCreation)).toEqual([true, true]);
+  });
+
+  test('a partial vertex write covers exactly the marked span and nothing else', () => {
+    const fake = recordingDevice();
+    const data = box();
+    const m = upload(fake.device, data);
+    fake.writes.length = 0;
+
+    data.vertexData[0] = 99;
+    m.markVertexDirty(0, 1);
+    expect(m.flush(data)).toBe(true);
+    expect(fake.writes).toHaveLength(1);
+    expect(fake.writes[0].offset, 'byte offset of vertex 0').toBe(0);
+    expect(fake.writes[0].elements, 'one vertex of 8 floats').toBe(8);
+    // The rest of the buffer is untouched, which is the property that makes a
+    // partial write worth having.
+    const read = fake.readFloats(m.vertexBuffer);
+    expect(read[0]).toBe(99);
+    expect(read[8]).toBe(data.vertexData[8]);
+
+    fake.writes.length = 0;
+    expect(m.flush(data), 'nothing marked, nothing written').toBe(false);
+    expect(fake.writes).toHaveLength(0);
+  });
+
+  test('three separate marks coalesce into one write covering the whole run', () => {
+    const fake = recordingDevice();
+    const data = box();
+    const m = upload(fake.device, data);
+    fake.writes.length = 0;
+    m.markVertexDirty(10, 1);
+    m.markVertexDirty(2, 1);
+    m.markVertexDirty(6, 1);
+    expect(m.vertexDirtyRange).toEqual([2, 9]);
+    m.flush(data);
+    expect(fake.writes).toHaveLength(1);
+    expect(fake.writes[0].offset).toBe(2 * 32);
+    expect(fake.writes[0].elements).toBe(9 * 8);
+    expect(m.vertexDirtyRange, 'and the span is cleared').toBeNull();
+  });
+
+  test('an odd-length index span is widened to a whole number of 4-byte units', () => {
+    // A Uint16 index is 2 bytes, and `writeBuffer` requires a multiple of 4, so
+    // three indices is a validation error and four is not.
+    const fake = recordingDevice();
+    const data = box();
+    const m = upload(fake.device, data);
+    fake.writes.length = 0;
+    m.markIndexDirty(0, 3);
+    m.flush(data);
+    expect(fake.writes[0].offset).toBe(0);
+    expect(fake.writes[0].elements, 'widened from 3 to 4').toBe(4);
+  });
+
+  test('markAllDirty covers both buffers, and flush takes them together', () => {
+    const fake = recordingDevice();
+    const data = box();
+    const m = upload(fake.device, data);
+    fake.writes.length = 0;
+    m.markAllDirty();
+    expect(m.vertexDirtyRange).toEqual([0, data.vertexCount]);
+    expect(m.indexDirtyRange).toEqual([0, data.indexCount]);
+    m.flush(data);
+    expect(fake.writes.map((w) => w.elements)).toEqual([data.vertexCount * 8, data.indexCount]);
+  });
+
+  test('flush refuses a different mesh, by identity on the layout and the counts', () => {
+    const fake = recordingDevice();
+    const data = box();
+    const m = upload(fake.device, data);
+    const other = box({ width: 2 });
+    m.markVertexDirty(0, 1);
+    const e = err(() => m.flush(other));
+    expect(e.code).toBe('INTERNAL_INVARIANT');
+    expect(e.message).toContain('upload()');
+  });
+
+  test('a layout override must still describe the data that was packed', () => {
+    const fake = recordingDevice();
+    // A combined instanced layout over a position-only mesh: the vertex half has
+    // to agree, or the offsets the pipeline reads are not the ones written.
+    const bad = layout({ position: 'float32x3', normal: 'float32x3', uv: 'float32x2' }, 2048, {
+      instanceTransform0: 'float32x4',
+    });
+    const e = err(() => upload(fake.device, box({ layout: POSITION_LAYOUT }), { layout: bad }));
+    expect(e.code).toBe('ATTRIBUTE_MISSING');
+    expect(e.message).toContain('normal');
+  });
+
+  test('an unindexed mesh tolerates an index mark', () => {
+    const fake = recordingDevice();
+    const flat = new MeshData({
+      layout: POSITION_LAYOUT,
+      vertices: { attributes: { position: [0, 0, 0, 1, 0, 0, 0, 1, 0] }, vertexCount: 3 },
+    });
+    const m = upload(fake.device, flat);
+    expect(() => m.markIndexDirty(0, 3)).not.toThrow();
+    expect(m.flush(flat)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local helpers used by the blocks above
+// ---------------------------------------------------------------------------
+
+function err(fn: () => void): AseError {
+  try {
+    fn();
+  } catch (e) {
+    if (e instanceof AseError) return e;
+    throw e;
+  }
+  throw new Error('expected an AseError, nothing was thrown');
+}
+
+/** The `tangent` attribute of one vertex of a tangent-carrying mesh. */
+function tangent(mesh: MeshData, i: number): number[] {
+  return attr(mesh, 'tangent', i);
+}

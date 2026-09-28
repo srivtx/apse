@@ -40,19 +40,27 @@ import { POSITION_LAYOUT, layoutCached } from '../src/geometry/layout.ts';
 import { generateScaffold, stripComments, validateGeneratedWGSL } from '../src/material/scaffold.ts';
 import type { GeneratedShader } from '../src/material/scaffold.ts';
 import {
+  ACES_COEFFICIENTS,
+  DEFAULT_HDR_FORMAT,
+  DEFAULT_TONE_MAP_OPERATOR,
   EXPOSURE_FRAME_FIELD,
   FULLSCREEN_LAYOUT,
   HDR_TARGET_FORMATS,
   OPERATOR_IDS,
+  SRGB_TRANSFER,
   TONEMAP_BLOCK,
   TONEMAP_MATERIAL_SLOTS,
   TONEMAP_SLOTS,
   TONE_MAP_OPERATORS,
   fullscreenMesh,
   isSrgbFormat,
+  linearToSrgb,
+  resolveTonemapOptions,
+  srgbToLinear,
   tonemapMaterialSpec,
+  writeToneMapSlots,
 } from '../src/material/tonemap.ts';
-import type { ToneMapOperator } from '../src/material/tonemap.ts';
+import type { ToneMapOperator, ToneMapSlots } from '../src/material/tonemap.ts';
 import { PresentPass } from '../src/render/present.ts';
 import type { PresentOptions } from '../src/render/present.ts';
 import { TEXTURE_USAGE } from '../src/render/device.ts';
@@ -411,8 +419,8 @@ describe('TONEMAP_SLOTS', () => {
   const block = buildUniformBlock('MaterialData', TONEMAP_SLOTS, { maxBindingSize: 65536 });
 
   test('declares the four fields the shader reads', () => {
-    expect(Object.keys(TONEMAP_SLOTS)).toEqual(['toneMap', 'exposure', 'operator', 'gamma']);
-    expect(block.fields.map((f) => f.name)).toEqual(['toneMap', 'exposure', 'operator', 'gamma']);
+    expect(Object.keys(TONEMAP_SLOTS)).toEqual(['toneMap', 'exposure', 'toneOperator', 'gamma']);
+    expect(block.fields.map((f) => f.name)).toEqual(['toneMap', 'exposure', 'toneOperator', 'gamma']);
     expect(block.fields.map((f) => f.type)).toEqual(['f32', 'f32', 'i32', 'f32']);
   });
 
@@ -465,9 +473,9 @@ describe('TONEMAP_SLOTS', () => {
   });
 
   test('the material block is the legal subset, resolved through buildUniformBlock', () => {
-    expect(Object.keys(TONEMAP_MATERIAL_SLOTS)).toEqual(['toneMap', 'operator', 'gamma']);
+    expect(Object.keys(TONEMAP_MATERIAL_SLOTS)).toEqual(['toneMap', 'toneOperator', 'gamma']);
     expect(TONEMAP_BLOCK.structName).toBe('MaterialData');
-    expect(TONEMAP_BLOCK.fields.map((f) => f.name)).toEqual(['toneMap', 'operator', 'gamma']);
+    expect(TONEMAP_BLOCK.fields.map((f) => f.name)).toEqual(['toneMap', 'toneOperator', 'gamma']);
     expect(TONEMAP_BLOCK.size).toBe(12);
     // And it is exactly what buildUniformBlock produces for that subset.
     expect(TONEMAP_BLOCK.fields).toEqual(
@@ -506,7 +514,7 @@ describe('the generated tone map WGSL', () => {
     expect(code).toContain('switch (op)');
     // The selector is a uniform, which is the whole point: one pipeline, four
     // curves, no shader compile when the user changes one.
-    expect(shader().resolved.fragmentBody).toContain('mat.operator');
+    expect(shader().resolved.fragmentBody).toContain('mat.toneOperator');
   });
 
   test('samples the source texture at a UV derived from @builtin(position)', () => {
@@ -553,9 +561,9 @@ describe('the generated tone map WGSL', () => {
 
   test('declares the legal slots and reads exposure from the frame block', () => {
     const { resolved } = shader({ operator: 'reinhard', gamma: 0.25 });
-    expect(Object.keys(resolved.slotTypes)).toEqual(['toneMap', 'operator', 'gamma']);
+    expect(Object.keys(resolved.slotTypes)).toEqual(['toneMap', 'toneOperator', 'gamma']);
     expect(resolved.slotDefaults.get('toneMap')).toBe(1);
-    expect(resolved.slotDefaults.get('operator')).toBe(OPERATOR_IDS.reinhard);
+    expect(resolved.slotDefaults.get('toneOperator')).toBe(OPERATOR_IDS.reinhard);
     expect(resolved.slotDefaults.get('gamma')).toBe(0.25);
     expect(resolved.fragmentBody).toContain('frame.exposure');
     expect(resolved.fragmentBody).not.toContain('mat.exposure');
@@ -563,7 +571,7 @@ describe('the generated tone map WGSL', () => {
 
   test('defaults to ACES at exposure 1, gamma 0', () => {
     const { resolved } = shader();
-    expect(resolved.slotDefaults.get('operator')).toBe(OPERATOR_IDS.aces);
+    expect(resolved.slotDefaults.get('toneOperator')).toBe(OPERATOR_IDS.aces);
     expect(OPERATOR_IDS.aces).toBe(1);
     // The fallback target format in a non-browser host. A real canvas answers
     // bgra8unorm, and both are non-srgb, so both need the encode below.
@@ -1383,5 +1391,175 @@ describe('the shape the renderer depends on', () => {
     expect(dest.width).toBe(640);
     expect(h.gpu.destroyLog).toHaveLength(before);
     pass.dispose();
+  });
+});
+
+// ===========================================================================
+// 10. The renderer-facing surface
+//
+// `PresentPass` is not this file's business, but it cannot wire tone mapping on
+// by default without a documented default and a validated way to build one. These
+// are the two functions and four constants that is, asserted directly — a
+// renderer that wires itself to anything else is relying on something that is
+// not tested.
+// ===========================================================================
+
+describe('resolveTonemapOptions — the documented default', () => {
+  test('no options at all is ACES, exposure 1, gamma 0, rgba16float, aces-encoded', () => {
+    // This object *is* "tone mapping on". Everything a renderer needs to turn it
+    // on is a decision apse has already made and a test has already pinned.
+    expect(resolveTonemapOptions()).toEqual({
+      operator: DEFAULT_TONE_MAP_OPERATOR,
+      exposure: 1,
+      gamma: 0,
+      hdrFormat: DEFAULT_HDR_FORMAT,
+      targetFormat: 'rgba8unorm',
+    });
+    expect(DEFAULT_TONE_MAP_OPERATOR).toBe('aces');
+    expect(DEFAULT_HDR_FORMAT).toBe('rgba16float');
+    // And the default actually produces a tone-mapped, encoded pass, not a copy.
+    const { resolved } = generateScaffold(tonemapMaterialSpec(resolveTonemapOptions()));
+    expect(resolved.slotDefaults.get('toneOperator')).toBe(OPERATOR_IDS.aces);
+    expect(resolved.fragmentBody).toContain('srgbEncode(graded)');
+  });
+
+  test('it fills gaps without discarding what the caller passed', () => {
+    expect(resolveTonemapOptions({ gamma: 0.25 })).toEqual({
+      operator: 'aces',
+      exposure: 1,
+      gamma: 0.25,
+      hdrFormat: 'rgba16float',
+      targetFormat: 'rgba8unorm',
+    });
+    expect(resolveTonemapOptions({ operator: 'reinhard', targetFormat: 'bgra8unorm-srgb' }).operator)
+      .toBe('reinhard');
+    expect(resolveTonemapOptions({ targetFormat: 'bgra8unorm-srgb' }).targetFormat)
+      .toBe('bgra8unorm-srgb');
+  });
+
+  test('it validates, so a caller that only ever builds options is still safe', () => {
+    // A renderer will not build a spec, so validating only in the spec builder
+    // would leave this path able to construct a pass whose shader is rejected.
+    for (const opts of [
+      { operator: 'filmic' as never },
+      { hdrFormat: 'rgba8unorm' as GPUTextureFormat },
+      { exposure: 0 },
+      { gamma: -1 },
+    ]) {
+      const error = expectCode(() => resolveTonemapOptions(opts), 'OPTION_UNKNOWN');
+      expect(error.fix.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('the target format is the one value the caller must not forget', () => {
+    // Documented as the failure with no error anywhere: the format decides
+    // whether the sRGB encode is in the shader or in the hardware, so a mismatch
+    // is a wrong image rather than a wrong call.
+    const srgb = generateScaffold(tonemapMaterialSpec(resolveTonemapOptions({ targetFormat: 'bgra8unorm-srgb' })));
+    expect(srgb.resolved.fragmentBody).toContain('let display = graded;');
+    const plain = generateScaffold(tonemapMaterialSpec(resolveTonemapOptions({ targetFormat: 'bgra8unorm' })));
+    expect(plain.resolved.fragmentBody).toContain('let display = srgbEncode(graded);');
+    // Omitted, the fallback is the canvas format — right for a canvas, wrong for
+    // anything else. That asymmetry is why the option is on the type.
+    expect(resolveTonemapOptions().targetFormat).toBe('rgba8unorm');
+  });
+});
+
+describe('writeToneMapSlots — the three writes, and the one it must not make', () => {
+  /** The whole `ToneMapSlots` contract, in three lines. */
+  function recorder(): { slots: Record<string, number>; target: ToneMapSlots } {
+    const slots: Record<string, number> = {};
+    return { slots, target: { setSlot: (n, v) => { slots[n] = v; } } };
+  }
+
+  test('it writes the three material-block fields and nothing else', () => {
+    const { slots, target } = recorder();
+    writeToneMapSlots(target, { operator: 'reinhard', gamma: 0.2 });
+    expect(slots).toEqual({ toneMap: 1, toneOperator: OPERATOR_IDS.reinhard, gamma: 0.2 });
+  });
+
+  test('exposure is deliberately absent, and the reason is structural', () => {
+    // `exposure` is a reserved field of the generated frame block, and the
+    // renderer rewrites the whole frame block every frame — so a value written
+    // here would be overwritten before the next draw. PresentPass.setExposure is
+    // the only thing that can hold it, and it re-asserts on every render().
+    const { slots, target } = recorder();
+    writeToneMapSlots(target, { operator: 'aces', exposure: 4 });
+    expect(Object.keys(slots)).not.toContain('exposure');
+    expect(RESERVED_SLOT_NAMES.has('exposure')).toBe(true);
+    expect(EXPOSURE_FRAME_FIELD).toBe('exposure');
+  });
+
+  test('it validates, and it does not write anything when it fails', () => {
+    // Half a retune is worse than none: an operator switched without its gamma,
+    // or a toneMap blend left at 0 from a previous call, and a frame that is
+    // quietly wrong in a way nothing reports.
+    const { slots, target } = recorder();
+    expectCode(() => writeToneMapSlots(target, { operator: 'nope' as never }), 'OPTION_UNKNOWN');
+    expect(slots).toEqual({});
+  });
+
+  test('it works on a real Material, through the structural interface', () => {
+    // The point of declaring `ToneMapSlots` rather than importing `Material`:
+    // this module stays free of a dependency on the compiled shader, and the
+    // renderer can retune a pass without pulling material.ts in for a type.
+    const h = harness();
+    return present(h, destination(h), { toneMapping: {} }).then((pass) => {
+      const material = pass.material!;
+      writeToneMapSlots(material, { operator: 'linear', gamma: 0.1 });
+      expect(material.materialData.get('toneOperator')).toEqual([OPERATOR_IDS.linear]);
+      // f32 storage, so 0.1 comes back as the nearest float to it.
+      expect(material.materialData.get('gamma')[0]).toBeCloseTo(0.1, 6);
+      expect(material.materialData.get('toneMap')).toEqual([1]);
+      expect(material.slotsDirty).toBe(true);
+      pass.dispose();
+    });
+  });
+});
+
+describe('the working space, and the transfer functions that pin it', () => {
+  test('the sRGB constants the shader was generated from are exported', () => {
+    // Exported so a caller converting colours on the CPU produces the same
+    // numbers the shader does, and so a reader can check the shader against them
+    // without reading the generator.
+    expect(SRGB_TRANSFER).toEqual(SRGB_PORT);
+    expect(ACES_COEFFICIENTS).toEqual(ACES_FIT);
+    const { code } = shader();
+    expect(code).toContain(`const SRGB_LINEAR_THRESHOLD : f32 = ${SRGB_TRANSFER.linearThreshold};`);
+    expect(code).toContain(`const ACES_E : f32 = ${ACES_COEFFICIENTS.e};`);
+  });
+
+  test('linearToSrgb is the same curve the shader emits, to the last digit tested', () => {
+    for (const x of [0, 0.002, 0.0031308, 0.02, 0.18, 0.5, 1, 2, 16]) {
+      expect(linearToSrgb(x)).toBeCloseTo(srgbPort(x), 12);
+    }
+  });
+
+  test('srgbToLinear inverts it, and clamps below zero rather than returning NaN', () => {
+    for (const x of [0, 0.01, 0.04, 0.2, 0.5, 0.735357, 1]) {
+      expect(srgbToLinear(linearToSrgb(x))).toBeCloseTo(x, 6);
+    }
+    // pow() of a negative base is undefined, and a NaN here would propagate into
+    // every colour the caller touches.
+    expect(linearToSrgb(-1)).toBe(0);
+    expect(srgbToLinear(-1)).toBe(0);
+    expect(linearToSrgb(Number.NaN)).toBe(0);
+    expect(srgbToLinear(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  test('the operator ids in the generated switch come from the exported table', () => {
+    // The generator used to hardcode four consts beside the table and comment that
+    // they were generated. Renaming a value in the table would then have left the
+    // switch selecting a curve the caller never asked for.
+    const { code } = shader();
+    for (const [name, id] of Object.entries(OPERATOR_IDS)) {
+      expect(code).toContain(`const OPERATOR_${name.toUpperCase()} : i32 = ${id};`);
+      expect(code).toContain(`case OPERATOR_${name.toUpperCase()}:`);
+    }
+    // The const array and the id table are the same four names, and their order
+    // in the array is the order of their ids — which is what makes the generated
+    // `switch` a dense set of cases rather than a sparse one.
+    expect([...TONE_MAP_OPERATORS] as string[]).toEqual(Object.keys(OPERATOR_IDS));
+    expect(TONE_MAP_OPERATORS.map((name) => OPERATOR_IDS[name])).toEqual([0, 1, 2, 3]);
   });
 });

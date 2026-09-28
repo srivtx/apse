@@ -224,6 +224,25 @@ const SPEC_KEYS: readonly string[] = [
   'depthFormat', 'stripIndexFormat', 'vertex', 'fragment', 'scaffold',
 ];
 
+/**
+ * The canvas format a material should target when the caller does not say.
+ *
+ * Read at call time rather than captured at module load, and guarded for
+ * non-browser contexts so importing a material factory in a Node test does not
+ * throw. `rgba8unorm` is the documented fallback for anywhere there is no canvas
+ * — an offscreen target, where the caller must pass the format anyway.
+ *
+ * Exported because five shipped material factories all default to it and a
+ * sixth private copy of these five lines is how they drift apart. It lives here
+ * rather than in one of them because this is the module every material already
+ * imports, and because {@link resolveTargets} computes the identical value.
+ */
+export function preferredTargetFormat(): GPUTextureFormat {
+  return typeof navigator !== 'undefined' && typeof navigator.gpu !== 'undefined'
+    ? navigator.gpu.getPreferredCanvasFormat()
+    : 'rgba8unorm';
+}
+
 // ---------------------------------------------------------------------------
 // Resolved form
 // ---------------------------------------------------------------------------
@@ -643,15 +662,35 @@ interface SamplerDraft {
   slotNames: string[];
 }
 
+/**
+ * The sampler variable name a body must use for a texture slot.
+ *
+ * Not always `<slotName>Sampler`: two slots whose sampler configuration is
+ * identical share one binding, and a shared binding has exactly one name, taken
+ * from the **first** slot in the group. A material factory that generates a body
+ * has to know which name that is, and the only honest way to find out is to ask
+ * the same resolver the generator uses — re-deriving the rule here would be
+ * exactly the drift the sharing exists to prevent, and a wrong answer is a WGSL
+ * error naming an undeclared identifier on a line nobody wrote.
+ *
+ * A pure function of `textures`, so calling it while the spec is still being
+ * assembled is safe: `resolveSpec` runs the identical computation later and
+ * reaches the identical answer.
+ */
+export function samplerNameFor(
+  textures: Readonly<Record<string, TextureSlotSpec>> | undefined,
+  slotName: string,
+): string {
+  if (textures === undefined) return `${slotName}Sampler`;
+  const { samplerForSlot } = resolveTextureSlots(textures, 'sampler-probe');
+  return samplerForSlot.get(slotName)?.varName ?? `${slotName}Sampler`;
+}
+
 function resolveTargets(targets: readonly TargetSpec[] | undefined, material: string): ResolvedTarget[] {
   // The canvas preferred format, not a hardcoded rgba8unorm: it is bgra8unorm
   // on desktop, and a pipeline built for the wrong one fails at setPipeline with
   // a message that names a format instead of the mistake.
-  const fallback: GPUTextureFormat =
-    typeof navigator !== 'undefined' && typeof navigator.gpu !== 'undefined'
-      ? navigator.gpu.getPreferredCanvasFormat()
-      : 'rgba8unorm';
-  const list: readonly TargetSpec[] = targets ?? [{ format: fallback }];
+  const list: readonly TargetSpec[] = targets ?? [{ format: preferredTargetFormat() }];
   if (list.length === 0) {
     fail('RENDER_TARGET_FORMAT_MISMATCH', `Material "${material}" declares no colour targets.`, {
       why: 'A render pipeline needs at least one colour attachment, and the generated fragment entry point returns a single `@location(0) vec4f`.',
@@ -961,20 +1000,63 @@ const OBJECT_FIELD_NAMES: readonly string[] = [
   'model', 'normalMatrix', 'objectId', 'instanceId', 'visibility',
 ];
 
+/**
+ * Names apse refuses as a slot, varying, or texture variable.
+ *
+ * The first block is WGSL's *keywords*; the second is its much longer list of
+ * **reserved words**, which Tint rejects exactly as hard. The second block is the
+ * one that matters, because its members read like ordinary variable names —
+ * `operator`, `sample`, `shared`, `filter`, `typedef`, `union` — and a material
+ * that declared a slot called any of them would fail at shader-compile time with
+ * a message pointing at generated code, rather than here where the fix can be
+ * named.
+ *
+ * It is not the whole reserved list: it is the members that are plausible field
+ * names in a graphics API. The cost of a false positive is a renamed slot, and
+ * the cost of a false negative is a shader that does not compile.
+ */
 const WGSL_KEYWORDS: ReadonlySet<string> = new Set([
+  // --- keywords ---
   'in', 'out', 'let', 'var', 'const', 'fn', 'struct', 'return', 'if', 'else', 'for',
   'while', 'loop', 'switch', 'case', 'default', 'break', 'continue', 'discard',
   'type', 'alias', 'override', 'true', 'false', 'array', 'atomic', 'ptr', 'sampler',
   'texture_2d', 'texture_cube', 'vec2f', 'vec3f', 'vec4f', 'mat4x4f', 'f32', 'i32', 'u32',
+  // --- reserved words a graphics API might plausibly name a field ---
+  'operator', 'common', 'filter', 'get', 'set', 'shared', 'static', 'typedef', 'typeid',
+  'union', 'template', 'class', 'interface', 'namespace', 'using', 'module', 'new',
+  'delete', 'public', 'private', 'protected', 'virtual', 'explicit', 'export',
+  'external', 'interface', 'match', 'mut', 'ref', 'require', 'resource', 'self',
+  'sizeof', 'super', 'this', 'typeof', 'unsized', 'use', 'where', 'with', 'yield',
+  'async', 'await', 'become', 'cast', 'catch', 'coherent', 'compile', 'concept',
+  'consteval', 'constexpr', 'crate', 'do', 'dynamic_cast', 'enum', 'fallthrough',
+  'final', 'finally', 'friend', 'from', 'impl', 'implements', 'import', 'inline',
+  'instanceof', 'layout', 'macro', 'meta', 'mod', 'move', 'mutable', 'noexcept',
+  'null', 'of', 'package', 'partition', 'pass', 'patch', 'precise', 'precision',
+  'priv', 'pub', 'readonly', 'register', 'reinterpret_cast', 'require', 'resource',
+  'restrict', 'snorm', 'std', 'subroutine', 'target', 'throw', 'trait', 'try',
+  'typeid', 'typename', 'unorm', 'unsafe', 'varying', 'volatile', 'wgsl',
+  // --- the builtin type and function names a slot would shadow ---
+  'vec2', 'vec3', 'vec4', 'mat2x2', 'mat3x3', 'mat4x4', 'bitcast', 'f16', 'texture_1d',
+  'texture_2d_array', 'texture_3d', 'texture_cube_array', 'texture_storage_2d',
+  'texture_depth_2d', 'texture_depth_cube', 'texture_depth_2d_array',
 ]);
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function assertIdentifier(name: string, what: string, material: string): void {
-  if (!IDENTIFIER.test(name) || WGSL_KEYWORDS.has(name)) {
+  if (!IDENTIFIER.test(name)) {
     fail('OPTION_UNKNOWN', `${what} name "${name}" on material "${material}" is not a usable WGSL identifier.`, {
-      why: 'Slot, varying, and texture names are emitted verbatim as WGSL identifiers, so they must match the identifier grammar and must not shadow a type or keyword.',
+      why: 'Slot, varying, and texture names are emitted verbatim as WGSL identifiers, so they must match the identifier grammar.',
       fix: 'Use a letter or underscore followed by letters, digits, and underscores. Give a texture slot a `name` override if its slot name cannot be changed.',
+    });
+  }
+  if (WGSL_KEYWORDS.has(name)) {
+    // Named separately from the grammar because the fix is different and the
+    // reason is not obvious: `operator`, `filter`, `shared` and `sample` are
+    // perfectly good JavaScript property names and perfectly illegal WGSL ones.
+    fail('OPTION_UNKNOWN', `${what} name "${name}" on material "${material}" is a WGSL reserved word.`, {
+      why: 'WGSL reserves a long list of words — including ordinary-looking ones like `operator`, `filter`, `shared`, `get`, `set` and `typedef` — and Tint rejects them as identifiers. The failure would otherwise surface as a shader-compile error whose line number points into generated code.',
+      fix: `Rename it. \`${name}\` is reserved by the WGSL specification regardless of what it means in JavaScript.`,
     });
   }
 }
@@ -1032,11 +1114,18 @@ function bodyNames(resolved: ResolvedMaterialSpec, stage: 'vertex' | 'fragment')
   const names = ['in', 'frame', 'obj'];
   if (stage === 'vertex') names.push('out');
   if (resolved.materialBlock !== null) names.push('mat');
+  // A shared sampler is one name, so a group of N slots on one sampler
+  // contributes N texture names and *one* sampler name. Collecting into a Set
+  // rather than pushing per slot keeps the header an accurate list — a sampler
+  // printed three times reads as three samplers, and the header is the answer to
+  // "what may I write in this body".
+  const samplers = new Set<string>();
   for (const t of resolved.textures) {
     names.push(t.varName);
     const s = resolved.samplerForSlot.get(t.slotName);
-    if (s !== undefined) names.push(s.varName);
+    if (s !== undefined) samplers.add(s.varName);
   }
+  for (const name of samplers) names.push(name);
   return names;
 }
 

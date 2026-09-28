@@ -192,12 +192,20 @@ export class UniformBlock {
   private field(name: string): UniformField {
     const f = this.spec.fields.find((x) => x.name === name);
     if (f === undefined) {
-      fail('INTERNAL_INVARIANT',
+      // `INVALID_USAGE`, not `INTERNAL_INVARIANT`: `UniformBlock` is public and
+      // `set`/`get` take the name as a plain string, so a misspelled field is a
+      // caller's typo reaching apse through an untyped edge — exactly the class
+      // of failure that must not be filed as an apse bug. The names are listed
+      // because the whole cost of the mistake is that you did not know they
+      // existed.
+      const known = this.spec.fields.map((x) => x.name);
+      fail('INVALID_USAGE',
         `Uniform block "${this.spec.structName}" has no field "${name}".`, {
-          why: 'apse writes uniform fields by name; writing an unknown name means the field table and the writer disagree.',
-          fix: 'This is a bug in apse. Please report it with the material that triggered it.',
-        });
-      throw new Error('unreachable');
+        why: `Fields are looked up by name in a block generated from a fixed field list, so a name outside it addresses no byte offset. This block has ${known.length} field${known.length === 1 ? '' : 's'}.`,
+        fix: known.length === 0
+          ? `This block is empty, so it has no fields to write.`
+          : `Use one of: ${known.join(', ')}.`,
+      });
     }
     return f;
   }

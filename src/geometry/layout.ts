@@ -122,6 +122,17 @@ export function vertexFormat(format: string, attribute: string): VertexFormatInf
 export type AttributeDefs = Readonly<Record<string, VertexFormat>>;
 
 /**
+ * The attribute name a tangent basis is written to, and read from.
+ *
+ * `float32x4` rather than a `vec3`: the fourth component is the **handedness**,
+ * `+1` or `-1`, telling the fragment stage which way the bitangent runs so a
+ * mirrored uv can be detected instead of shading the wrong side of every normal
+ * map. It is one float of bandwidth and the difference between a correct and an
+ * inside-out normal map.
+ */
+export const TANGENT = 'tangent';
+
+/**
  * `maxVertexAttributes`: the number of `@location`s a vertex stage input may
  * declare, counted across *every* vertex buffer the pipeline binds. The vertex
  * half and the per-instance half draw on the same budget, which is the whole
@@ -538,13 +549,20 @@ export const STANDARD_ATTRIBUTES: AttributeDefs = Object.freeze({
 /** position + normal + uv, 32 bytes/vertex. The right default for most meshes. */
 export const STANDARD_LAYOUT: VertexLayout = layout(STANDARD_ATTRIBUTES);
 
-/** position + normal + uv + tangent + handedness, 48 bytes/vertex. */
-export const TANGENT_LAYOUT: VertexLayout = layout({
-  position: 'float32x3',
-  normal: 'float32x3',
-  uv: 'float32x2',
-  tangent: 'float32x4',
+/**
+ * The attribute map behind {@link TANGENT_LAYOUT}.
+ *
+ * Exported for the same reason {@link STANDARD_ATTRIBUTES} is: a normal-mapped
+ * material and the geometry feeding it have to name the tangent attribute
+ * identically, and there is exactly one name for it.
+ */
+export const TANGENT_ATTRIBUTES: AttributeDefs = Object.freeze({
+  ...STANDARD_ATTRIBUTES,
+  [TANGENT]: 'float32x4',
 });
+
+/** position + normal + uv + tangent + handedness, 48 bytes/vertex. */
+export const TANGENT_LAYOUT: VertexLayout = layout(TANGENT_ATTRIBUTES);
 
 /** position + uv, 20 bytes/vertex. For unlit or fully custom shading. */
 export const POSITION_UV_LAYOUT: VertexLayout = layout({

@@ -91,9 +91,33 @@ export const OBJECT_UNIFORM_STRIDE_F32 = OBJECT_UNIFORM_STRIDE / 4;
 export const OBJECT_UNIFORM_SIZE = 124;
 
 /**
+ * The smallest object-uniform stride {@link Scene.collectDrawItems} will accept,
+ * in bytes.
+ *
+ * `minUniformBufferOffsetAlignment` is 256 in the WebGPU specification, and a
+ * device may only ever report a *smaller* one — the compatibility profile takes
+ * the floor, and no profile raises it. So "a multiple of 256" is the one stride
+ * rule that is correct on every device without asking the device anything, and
+ * that is what the parameter is checked against rather than against a value
+ * passed in from the renderer. It also happens to be the default, so the common
+ * case needs no arithmetic at all.
+ */
+export const MIN_OBJECT_UNIFORM_STRIDE = OBJECT_UNIFORM_STRIDE;
+
+/**
  * The `DrawItem` fields apse fills in. `material` and `geometry` are
  * `readonly` on the interface, so the pooled implementation declares them
  * mutable and is assignable to it — the pool is the point.
+ *
+ * Every field is assigned on every frame by {@link Scene.collectDrawItems}, and
+ * that is not a matter of tidiness. A pooled item is an object that last frame's
+ * scene left holding last frame's node, and anything not overwritten is
+ * *someone else's values* read as if they were this frame's — a stale
+ * `instanceCount` draws the wrong number of copies, a stale `objectId` puts two
+ * objects' transforms in one uniform slot. The initialiser is one function for
+ * exactly that reason, and {@link Scene.collectDrawItems} validates the result
+ * of it rather than the inputs, so a field added later fails loudly instead of
+ * reading a default.
  */
 class PooledDrawItem implements DrawItem {
   objectId = 0;
@@ -130,6 +154,108 @@ const _collectStack: Node[] = [];
 const _traverseStack: Node[] = [];
 
 // ---------------------------------------------------------------------------
+// Draw-item validation
+// ---------------------------------------------------------------------------
+
+/**
+ * `Resource` state, read structurally.
+ *
+ * `DrawableGeometry` and `Drawable` are interfaces in `src/render`, and they
+ * describe what a draw *needs* — not how the thing behind them counts its
+ * references. `GpuMesh` and `Material` both answer these questions; a hand-rolled
+ * geometry does not, and `undefined` here means "not a ref-counted resource",
+ * which is not an error. `undefined` is a valid answer because a *missing*
+ * `disposed` cannot mean a disposed object.
+ */
+interface ResourceState {
+  readonly disposed?: boolean;
+  readonly name?: string;
+}
+
+/**
+ * Rejects an object-uniform stride that would produce misaligned dynamic offsets.
+ *
+ * **Why this is checked once, before the walk, and not per item.** The check
+ * used to live nowhere, and the failure it is checking for is the one that
+ * cannot be caught at the point of use: `0 * stride` is `0`, and `0` is a legal
+ * dynamic offset on every device. So a scene with no visible meshes, or exactly
+ * one, produces nothing wrong at all, and the corruption appears at the *second*
+ * item — by which point the offset is in a bind group call and the item is on
+ * its way to the command buffer. Validating the stride instead of the offsets
+ * makes the empty scene and the one-item scene fail exactly as loudly as the
+ * thousand-item one, which is the only version of the rule that is a rule.
+ */
+function assertObjectStride(stride: number): void {
+  const ok = Number.isInteger(stride) && stride >= MIN_OBJECT_UNIFORM_STRIDE && stride % MIN_OBJECT_UNIFORM_STRIDE === 0;
+  if (ok) return;
+  fail('INVALID_USAGE',
+    `collectDrawItems was given an object uniform stride of ${stride} bytes.`, {
+    why: `A dynamic offset must be a multiple of minUniformBufferOffsetAlignment (256 on every profile). Object 0 is always at offset 0 and always valid, so a one-item scene is correct and a two-item scene is a silent corruption.`,
+    fix: `Pass a positive multiple of ${MIN_OBJECT_UNIFORM_STRIDE} — the default, and what \`ObjectUniforms\` is allocated with.`,
+    detail: { kind: 'numeric', field: 'objectUniformStride', value: stride, min: MIN_OBJECT_UNIFORM_STRIDE },
+  });
+}
+
+/**
+ * True when a draw on this node would issue anything at all.
+ *
+ * Zero is legal input and must not become a draw item: `GpuInstances` accepts an
+ * empty transform list — it allocates a 4-byte floor so `createBuffer` stays well
+ * defined — and a mesh with no indices is equally legal. `drawIndexed` with
+ * `instanceCount: 0` is a silent no-op, so a node that will draw nothing is
+ * counted instead. It is a *not-submitted* node, which is a different fact from a
+ * culled one, and the two are counted separately for exactly that reason.
+ */
+function canDraw(node: MeshNode): boolean {
+  const indexCount = (node.mesh as { indexCount?: number }).indexCount ?? 0;
+  return indexCount > 0 && node.instanceCount > 0;
+}
+
+/**
+ * Rejects a draw item the renderer could not encode correctly.
+ *
+ * Runs on the *item*, after it has been filled in, and on every item. The
+ * alternative — checking the node on the way in — is what makes a validation
+ * conditional on which path emitted the item, and a validation that some paths
+ * skip is not a validation.
+ *
+ * The three failures are the three ways a draw item can be structurally
+ * plausible and still produce a corrupt frame: a dynamic offset the API will
+ * reject, a geometry whose buffers are gone, and a `model` that is not a
+ * `mat4x4f`. The middle one is what refcounted ownership in `node.ts` makes
+ * unreachable by normal use — a node holds a reference to what it draws — so it
+ * is the backstop for the paths ownership does not cover: a mesh disposed by hand
+ * while a node still points at it.
+ */
+function assertDrawable(item: DrawItem): void {
+  if (item.objectOffset % MIN_OBJECT_UNIFORM_STRIDE !== 0) {
+    fail('INTERNAL_INVARIANT',
+      `Draw item ${item.objectId} would bind its object block at byte offset ${item.objectOffset}.`, {
+      why: `A dynamic offset must be a multiple of ${MIN_OBJECT_UNIFORM_STRIDE}; one that is not invalidates the whole command buffer, with no exception and an empty frame. The stride is validated on entry to collectDrawItems, so this offset came from somewhere other than \`objectId * stride\`.`,
+      fix: 'Report this: `objectOffset` is assigned in exactly one place.',
+      detail: { kind: 'numeric', field: 'objectOffset', value: item.objectOffset, min: MIN_OBJECT_UNIFORM_STRIDE },
+    });
+  }
+
+  const geometry = item.geometry as ResourceState;
+  if (geometry.disposed === true) {
+    fail('MESH_DISPOSED',
+      `Draw item ${item.objectId} draws mesh "${geometry.name ?? 'unnamed'}", whose buffers have been released.`, {
+      why: 'The buffers behind this item are destroyed, so the draw encodes against freed memory: every triangle of this object silently vanishes while the draw call succeeds.',
+      fix: 'Hold a reference with `mesh.ref()`. A MeshNode in a graph already holds one, so this means the mesh was disposed out from under the node.',
+    });
+  }
+  if (item.model.length !== 16) {
+    fail('INTERNAL_INVARIANT',
+      `Draw item ${item.objectId} carries a ${item.model.length}-element model matrix.`, {
+      why: 'The model is a mat4x4f in the object block. Any other length leaves the rest of the record unwritten, so every object after this one inherits the previous one\'s transform.',
+      fix: 'Report this: `DrawItem.model` is a live reference to a node\'s `Float32Array(16)`.',
+      detail: { kind: 'numeric', field: 'model.length', value: item.model.length, min: 16, max: 16 },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Scene
 // ---------------------------------------------------------------------------
 
@@ -146,6 +272,32 @@ export interface SceneOptions {
  * extra level. It is the one node that is never culled and never drawn, and
  * because nothing dirties it implicitly it is the single comparison that makes
  * a static frame free.
+ *
+ * ## A scene owns what is in it
+ *
+ * {@link add} and {@link remove} are also the retain and release pair. Adding a
+ * `MeshNode` takes a reference to its mesh and its material; removing one gives
+ * it back. So the question "is this mesh still alive?" is answered by the graph
+ * rather than by whoever happened to keep a handle:
+ *
+ * ```ts
+ * const mesh = upload(device, boxData());           // refCount 1, yours
+ * const node = new MeshNode({ mesh, material });    // not in a graph: still 1
+ * scene.add(node);                                  // refCount 2, the scene's
+ * mesh.unref();                                     // you are done with it
+ * // ...render for as long as you like: the node holds the last reference
+ * scene.remove(node);                               // refCount 0, released
+ * ```
+ *
+ * Without the `add` line, that `unref` destroys the buffers out from under a
+ * scene that is still drawing them, and the symptom is a screen that goes empty
+ * with no error and no failing draw call.
+ *
+ * The same rule applies one level down, which is the part that has to be here
+ * rather than in {@link add}: a node built into a group *before* the group is
+ * added is covered by exactly the same code path, because the reference is taken
+ * by `Node.add` and given back by the one detach path every removal funnels
+ * through. Ownership is a property of being in a graph, not of which graph.
  */
 export class Scene {
   readonly name: string;
@@ -187,7 +339,13 @@ export class Scene {
     return this.#peakDrawCount;
   }
 
-  /** Attaches `node` to the scene root. Chainable. */
+  /**
+   * Attaches `node` to the scene root. Chainable.
+   *
+   * Takes a reference to everything `node` draws, and to everything its existing
+   * subtree draws, so a group assembled before it reaches the scene arrives with
+   * its resources already retained. See the class comment.
+   */
   add(node: Node): this {
     this.root.add(node);
     this.#version++;
@@ -195,7 +353,10 @@ export class Scene {
   }
 
   /**
-   * Detaches `node` from the scene.
+   * Detaches `node` from the scene, wherever in the tree it is.
+   *
+   * Releases the references taken by {@link add}, so a mesh or material whose
+   * only remaining reference was the scene's is disposed here and not before.
    *
    * Throws `NODE_NOT_ATTACHED` when it was never in a scene, because "removed
    * something that was not there" is nearly always a variable that was never
@@ -214,7 +375,13 @@ export class Scene {
     return this;
   }
 
-  /** Detaches everything. */
+  /**
+   * Detaches everything, releasing every reference the scene held.
+   *
+   * A shared mesh is released once per node that held it, so a thousand nodes on
+   * one geometry survive this call with the geometry intact and dispose it on the
+   * thousandth detach — not on the first.
+   */
   clear(): this {
     this.root.clear();
     this.#version++;
@@ -252,8 +419,54 @@ export class Scene {
   }
 
   /**
+   * MeshNodes the last {@link collectDrawItems} call tested and rejected.
+   *
+   * Recorded at the walk because the caller cannot derive it: `out` only ever
+   * receives the survivors, so `candidates - out.length` is a subtraction of a
+   * number by itself and always zero. A statistic that can only ever read one
+   * value is worse than no statistic, because it looks like culling is working.
+   *
+   * This counts **frustum rejections and nothing else**. A node that was never a
+   * candidate — hidden, on a layer the camera does not see, or holding a
+   * geometry with no instances to draw — is in {@link emptyCount} or in neither,
+   * and folding those in here is how a "culled" statistic starts reporting how
+   * much of the scene the author happened to switch off.
+   */
+  culledCount = 0;
+
+  /**
+   * MeshNodes the last walk saw, before culling.
+   *
+   * The three counters partition it exactly, and the partition is the point:
+   *
+   * ```txt
+   *   meshNodeCount === out.length + culledCount + emptyCount
+   * ```
+   *
+   * so any one of them can be checked against the other two, and a caller that
+   * wants "how much of my scene did I not draw, and why" has both answers
+   * rather than one ambiguous one. A node under a hidden ancestor is in none of
+   * them, and {@link meshNodeCount} counts it: the walk skipped that subtree on
+   * the ancestor's behalf, and pretending otherwise would make the identity
+   * above false.
+   */
+  meshNodeCount = 0;
+
+  /**
+   * MeshNodes that were candidates and produced no draw item for a reason other
+   * than culling — today, a geometry with no instances or no indices.
+   *
+   * Separate from {@link culledCount} because the two mean opposite things: a
+   * culled node is off screen and a closer camera will find it, while an empty
+   * one is on screen, in frustum, and still has nothing to draw. A statistic
+   * that adds them together reports a culling win for a scene that has nothing
+   * to draw.
+   */
+  emptyCount = 0;
+
+  /**
    * Resolves world matrices, culls, and fills `out` with one pooled
-   * {@link DrawItem} per visible mesh node.
+   * {@link DrawItem} per drawable, unculled mesh node.
    *
    * `out` is cleared first, so the array length is the draw count and a culled
    * object is *absent* rather than present-and-invisible. Absent is the
@@ -264,30 +477,31 @@ export class Scene {
    * {@link OBJECT_UNIFORM_STRIDE}. `item.objectOffset` is `index * stride` and
    * `item.objectId` is `index`, both indexed into `out` — the uniform packer
    * writes object *k*'s transform at byte offset *k* × 256, and a shader reads
-   * the same number back out of the flat `objectId`.
+   * the same number back out of the flat `objectId`. The stride must be a
+   * positive multiple of {@link MIN_OBJECT_UNIFORM_STRIDE}, and it is checked
+   * before the walk rather than per item: see {@link assertObjectStride} for why
+   * the per-item version of that check is not a check.
+   *
+   * Instanced meshes are one item, not `instanceCount` of them. The count rides
+   * on the item, so a thousand copies of a cube cost a thousand sphere tests, a
+   * thousand uniform slots, and **one** `drawIndexed`. The per-instance transforms
+   * themselves are vertex attributes read from `node.instanceBuffer` — see
+   * `MeshNode.instanceCount` for why that count is read per frame rather than
+   * captured.
    *
    * The camera's frustum is extracted once, into module scratch, and every
    * node is tested against it. Nothing here allocates, on any frame, ever:
    * a scene that grew to 100,000 objects would still allocate zero.
    */
-  /**
-   * MeshNodes the last {@link collectDrawItems} call tested and rejected.
-   *
-   * This has to be recorded here, at the walk, because the caller cannot derive
-   * it: `out` only ever receives the survivors, so `candidates - out.length` is
-   * a subtraction of a number by itself and always zero. A statistic that can
-   * only ever read one value is worse than no statistic, because it looks like
-   * culling is working.
-   */
-  culledCount = 0;
-  /** MeshNodes the last walk visited, before and after culling. */
-  meshNodeCount = 0;
-
   collectDrawItems(
     out: DrawItem[],
     camera: Camera,
     objectUniformStride: number = OBJECT_UNIFORM_STRIDE,
   ): DrawItem[] {
+    // Before anything else, and unconditionally: this is the one validation that
+    // cannot be deferred to the items, because a scene with zero or one item
+    // cannot produce a misaligned offset to complain about.
+    assertObjectStride(objectUniformStride);
     updateWorldMatrices(this.root);
     camera.getFrustum(_frustum);
     out.length = 0;
@@ -296,7 +510,8 @@ export class Scene {
     stack.length = 0;
     stack.push(this.root);
     let meshNodes = 0;
-    this.culledCount = 0;
+    let culled = 0;
+    let empty = 0;
     const layers = camera.layers;
 
     while (stack.length > 0) {
@@ -307,12 +522,19 @@ export class Scene {
 
       if (node instanceof MeshNode) {
         meshNodes++;
-        _sphere.center = node.worldPosition;
-        _sphere.radius = node.worldBoundingRadius;
-        if (containsSphere(_frustum, _sphere)) {
-          out.push(this.#take(node, camera, objectUniformStride, out.length));
+        // Not a cull decision and not a draw: a node with nothing to draw is
+        // never submitted, and reporting it as culled would credit the
+        // frustum with rejecting something that was never in front of it.
+        if (!canDraw(node)) {
+          empty++;
         } else {
-          this.culledCount++;
+          _sphere.center = node.worldPosition;
+          _sphere.radius = node.worldBoundingRadius;
+          if (containsSphere(_frustum, _sphere)) {
+            out.push(this.#emit(node, camera, objectUniformStride, out.length));
+          } else {
+            culled++;
+          }
         }
       }
 
@@ -321,15 +543,33 @@ export class Scene {
     }
 
     this.meshNodeCount = meshNodes;
+    this.culledCount = culled;
+    this.emptyCount = empty;
     this.#peakDrawCount = out.length > this.#peakDrawCount ? out.length : this.#peakDrawCount;
     return out;
   }
 
   /**
-   * Reuses the item at `index` of the pool, growing it if this is the first
-   * time the scene has needed that many.
+   * The single place a draw item is created, filled, and checked.
+   *
+   * One function for three reasons, each of which is a bug the moment it is
+   * spread out:
+   *
+   *   1. **The pool.** A reused item is last frame's object. Every field is
+   *      assigned unconditionally below, so nothing survives from a previous
+   *      frame — a stale `instanceCount` draws the wrong number of copies and a
+   *      stale `objectId` puts two objects in one uniform slot, both silently.
+   *   2. **The validation.** It runs on the item, once, here. Any second place
+   *      that pushed into `out` would be a path that skips it, and a validation
+   *      some paths skip is not a validation.
+   *   3. **The slot.** `objectId` is the item's own index, so every item has a
+   *      unique dynamic-offset slot and the uniform packer can key on it
+   *      without a second lookup. One slot per *item*, not per instance: an
+   *      instanced draw binds one object block and reads each instance's
+   *      transform from the vertex buffer, so a per-instance slot would be a
+   *      second copy of the same 124 bytes `instanceCount` times over.
    */
-  #take(node: MeshNode, camera: Camera, stride: number, index: number): DrawItem {
+  #emit(node: MeshNode, camera: Camera, stride: number, index: number): DrawItem {
     const item = this.#pool[index] ?? (this.#pool[index] = new PooledDrawItem());
     item.objectId = index;
     item.objectOffset = index * stride;
@@ -342,6 +582,9 @@ export class Scene {
     item.order = node.order;
     item.material = node.material;
     item.geometry = node.mesh;
+    // Read through the node rather than off the geometry here, so the draw list
+    // has one place that knows a `MeshNode` can carry instances and the pooled
+    // item never holds a count from the frame before the geometry changed.
     item.instanceCount = node.instanceCount;
     item.firstInstance = node.firstInstance;
     item.visible = true;
@@ -349,6 +592,7 @@ export class Scene {
     // back-to-front transparency; opaque items are front-to-back in every
     // engine that cares, and both orders are one comparator apart.
     item.depth = -transformPoint(_viewPoint, node.worldPosition, camera.view)[2];
+    assertDrawable(item);
     return item;
   }
 }

@@ -1,0 +1,300 @@
+name: Release
+
+# Two triggers, two behaviours:
+#
+#   tag `v*`     publish to npm, once, with provenance.
+#   PR / manual  prove the tarball npm would receive packs, verifies, and
+#                resolves, without publishing anything.
+#
+# The dry run is not a formality. `files` in package.json is a hand-maintained
+# list and the exports map points at build products that only exist after a
+# build, and neither is checked by a test — a missing dist/ subpath is invisible
+# until somebody installs the package and finds out. `npm pack` produces exactly
+# the tarball that would be uploaded, so that failure mode surfaces on the pull
+# request that introduced it rather than at the tag.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a release mid-publish. A cancelled publish can leave a tag
+# pointing at a version that is on npm, or a version half-attested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: 1.3.9
+  NODE_VERSION: 22
+  # No job in this workflow launches a browser, so puppeteer's postinstall has
+  # nothing to provision. Skipping its ~150 MB download keeps `bun install`
+  # hermetic — the release path should not depend on an unrelated third-party
+  # download succeeding, least of all the one that publishes to npm.
+  PUPPETEER_SKIP_DOWNLOAD: '1'
+
+jobs:
+  pack:
+    name: pack and inspect the tarball
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Provenance is an attestation about a specific commit, and npm
+          # verifies that commit against the remote ref. A shallow clone has a
+          # grafted history where the checked-out SHA still resolves locally but
+          # fails that verification. Full history, always.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # Writes an .npmrc resolving ${NODE_AUTH_TOKEN} against the registry,
+          # which is how `npm publish` authenticates without a checked-in .npmrc.
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: install
+        run: bun install --frozen-lockfile
+
+      # bench/dx/apse-custom-material.ts has a static type-level import of
+      # `../../dist/index.js` and tsconfig.json typechecks `bench/**`, so
+      # `tsc --noEmit` cannot start on a fresh checkout without dist/ — and
+      # `verify` runs typecheck first by design. Building first is what makes the
+      # chain startable; `verify` still runs its own build, and the chain itself
+      # is unchanged. The real fix belongs in that bench file.
+      - name: build (dist/ is type-referenced by bench/dx)
+        run: bun run build
+
+      # Nothing gets packed from a tree that does not type-check, pass its tests,
+      # build, and fit its size budgets. A release that skipped this would be the
+      # one path by which a broken version reaches npm.
+      - name: verify
+        run: bun run verify
+
+      # The tag is the human-readable statement of intent, and it is easy to bump
+      # package.json, src/index.ts's VERSION, and the tag to the same wrong
+      # number. scripts/build.ts checks the first two against each other; this
+      # closes the loop on the third.
+      - name: check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          echo "tag:     v${tag_version}"
+          echo "package: ${pkg_version}"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag v${tag_version} does not match package.json version ${pkg_version}"
+            exit 1
+          fi
+
+      - name: pack
+        id: pack
+        run: |
+          # `npm pack` rather than `npm publish --dry-run`, because it leaves the
+          # tarball on disk. The publish job then uploads these exact bytes
+          # instead of re-deriving them, so what was reviewed is what ships.
+          mkdir -p pack-out
+          tarball="$(npm pack --pack-destination pack-out --silent)"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "packed ${tarball} ($(du -h "pack-out/${tarball}" | cut -f1))"
+
+      - name: show what the tarball contains
+        run: |
+          tarball="$(ls pack-out)"
+          echo '```'
+          tar -tzf "pack-out/${tarball}" | sort
+          echo '```'
+
+      # The exports map is the API. If a subpath in it has no file in the
+      # tarball, the package installs cleanly and then fails to import — on a
+      # user's machine, not ours. Read the map out of the packed tarball and
+      # check every target against its own contents, so the check covers what
+      # would actually be installed rather than what is in the working tree.
+      - name: every exports target must be in the tarball
+        run: |
+          tarball="pack-out/$(ls pack-out)"
+          node --input-type=module -e '
+            import { execFileSync } from "node:child_process";
+            import { readFileSync } from "node:fs";
+
+            const [tarball] = process.argv.slice(1);
+            const listing = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
+              .trim().split("\n");
+            const paths = new Set(listing.map((p) => p.replace(/^package\//, "")));
+            const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+
+            const targets = [];
+            for (const [subpath, entry] of Object.entries(pkg.exports ?? {})) {
+              const conditions = typeof entry === "string" ? { default: entry } : entry;
+              for (const [condition, target] of Object.entries(conditions)) {
+                targets.push([`${subpath} (${condition})`, target]);
+              }
+            }
+            for (const [version, map] of Object.entries(pkg.typesVersions ?? {})) {
+              for (const [subpath, list] of Object.entries(map)) {
+                for (const target of list) targets.push([`typesVersions[${version}].${subpath}`, target]);
+              }
+            }
+
+            let missing = 0;
+            for (const [label, target] of targets) {
+              // ./package.json is a live file, not a build product; npm always
+              // includes it and nothing needs to have generated it.
+              if (target.startsWith("./package.json")) continue;
+              if (!paths.has(target.replace(/^\.\//, ""))) {
+                missing++;
+                console.error(`MISSING from tarball: ${label} -> ${target}`);
+              }
+            }
+            const checked = targets.length - 1;
+            console.log(`${checked - missing}/${checked} exports targets present in ${tarball}`);
+            if (missing > 0) {
+              console.error("The package would install and then fail to import. Fix `files` in package.json or the build, and re-run.");
+              process.exit(1);
+            }
+          ' "${tarball}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apse-npm-tarball
+          path: pack-out/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    # Tag pushes only. A pull_request event can never reach this job whatever the
+    # ref is, and the dry-run job is what a pull request gets instead.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      # This is what makes --provenance work: npm exchanges the runner's OIDC
+      # identity for an attestation binding the published tarball's digest to
+      # this workflow run and this commit. There is no attestation key to store,
+      # rotate, or leak. Scoped to this one job — the workflow's top-level
+      # permission stays read-only, and `pack` and `dry-run` never get a token.
+      #
+      # Authentication is a classic npm automation token from the `NPM_TOKEN`
+      # secret, not OIDC: npm's OIDC auth is not GA, so the token authenticates
+      # and OIDC attests. They are different jobs and both are needed.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: install
+        run: bun install --frozen-lockfile
+
+      # `pack` already proved this commit's tarball is sound on another runner.
+      # Repeating it here fails the release rather than uploading a package that
+      # does not correspond to the tag, and it is the check that would catch a
+      # runner whose toolchain resolved differently. The explicit build is for
+      # the same reason as in `pack`: typecheck runs before build inside verify.
+      - name: build (dist/ is type-referenced by bench/dx)
+        run: bun run build
+
+      - name: verify
+        run: bun run verify
+
+      - name: download the verified tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: apse-npm-tarball
+          path: publish
+
+      - name: publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # The ./ matters. Without it npm-package-arg reads a bare relative
+          # path containing a slash as a git remote and tries to `git ls-remote`
+          # it, which fails with a confusing SSH error before npm ever opens the
+          # tarball.
+          tarball="./publish/$(ls publish)"
+          echo "publishing ${tarball}"
+          # --provenance attaches the build attestation;
+          # --access public makes an unscoped package publishable at all, since
+          # npm defaults new packages to private.
+          npm publish "${tarball}" --provenance --access public
+
+      - name: confirm the version is live
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          # The registry can take a moment to serve a freshly published version,
+          # so poll rather than assert once and fail a successful release on a
+          # propagation delay.
+          for attempt in $(seq 1 10); do
+            if npm view "${name}@${version}" version 2>/dev/null | grep -qx "${version}"; then
+              echo "${name}@${version} is live on the registry"
+              exit 0
+            fi
+            echo "not visible yet (attempt ${attempt}/10), waiting 15s"
+            sleep 15
+          done
+          echo "::error::${name}@${version} did not appear on the registry within 150s — check for an auth or provenance failure"
+          exit 1
+
+  dry-run:
+    name: publish dry run
+    # Everything that is not a tag push: every pull request, and manual dispatch.
+    # Nothing here can publish — it never receives NPM_TOKEN, and every npm
+    # invocation is --dry-run.
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    needs: pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: install
+        run: bun install --frozen-lockfile
+
+      - name: build
+        run: bun run build
+
+      - name: download the verified tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: apse-npm-tarball
+          path: publish
+
+      - name: publish (dry run)
+        run: |
+          # The ./ matters: see the note in the publish job.
+          tarball="./publish/$(ls publish)"
+          npm publish "${tarball}" --dry-run --access public

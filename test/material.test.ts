@@ -24,11 +24,16 @@
 import { describe, expect, test } from 'bun:test';
 import { AseError } from '../src/core/error.ts';
 import { BIND_GROUP, FRAME_BLOCK, OBJECT_BLOCK, RESERVED_SLOT_NAMES } from '../src/core/slot.ts';
-import { POSITION_LAYOUT, STANDARD_LAYOUT, layout } from '../src/geometry/layout.ts';
+import { UNIFORM_TYPES } from '../src/core/uniform.ts';
+import { TANGENT_LAYOUT, POSITION_LAYOUT, STANDARD_LAYOUT, layout } from '../src/geometry/layout.ts';
+import { ObjectUniforms } from '../src/material/material.ts';
 import {
+  anisotropicMaterialSpec,
   basicMaterialSpec,
   checkVaryingBudget,
   describeMaterial,
+  diffuseMaterialSpec,
+  emissiveMaterialSpec,
   fnv1a,
   generateScaffold,
   pipelineKeyOf,
@@ -36,11 +41,53 @@ import {
   tokenKeyOf,
   pbrMaterialSpec,
   resolveSpec,
+  samplerNameFor,
+  stageAtLine,
   stripComments,
   validateBodyIdentifiers,
   validateGeneratedWGSL,
+  MAX_DIRECTIONAL_LIGHTS,
+  lightColorSlot,
+  lightDirSlot,
+  type DirectionalLight,
+  type ShaderStage,
 } from '../src/material/index.ts';
 import type { MaterialSpec } from '../src/material/index.ts';
+import {
+  FakePipelineDevice,
+  asPipelineDevice,
+  fragmentBannerLineOf,
+  fragmentEntryLineOf,
+  preludeBannerLineOf,
+  preludeFirstLineOf,
+  vertexBannerLineOf,
+  vertexEntryLineOf,
+} from './fake-device-ext.ts';
+
+// ---------------------------------------------------------------------------
+// WebGPU globals
+//
+// Bun has no WebGPU globals, and `ObjectUniforms` and `Material` read the usage
+// constants the way a browser does. The spec's bit values are enough, and
+// installing them is also a tripwire: a wrong bit here would show up as a wrong
+// `usage` on the recorded buffer. The same block appears in `test/tonemap.test.ts`
+//; assigning the same values twice is a no-op, so whichever file loads second
+// simply confirms the values.
+// ---------------------------------------------------------------------------
+
+(globalThis as unknown as { GPUBufferUsage: unknown }).GPUBufferUsage = {
+  MAP_READ: 0x0001,
+  MAP_WRITE: 0x0002,
+  COPY_SRC: 0x0004,
+  COPY_DST: 0x0008,
+  INDEX: 0x0010,
+  VERTEX: 0x0020,
+  UNIFORM: 0x0040,
+  STORAGE: 0x0080,
+  INDIRECT: 0x0100,
+  QUERY_RESOLVE: 0x0200,
+};
+
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1159,6 +1206,13 @@ describe('validateGeneratedWGSL', () => {
       basicMaterialSpec({ textured: true, transparent: true, doubleSided: true }),
       pbrMaterialSpec(),
       pbrMaterialSpec({ shadows: true }),
+      pbrMaterialSpec({ environment: true, environmentSpecular: true, textured: true, rimStrength: 0.5 }),
+      diffuseMaterialSpec(),
+      diffuseMaterialSpec({ rimStrength: 0.1, shadows: true, environment: true, textured: true, transparent: true }),
+      emissiveMaterialSpec(),
+      emissiveMaterialSpec({ fresnel: true, fresnelStrength: 2, pulseHz: 1, pulseDepth: 0.5, textured: true }),
+      anisotropicMaterialSpec(),
+      anisotropicMaterialSpec({ shadows: true, environment: true, rimStrength: 0.2 }),
       spec({ textures: { a: { kind: 'cube' }, b: { kind: '3d' }, c: { kind: '2d-array' } } }),
       spec({ layout: layout({ position: 'float32x3', normal: 'float32x3' }) }),
     ]) {
@@ -1296,3 +1350,1144 @@ describe('basic and pbr go through the same scaffold', () => {
     expect(a.resolved.layout.key).toBe(b.resolved.layout.key);
   });
 });
+
+// ===========================================================================
+// 13. The shipped library
+//
+// Every factory is a function returning a MaterialSpec, so the whole library is
+// testable with no GPU. The bar is the same as the scaffold's: what is
+// *guaranteed* — the exact slots, the exact statements, the exact wiring — rather
+// than that the pixels look right, which no assertion here can know.
+// ===========================================================================
+
+/** The five shipped factories, with every option that switches something on. */
+const LIBRARY: readonly { name: string; spec: MaterialSpec }[] = [
+  { name: 'basic', spec: basicMaterialSpec() },
+  {
+    name: 'pbr',
+    spec: pbrMaterialSpec({
+      lights: [
+        { direction: [0.5, 1, 0.3], color: [3, 3, 3], castShadow: true },
+        { direction: [-0.7, 0.3, -0.2], color: [0.4, 0.5, 0.9], intensity: 2 },
+      ],
+      shadows: true,
+      environment: true,
+      environmentSpecular: true,
+      rimStrength: 0.35,
+      textured: true,
+    }),
+  },
+  {
+    name: 'diffuse',
+    spec: diffuseMaterialSpec({ rimStrength: 0.08, shadows: true, environment: true, textured: true }),
+  },
+  {
+    name: 'emissive',
+    spec: emissiveMaterialSpec({
+      fresnel: true, fresnelStrength: 1.5, pulseHz: 2, pulseDepth: 0.5, textured: true, transparent: true,
+    }),
+  },
+  { name: 'anisotropic', spec: anisotropicMaterialSpec({ shadows: true, rimStrength: 0.2 }) },
+];
+
+describe('the shipped library — every material goes through the same scaffold', () => {
+  test('all five factories produce structurally valid generated WGSL', () => {
+    for (const { name, spec } of LIBRARY) {
+      const code = generateScaffold(spec).code;
+      expect(validateGeneratedWGSL(code), name).toEqual({ ok: true });
+      // ...and through the whole structural parse, which also resolves every
+      // `mat.`/`in.`/`out.`/`frame.`/`obj.` access against what was declared.
+      parseCheck(spec);
+    }
+  });
+
+  test('five distinct factories produce five distinct programs', () => {
+    const codes = LIBRARY.map((m) => generateScaffold(m.spec).code);
+    expect(new Set(codes).size).toBe(codes.length);
+    // ...and no two share a pipeline, which is the only assertion that would
+    // catch two factories having accidentally become the same shader.
+    const keys = LIBRARY.map((m) => generateScaffold(m.spec).pipelineKey);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  test('none of them writes a @group, a @binding, or a struct by hand', () => {
+    // The point of the whole project. A material is allowed a `fn` and a `const`
+    // in its prelude and nothing else, so this is the assertion that keeps a
+    // future "just one binding" from creeping in.
+    for (const { name, spec } of LIBRARY) {
+      const prelude = resolveSpec(spec).prelude;
+      expect(prelude, name).not.toMatch(/@group|@binding|@vertex|@fragment/);
+      expect(prelude, name).not.toMatch(/\bstruct\s+\w/);
+      expect(prelude, name).not.toMatch(/var\s*</);
+    }
+  });
+
+  test('the bodies are statements only: no declaration, no attribute', () => {
+    for (const { name, spec } of LIBRARY) {
+      for (const body of [resolveSpec(spec).vertexBody, resolveSpec(spec).fragmentBody]) {
+        expect(body, name).not.toMatch(/@|^\s*fn\s|^\s*struct\s/m);
+      }
+    }
+  });
+});
+
+// ===========================================================================
+// 14. The light rig is data
+// ===========================================================================
+
+/** How many times the direct-lighting loop accumulates. */
+function lightIterations(spec: MaterialSpec): number {
+  const body = stripComments(resolveSpec(spec).fragmentBody);
+  return (body.match(/direct = direct \+ \(diff \+ spec\)/g) ?? []).length;
+}
+
+describe('the light rig is data, not shader text', () => {
+  const lit = (n: number): DirectionalLight[] =>
+    Array.from({ length: n }, (_, i) => ({
+      direction: [i + 1, 1, 0.3] as const,
+      color: [1, 1, 1] as const,
+    }));
+
+  test('one light through four: one slot pair and one loop iteration each', () => {
+    for (let n = 1; n <= MAX_DIRECTIONAL_LIGHTS; n++) {
+      const spec = pbrMaterialSpec({ lights: lit(n) });
+      const slots = Object.keys(resolveSpec(spec).slotTypes);
+      for (let i = 0; i < n; i++) {
+        expect(slots, `n=${n}`).toContain(lightDirSlot(i));
+        expect(slots, `n=${n}`).toContain(lightColorSlot(i));
+      }
+      expect(slots, `n=${n}`).not.toContain(lightDirSlot(n));
+      expect(lightIterations(spec), `n=${n}`).toBe(n);
+    }
+  });
+
+  test('the first light keeps the shipped slot names, and the rest are indexed', () => {
+    // The asymmetry is deliberate and load-bearing: `setSlot('lightDir', …)` is
+    // in the wild, and renaming it would break that call with a runtime error
+    // rather than a compile error. Pinned so the rule cannot drift.
+    expect(lightDirSlot(0)).toBe('lightDir');
+    expect(lightColorSlot(0)).toBe('lightColor');
+    expect(lightDirSlot(1)).toBe('light1Dir');
+    expect(lightColorSlot(1)).toBe('light1Color');
+    expect(lightDirSlot(3)).toBe('light3Dir');
+    expect(lightColorSlot(3)).toBe('light3Color');
+
+    const withDefault = resolveSpec(pbrMaterialSpec()).slotTypes;
+    expect(Object.keys(withDefault)).toContain('lightDir');
+    expect(Object.keys(withDefault)).toContain('lightColor');
+  });
+
+  test('a fourth light is a data change and a fifth is a typed error', () => {
+    expect(MAX_DIRECTIONAL_LIGHTS).toBe(4);
+    expect(() => pbrMaterialSpec({ lights: lit(4) })).not.toThrow();
+    const err = expectError(() => pbrMaterialSpec({ lights: lit(5) }), 'OPTION_UNKNOWN');
+    expect(err.message).toContain('5 lights');
+    expect(err.message).toContain('4');
+    expect(err.fix).toContain('MAX_DIRECTIONAL_LIGHTS');
+  });
+
+  test('an empty light array is rejected rather than shading nothing', () => {
+    const err = expectError(() => pbrMaterialSpec({ lights: [] }), 'OPTION_UNKNOWN');
+    expect(err.message).toContain('empty light array');
+    expect(err.fix).toContain('lights:');
+  });
+
+  test('intensity is folded into the radiance slot, so a light is two slots', () => {
+    const spec = pbrMaterialSpec({
+      lights: [{ direction: [0, 1, 0], color: [1, 0.5, 0.25], intensity: 4 }],
+    });
+    const defaults = resolveSpec(spec).slotDefaults;
+    expect(defaults.get('lightColor')).toEqual([4, 2, 1]);
+    expect(defaults.get('lightDir')).toEqual([0, 1, 0]);
+    expect(Object.keys(resolveSpec(spec).slotTypes).filter((s) => s.startsWith('light'))).toEqual([
+      'lightDir', 'lightColor',
+    ]);
+  });
+
+  test('a zero direction and a negative intensity are rejected by name', () => {
+    const zero = expectError(
+      () => pbrMaterialSpec({ lights: [{ direction: [0, 0, 0] }] }),
+      'OPTION_UNKNOWN',
+    );
+    expect(zero.message).toContain('[0, 0, 0]');
+    expect(zero.why).toContain('NaN');
+    const negative = expectError(
+      () => pbrMaterialSpec({ lights: [{ direction: [0, 1, 0], intensity: -1 }] }),
+      'OPTION_UNKNOWN',
+    );
+    expect(negative.message).toContain('intensity');
+    expectError(() => pbrMaterialSpec({ lights: [{ direction: [0, 1, 0], color: [1, Number.NaN, 1] }] }), 'OPTION_UNKNOWN');
+  });
+
+  test('castShadow is only legal on a shadowed first light, and both mistakes say why', () => {
+    const noShadowMap = expectError(
+      () => pbrMaterialSpec({ lights: [{ direction: [0, 1, 0], castShadow: true }] }),
+      'OPTION_UNKNOWN',
+    );
+    expect(noShadowMap.message).toContain('castShadow');
+    expect(noShadowMap.fix).toContain('shadows: true');
+
+    const notFirst = expectError(
+      () => pbrMaterialSpec({
+        shadows: true,
+        lights: [{ direction: [0, 1, 0] }, { direction: [1, 0, 0], castShadow: true }],
+      }),
+      'OPTION_UNKNOWN',
+    );
+    expect(notFirst.message).toContain('only the first light');
+    expect(notFirst.fix).toContain('cascade');
+  });
+
+  test('the shadow multiplier lands on the light that asked for it, and only that one', () => {
+    const spec = pbrMaterialSpec({
+      shadows: true,
+      lights: [{ direction: [0, 1, 0], castShadow: true }, { direction: [1, 0, 0] }],
+    });
+    const body = stripComments(resolveSpec(spec).fragmentBody);
+    const lines = body.split('\n').map((l) => l.trim());
+    const accumulators = lines.filter((l) => l.startsWith('direct = direct +'));
+    expect(accumulators).toHaveLength(2);
+    expect(accumulators[0]).toMatch(/mat\.lightColor \* nDotL \* shadow;$/);
+    expect(accumulators[1]).toMatch(/mat\.light1Color \* nDotL;$/);
+  });
+
+  test('the shorthand and `lights` together are rejected, not silently merged', () => {
+    const err = expectError(
+      () => pbrMaterialSpec({ lightDir: [0, 1, 0], lights: [{ direction: [1, 0, 0] }] }),
+      'OPTION_UNKNOWN',
+    );
+    expect(err.message).toContain('lightDir');
+    expect(err.fix).toContain('lights');
+  });
+
+  test('the shorthand alone still works, and defaults to the shipped light', () => {
+    const spec = pbrMaterialSpec({ lightDir: [0, 2, 0], lightColor: [5, 5, 5] });
+    const defaults = resolveSpec(spec).slotDefaults;
+    expect(defaults.get('lightDir')).toEqual([0, 2, 0]);
+    expect(defaults.get('lightColor')).toEqual([5, 5, 5]);
+    // A direction of any length is legal: the shader normalises it, so
+    // `normalize(lightPos - worldPos)` can be precomputed once per frame.
+    expect(lightIterations(spec)).toBe(1);
+  });
+
+  test('every lit material shares one light rig, not one per material', () => {
+    // The same helper emits the loop for all of them, which is what makes the
+    // count a property of the array rather than of the shader.
+    for (const spec of [
+      pbrMaterialSpec({ lights: lit(3) }),
+      diffuseMaterialSpec({ lights: lit(3) }),
+      anisotropicMaterialSpec({ lights: lit(3) }),
+    ]) {
+      expect(lightIterations(spec)).toBe(3);
+      expect(Object.keys(resolveSpec(spec).slotTypes)).toContain('light2Color');
+    }
+    // ...and the emissive material is not a lit material, so it has no rig at
+    // all: an emitter does not have a light array, it has a radiance.
+    expect(Object.keys(resolveSpec(emissiveMaterialSpec()).slotTypes).some((s) => s.startsWith('light')))
+      .toBe(false);
+  });
+
+  test('a light count change moves the uniform block, and the block is generated', () => {
+    const one = generateScaffold(pbrMaterialSpec({ lights: lit(1) })).materialBlock;
+    const four = generateScaffold(pbrMaterialSpec({ lights: lit(4) })).materialBlock;
+    expect(one.size).toBe(four.size - 3 * 32);
+    // Every offset comes from buildUniformBlock: 16-byte aligned vec3f, 12 wide.
+    for (const field of four.fields) {
+      expect(field.offset % UNIFORM_TYPES[field.type].align).toBe(0);
+    }
+    expect(four.wgsl).toContain('light3Dir : vec3<f32>,');
+  });
+});
+
+// ===========================================================================
+// 15. The BRDFs, as numbers
+//
+// The WGSL cannot run here, so each model is re-derived in TypeScript from the
+// same structure the generated code has and the *properties* it must satisfy are
+// asserted. These are the tests that would catch a sign error, a missing 1/PI, or
+// a rim that adds energy that never came in.
+// ===========================================================================
+
+/** Schlick, the generated `fresnelSchlick`. */
+function fresnelSchlick(cos: number, f0: number): number {
+  const m = Math.min(1, Math.max(0, 1 - cos));
+  const m2 = m * m;
+  return f0 + (1 - f0) * (m2 * m2 * m);
+}
+
+/** GGX, the generated `distributionGGX`, guard included. */
+function distributionGGX(nDotH: number, roughness: number): number {
+  const a = roughness * roughness;
+  const a2 = a * a;
+  const d = nDotH * nDotH * (a2 - 1) + 1;
+  return a2 / Math.max(Math.PI * d * d, 1e-12);
+}
+
+/** Burley's anisotropic GGX, the generated `distributionGGXAniso`. */
+function distributionGGXAniso(nDotH: number, tDotH: number, bDotH: number, at: number, ab: number): number {
+  const a2 = at * ab;
+  const v = [ab * tDotH, at * bDotH, a2 * nDotH];
+  const v2 = v[0]! * v[0]! + v[1]! * v[1]! + v[2]! * v[2]!;
+  const w2 = a2 / Math.max(v2, 1e-12);
+  return (a2 * w2 * w2) / Math.PI;
+}
+
+/** Oren-Nayar, the generated `orenNayar`. */
+function orenNayar(nDotL: number, nDotV: number, lDotV: number, sigma2: number): number {
+  const s = lDotV - nDotL * nDotV;
+  const t = s > 0 ? Math.max(nDotL, nDotV) + 1e-4 : 1;
+  const a = 1 - (0.5 * sigma2) / (sigma2 + 0.33);
+  const b = (0.45 * sigma2) / (sigma2 + 0.09);
+  return Math.min((nDotL / Math.PI) * (a + (b * s) / t), 1);
+}
+
+describe('Fresnel, the rim, and the energy budget', () => {
+  test('Schlick is F0 head-on and 1 at grazing, for every F0', () => {
+    for (const f0 of [0, 0.04, 0.5, 1]) {
+      expect(fresnelSchlick(1, f0)).toBeCloseTo(f0, 6);
+      expect(fresnelSchlick(0, f0)).toBeCloseTo(1, 6);
+      // Falling as the view leaves the normal: a reflectance that rose would be
+      // a surface brighter head-on than at grazing, which is not a reflectance.
+      let previous = Infinity;
+      for (let i = 0; i <= 100; i++) {
+        const v = fresnelSchlick(i / 100, f0);
+        expect(v).toBeLessThanOrEqual(previous);
+        expect(v).toBeLessThanOrEqual(1);
+        previous = v;
+      }
+    }
+  });
+
+  test('a rim is a reflectance, not pow(1 - N·V, k)', () => {
+    // The property that makes the energy budget below meaningful: the rim's value
+    // is bounded by 1 and equals rimColor at normal incidence, so a diffuse term
+    // attenuated by (1 - rim) can never be negative and the sum never exceeds the
+    // light that fell on it. `pow(1 - n, 3)` violates the first of those — it is
+    // 1 at n = 0 but so is Schlick, and it is the *F0* at n = 1 that differs:
+    // pow gives 0 there for every k, Schlick gives f0.
+    const rim = (nDotV: number, f0: number, strength: number): number =>
+      fresnelSchlick(nDotV, f0) * strength;
+    expect(rim(1, 0.08, 1)).toBeCloseTo(0.08, 6);
+    expect(rim(0, 0.08, 1)).toBeCloseTo(1, 6);
+    expect(rim(0.5, 0.08, 1)).toBeGreaterThan(0.08);
+  });
+
+  test('the diffuse material attenuates its diffuse by exactly the rim', () => {
+    // Not a stylistic choice: this material has no specular lobe, so the rim *is*
+    // the dielectric reflection, and the two are parts of one budget.
+    const body = stripComments(resolveSpec(diffuseMaterialSpec({ rimStrength: 0.1 })).fragmentBody);
+    expect(body).toContain('* (vec3f(1.0) - rim)');
+    expect(body).toContain('let spec = vec3f(0.0);');
+    // ...and the whole point of the model is that a zero-roughness surface must
+    // be exactly Lambert, or the two are not the same model with a knob.
+    for (const n of [0.1, 0.5, 0.9]) {
+      expect(orenNayar(n, n, n, 0)).toBeCloseTo(n / Math.PI, 6);
+    }
+  });
+
+  test('Oren-Nayar rises at grazing incidence, which is why it is not Lambert', () => {
+    // Fix N·L and vary N·V: the model must return more as the view grazes. That
+    // is the whole reason the material exists, and it is the property a `pow`
+    // heuristic cannot express.
+    const rough = orenNayar(0.5, 0.9, 0.5, 0.25);
+    const grazing = orenNayar(0.5, 0.05, 0.5, 0.25);
+    expect(grazing).toBeGreaterThan(rough);
+    // And it never exceeds 1, which is the model's documented failure point and
+    // the reason the generated code clamps.
+    for (const s2 of [0, 0.1, 0.5, 1]) {
+      for (let i = 0; i <= 20; i++) {
+        for (let j = 0; j <= 20; j++) {
+          const v = orenNayar(i / 20, j / 20, 0.5, s2);
+          expect(v).toBeGreaterThanOrEqual(0);
+          expect(v).toBeLessThanOrEqual(1);
+        }
+      }
+    }
+  });
+
+  test('the GGX lobe normalises to 1 and peaks at the halfway vector', () => {
+    // Roughness 1 is excluded from the peak check and asserted separately: it is
+    // the flat limit, where a = 1 and the distribution collapses to a constant.
+    for (const roughness of [0.045, 0.2, 0.5, 0.9]) {
+      expect(distributionGGX(1, roughness)).toBeGreaterThan(distributionGGX(0.9, roughness));
+      expect(distributionGGX(0, roughness)).toBeLessThan(distributionGGX(0.1, roughness));
+    }
+    // The floor's actual reason: at zero roughness a2 is 0, the denominator
+    // collapses, and the "mirror" lobe returns *nothing at all* rather than an
+    // infinitely bright highlight. A black specular on a polished surface is the
+    // failure, so MIN_ROUGHNESS is a physical floor and not an epsilon.
+    expect(distributionGGX(1, 0)).toBe(0);
+    // Where the guard does not bind, the peak is the textbook 1 / (PI r^4), and
+    // it rises monotonically as the surface is polished — all the way to the
+    // floor. This is the assertion that pins the guard's *smallness*: a 1e-7
+    // guard binds below r ≈ 0.13 and clips the peak at 41, so a polished metal
+    // would have no highlight and nothing would report it.
+    expect(distributionGGX(1, 0.5)).toBeCloseTo(1 / (Math.PI * Math.pow(0.25, 2)), 6);
+    expect(distributionGGX(1, 0.045)).toBeCloseTo(1 / (Math.PI * Math.pow(0.045, 4)), 4);
+    expect(distributionGGX(1, 0.045)).toBeGreaterThan(70000);
+    let previous = 0;
+    for (const r of [1, 0.7, 0.5, 0.2, 0.1, 0.045]) {
+      const v = distributionGGX(1, r);
+      expect(v).toBeGreaterThan(previous);
+      previous = v;
+    }
+    // Roughness 1 is the flat limit: a = a2 = 1 makes d = 1 for every N·H, so
+    // the lobe is 1/PI everywhere and a fully rough surface has no highlight.
+    for (const nDotH of [0, 0.25, 0.5, 0.75, 1]) {
+      expect(distributionGGX(nDotH, 1)).toBeCloseTo(1 / Math.PI, 6);
+    }
+  });
+
+  test('the anisotropic lobe reduces to the isotropic one at zero anisotropy', () => {
+    // The consistency that a formulation taking perceptual roughness would break:
+    // aniso forms at * ab internally, so the caller has to square. With at = ab
+    // = r^2 the two must agree to the last bit a float has, and they do.
+    for (const r of [0.045, 0.1, 0.35, 0.7, 1]) {
+      const alpha = r * r;
+      for (const nDotH of [0.2, 0.6, 0.9, 1]) {
+        const t = Math.sqrt(Math.max(0, 1 - nDotH * nDotH));
+        expect(distributionGGXAniso(nDotH, t, 0, alpha, alpha)).toBeCloseTo(
+          distributionGGX(nDotH, r), 3,
+        );
+      }
+    }
+  });
+
+  test('the anisotropic lobe is wider along the grain, which is the point', () => {
+    // at > ab: the lobe is broader along T than along B, so a halfway vector
+    // pointing down the grain is inside the lobe at a lower N·H than one across
+    // it. If the two were symmetric, `anisotropy` would be doing nothing.
+    const rough = 0.3;
+    const at = Math.pow(rough * 1.6, 2);
+    const ab = Math.pow(rough * 0.4, 2);
+    const alongGrain = distributionGGXAniso(0.7, 0.714, 0, at, ab);
+    const acrossGrain = distributionGGXAniso(0.7, 0, 0.714, at, ab);
+    expect(alongGrain).toBeGreaterThan(acrossGrain);
+    // ...and the isotropic value sits between the two, as it must.
+    const iso = distributionGGX(0.7, rough);
+    expect(alongGrain).toBeGreaterThan(iso);
+    expect(acrossGrain).toBeLessThan(iso);
+  });
+
+  test('the generated PBR multiplies the diffuse by (1 - F), which is the whole budget', () => {
+    const body = stripComments(resolveSpec(pbrMaterialSpec()).fragmentBody);
+    expect(body).toContain('(vec3f(1.0) - fresnelSchlick(nDotV, f0)) * diffuseColor / PI');
+    // And a metal has no diffuse left to spend, because its albedo is its
+    // specular reflectance — `diffuseColor = base * (1 - metallic)`.
+    expect(body).toContain('let diffuseColor = base * (1.0 - metallic);');
+    expect(body).toContain('let f0 = mix(vec3f(0.04), base, metallic);');
+  });
+});
+
+// ===========================================================================
+// 16. Image-based lighting
+// ===========================================================================
+
+describe('image-based lighting', () => {
+  test('it is off by default and adds no texture group at all', () => {
+    const g = generateScaffold(pbrMaterialSpec());
+    expect(g.textureSlots).toEqual([]);
+    expect(g.code).not.toContain('irradianceAt');
+    expect(g.code).not.toContain('mat.environmentIntensity');
+  });
+
+  test('turning it on declares one equirect slot, and the samplers are shared correctly', () => {
+    // albedo and environment ask for byte-identical sampler configuration, so
+    // apse gives them ONE binding. The body must therefore use the *shared*
+    // name — which is why the factories ask `samplerNameFor` rather than
+    // writing `<slot>Sampler` and hoping.
+    const spec = pbrMaterialSpec({ environment: true, textured: true });
+    const g = generateScaffold(spec);
+    const kinds = g.textureSlots.map((t) => `${t.slotName}:${t.bindingIndex}`);
+    expect(kinds).toEqual(['albedo:0', 'environment:1']);
+    expect(g.resolved.samplers).toHaveLength(1);
+    expect(g.resolved.samplers[0]!.slotNames).toEqual(['albedo', 'environment']);
+    expect(g.code).toContain('textureSampleLevel(environment, albedoSampler,');
+    expect(g.code).not.toContain('environmentSampler');
+  });
+
+  test('samplerNameFor is the authority, and agrees with describeMaterial', () => {
+    const textures = { a: { kind: '2d' as const }, b: { kind: '2d' as const } };
+    expect(samplerNameFor(textures, 'a')).toBe('aSampler');
+    expect(samplerNameFor(textures, 'b')).toBe('aSampler');
+    expect(describeMaterial({ name: 't', textures, vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);', fragment: 'return vec4f(1.0);' })
+      .textures.find((t) => t.slotName === 'b')?.sampler).toBe('aSampler');
+    // A different address mode is a different sampler, and gets its own name.
+    expect(samplerNameFor({ a: { kind: '2d' }, b: { kind: '2d', addressMode: 'clamp-to-edge' } }, 'b'))
+      .toBe('bSampler');
+    // And the function is total: an undeclared slot gets the obvious answer
+    // rather than throwing, so a factory can ask before the spec is finished.
+    expect(samplerNameFor(undefined, 'a')).toBe('aSampler');
+    expect(samplerNameFor(textures, 'zzz')).toBe('zzzSampler');
+  });
+
+  test('the equirect convention is stated in the generated program, not only in the docs', () => {
+    const code = generateScaffold(pbrMaterialSpec({ environment: true })).code;
+    // A caller has to author the map to this convention and apse cannot discover
+    // it, so the convention travels with the shader.
+    expect(code).toContain('atan2(rotated.z, rotated.x) / (2.0 * PI) + 0.5');
+    expect(code).toContain('acos(clamp(rotated.y, -1.0, 1.0)) / PI');
+    expect(code).toContain('fn equirectUv(d : vec3f) -> vec2f {');
+  });
+
+  test('the specular IBL term is off unless asked for, and both are documented as such', () => {
+    const diffuseOnly = generateScaffold(pbrMaterialSpec({ environment: true })).code;
+    expect(diffuseOnly).toContain('fn environmentSpecular(');
+    expect(stripComments(resolveSpec(pbrMaterialSpec({ environment: true })).fragmentBody))
+      .not.toContain('envSpec');
+    const both = resolveSpec(pbrMaterialSpec({ environment: true, environmentSpecular: true })).fragmentBody;
+    expect(stripComments(both)).toContain('envSpec * envBRDF');
+    // A material with no environment has no environment slots at all, so a stray
+    // `mat.environmentIntensity` would be caught by the identifier validator.
+    expect(Object.keys(resolveSpec(pbrMaterialSpec()).slotTypes)).not.toContain('environmentIntensity');
+    expect(() => validateGeneratedWGSL(generateScaffold(pbrMaterialSpec()).code)).not.toThrow();
+  });
+
+  test('the IBL knobs are uniform fields, so a probe can be retuned with no rebuild', () => {
+    const types = resolveSpec(pbrMaterialSpec({ environment: true })).slotTypes;
+    expect(types.environmentIntensity).toBe('f32');
+    expect(types.environmentRotation).toBe('f32');
+    expect(types.irradianceMip).toBe('f32');
+    expect(types.environmentMip).toBe('f32');
+  });
+});
+
+// ===========================================================================
+// 17. The three new materials, one at a time
+// ===========================================================================
+
+describe('diffuseMaterial', () => {
+  test('it has no metallic and no specular lobe, and says so in the program', () => {
+    const resolved = resolveSpec(diffuseMaterialSpec());
+    expect(Object.keys(resolved.slotTypes)).not.toContain('metallic');
+    const body = stripComments(resolved.fragmentBody);
+    expect(resolved.prelude).toContain('fn orenNayar');
+    // The loop omits the halfway vector, which this BRDF has no use for: three
+    // dead lets and three live normalizes per light, in a file people read.
+    expect(body).not.toContain('let h =');
+    expect(body).not.toContain('nDotH');
+    expect(body).toContain('lDotV');
+  });
+
+  test('it defaults to opaque, and to transparent with alpha blending', () => {
+    expect(diffuseMaterialSpec().phase).toBe('opaque');
+    const t = diffuseMaterialSpec({ transparent: true, opacity: 0.4 });
+    expect(t.phase).toBe('transparent');
+    expect(t.depth).toEqual({ write: false, compare: 'less' });
+    expect(resolveSpec(t).slotDefaults.get('opacity')).toBe(0.4);
+    expect(stripComments(resolveSpec(t).fragmentBody)).toContain('mat.opacity * frame.alpha');
+  });
+
+  test('groundColor defaults to 35% of the sky, which is what it always was', () => {
+    const spec = diffuseMaterialSpec({ ambientColor: [0.2, 0.4, 0.6] });
+    const d = resolveSpec(spec).slotDefaults;
+    // Compared componentwise: 0.2 * 0.35 is not 0.07 in binary floating point,
+    // and asserting an exact product here would be asserting the wrong thing.
+    const ground = d.get('groundColor') as number[];
+    [0.07, 0.14, 0.21].forEach((expected, i) => expect(ground[i]).toBeCloseTo(expected, 10));
+    const explicit = resolveSpec(diffuseMaterialSpec({ ambientColor: [0.2, 0.4, 0.6], groundColor: [1, 0, 0] })).slotDefaults;
+    expect(explicit.get('groundColor')).toEqual([1, 0, 0]);
+  });
+});
+
+describe('emissiveMaterial', () => {
+  test('a plain emitter is three slots, no varyings, and an empty prelude', () => {
+    const resolved = resolveSpec(emissiveMaterialSpec());
+    expect(Object.keys(resolved.slotTypes)).toEqual(['color', 'intensity', 'opacity']);
+    expect(resolved.userVaryings).toEqual([]);
+    expect(resolved.prelude.trim()).toBe('');
+    // Whitespace-collapsed, because a comment is deleted rather than blanked and
+    // leaves the run of spaces it occupied behind.
+    expect(collapse(resolved.fragmentBody))
+      .toBe('let radiance = mat.color * mat.intensity; return vec4f(radiance, mat.opacity * frame.alpha);');
+  });
+
+  test('intensity is a radiance multiplier and is not clamped to one', () => {
+    // The value that makes this material different from basicMaterial: 8 is a
+    // legitimate lamp, and the only thing that can carry it is an HDR
+    // intermediate.
+    expect(resolveSpec(emissiveMaterialSpec({ intensity: 8 })).slotDefaults.get('intensity')).toBe(8);
+    expect(stripComments(resolveSpec(emissiveMaterialSpec({ intensity: 8 })).fragmentBody))
+      .toContain('mat.color * mat.intensity');
+  });
+
+  test('the view-dependent term switches on the varyings it needs and no others', () => {
+    const plain = resolveSpec(emissiveMaterialSpec()).userVaryings.map((v) => v.name);
+    expect(plain).toEqual([]);
+    const sheen = resolveSpec(emissiveMaterialSpec({ fresnel: true, fresnelStrength: 1 })).userVaryings.map((v) => v.name);
+    expect(sheen).toEqual(['worldPos', 'normal']);
+    // A Fresnel term that needed no normal would be a bug: the whole model is
+    // the angle between the normal and the view.
+    expect(stripComments(resolveSpec(emissiveMaterialSpec({ fresnel: true, fresnelStrength: 1 })).fragmentBody))
+      .toContain('fresnelSchlick(nDotV, vec3f(1.0)) * mat.fresnelStrength');
+  });
+
+  test('the pulse is driven by frame.time, and only exists when it is switched on', () => {
+    expect(Object.keys(resolveSpec(emissiveMaterialSpec()).slotTypes)).not.toContain('pulseHz');
+    const pulsing = resolveSpec(emissiveMaterialSpec({ pulseHz: 2, pulseDepth: 0.5 }));
+    expect(pulsing.slotDefaults.get('pulseHz')).toBe(2);
+    expect(pulsing.slotDefaults.get('pulseDepth')).toBe(0.5);
+    const body = stripComments(pulsing.fragmentBody);
+    expect(body).toContain('2.0 * PI * mat.pulseHz * frame.time');
+    // A raised cosine, not a sine: sin has a non-zero derivative at its trough
+    // and a surface at depth 1 visibly bounces there twice a cycle.
+    expect(body).toContain('cos(phase)');
+    expect(body).not.toContain('sin(phase)');
+  });
+
+  test('a frequency with no depth, and a flag with no strength, are both rejected', () => {
+    const noDepth = expectError(() => emissiveMaterialSpec({ pulseHz: 2 }), 'OPTION_UNKNOWN');
+    expect(noDepth.message).toContain('pulseDepth');
+    const noStrength = expectError(() => emissiveMaterialSpec({ fresnel: true }), 'OPTION_UNKNOWN');
+    expect(noStrength.message).toContain('fresnelStrength');
+    expectError(() => emissiveMaterialSpec({ intensity: -1 }), 'OPTION_UNKNOWN');
+    expectError(() => emissiveMaterialSpec({ intensity: Number.NaN }), 'OPTION_UNKNOWN');
+  });
+
+  test('the emissive map multiplies the radiance and is never added to a lit term', () => {
+    const resolved = resolveSpec(emissiveMaterialSpec({ textured: true }));
+    expect(resolved.textures.map((t) => t.slotName)).toEqual(['emissive']);
+    const body = stripComments(resolved.fragmentBody);
+    expect(body).toContain('textureSample(emissive, emissiveSampler, in.uv).rgb * mat.color * mat.intensity');
+    // The distinguishing line: an emission map has black in it, and black must
+    // stay black. An albedo map would be lifted by the light rig.
+    expect(body).not.toContain('frame.camPos * mat.color');
+  });
+});
+
+describe('anisotropicMaterial', () => {
+  test('it refuses a layout with no tangent, and names the attribute', () => {
+    const err = expectError(
+      () => anisotropicMaterialSpec({ layout: layout({ position: 'float32x3', normal: 'float32x3' }) }),
+      'ATTRIBUTE_MISSING',
+    );
+    expect(err.message).toContain('tangent');
+    expect(err.fix).toContain('TANGENT_LAYOUT');
+    // The default is the one layout that has one, so the common case just works.
+    expect(resolveSpec(anisotropicMaterialSpec()).layout.key).toBe(TANGENT_LAYOUT.key);
+  });
+
+  test('the tangent frame is rebuilt in the shader, not trusted from the varying', () => {
+    const body = stripComments(resolveSpec(anisotropicMaterialSpec()).fragmentBody);
+    // Gram-Schmidt, because an interpolated tangent is not guaranteed orthogonal
+    // to an interpolated normal, and a non-orthonormal frame makes the highlight
+    // depend on the tessellation.
+    expect(body).toContain('safeNormalize(tRaw.xyz - n * dot(n, tRaw.xyz))');
+    expect(body).toContain('cross(n, t) * tRaw.w');
+  });
+
+  test('it generates the anisotropic lobe, not the isotropic one', () => {
+    const resolved = resolveSpec(anisotropicMaterialSpec({ anisotropy: 0.8 }));
+    expect(resolved.prelude).toContain('fn distributionGGXAniso');
+    expect(resolved.prelude).toContain('fn visibilitySmithAniso');
+    const body = stripComments(resolved.fragmentBody);
+    expect(body).toContain('distributionGGXAniso(nDotH, dot(t, h), dot(b, h), at, ab)');
+    expect(body).toContain('visibilitySmithAniso(at, ab, tDotV, bDotV, dot(t, l), dot(b, l), nDotV, nDotL)');
+    expect(body).not.toContain('distributionGGX(');
+    // Two roughnesses, both floored, and then squared into alpha. The squaring is
+    // the consistency requirement: distributionGGXAniso forms at*ab internally,
+    // so handing it perceptual roughness would make the same `roughness` mean a
+    // different material from pbrMaterial's.
+    expect(body).toContain('clamp(mat.roughness * (1.0 + mat.anisotropy), MIN_ROUGHNESS, 1.0)');
+    expect(body).toContain('clamp(mat.roughness * (1.0 - mat.anisotropy), MIN_ROUGHNESS, 1.0)');
+    expect(body).toContain('let at = roughT * roughT;');
+    expect(body).toContain('let ab = roughB * roughB;');
+    expect(resolved.slotDefaults.get('anisotropy')).toBe(0.8);
+  });
+
+  test('the tangent is transformed by the model matrix, not the normal matrix', () => {
+    // Identical under a uniform scale, which is exactly why using the wrong one is
+    // invisible until an object is scaled unevenly.
+    const resolved = resolveSpec(anisotropicMaterialSpec());
+    expect(stripComments(resolved.vertexBody)).toContain('(obj.model * vec4f(in.tangent.xyz, 0.0)).xyz');
+    expect(resolved.vertexBody).not.toContain('obj.normalMatrix * in.tangent');
+  });
+
+  test('anisotropy, metallic and roughness are range-checked rather than clamped silently', () => {
+    for (const opts of [{ anisotropy: 2 }, { anisotropy: -2 }, { metallic: 3 }, { roughness: Number.NaN }]) {
+      const err = expectError(() => anisotropicMaterialSpec(opts), 'OPTION_UNKNOWN');
+      expect(err.why).toContain('clamp');
+    }
+  });
+});
+
+// ===========================================================================
+// 18. Shader diagnostics
+//
+// The path exists because a WGSL compile error otherwise arrives wrapped in a
+// validation message whose stage attribution is frequently wrong. These tests
+// pin the three properties that path has to keep, and the fake device is the only
+// way to get a fragment-stage diagnostic without a browser.
+// ===========================================================================
+
+/** A one-line material, so a diagnostic can be aimed at a chosen line. */
+function diagnosticSpec(): MaterialSpec {
+  return {
+    name: 'diag',
+    layout: POSITION_LAYOUT,
+    varyings: { t: 'f32' },
+    slots: { k: 'f32' },
+    prelude: 'fn helper() -> f32 { return mat.k; }',
+    targets: [{ format: 'bgra8unorm' }],
+    vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0); out.t = helper();',
+    fragment: 'return vec4f(in.t, 0.0, 0.0, 1.0);',
+  };
+}
+
+async function expectCompileError(device: FakePipelineDevice, spec: MaterialSpec): Promise<AseError> {
+  try {
+    const { Material } = await import('../src/material/material.ts');
+    await Material.create(asPipelineDevice(device), spec);
+  } catch (err) {
+    if (!(err instanceof AseError)) throw new Error(`expected an AseError, got ${String(err)}`);
+    expect(err.code).toBe('SHADER_COMPILE_FAILED');
+    return err;
+  }
+  throw new Error('expected the compile to fail');
+}
+
+describe('shader diagnostics — the real compiler output, attributed to the right stage', () => {
+  test('a fragment-stage error is labelled fragment, never vertex', () => {
+    // The bug this pins. The validation wrapper's text is unreliable about the
+    // stage, and a person who believes it looks in the wrong half of their own
+    // material.
+    const spec = diagnosticSpec();
+    const code = generateScaffold(spec).code;
+    const line = fragmentEntryLineOf(code) + 1;
+    const device = new FakePipelineDevice({
+      pipelineError: new Error('While validating vertex stage: shader validation error'),
+      compilationMessages: [
+        { type: 'error', message: "expected ';' for variable declaration", lineNum: line, linePos: 7 },
+      ],
+    });
+    return expectCompileError(device, spec).then((err) => {
+      expect(err.message).toContain('fragment stage');
+      expect(err.message).not.toContain('vertex stage');
+      expect(err.message).toContain(`line ${line} column 7`);
+      expect(err.message).toContain("expected ';'");
+      // The line the compiler pointed at, so a 3 KB generated program is
+      // actionable. This is the part that was being dropped.
+      expect(err.why).toContain('return vec4f(in.t, 0.0, 0.0, 1.0);');
+      expect(err.why).toContain(`[fragment] ${line}:7`);
+      // The original error is kept, not just its text.
+      expect((err.cause as Error).message).toContain('While validating vertex stage');
+    });
+  });
+
+  test('a vertex-stage error is labelled vertex, and a prelude error prelude', () => {
+    const spec = diagnosticSpec();
+    const code = generateScaffold(spec).code;
+    const cases: readonly [number, string][] = [
+      [vertexEntryLineOf(code) + 1, 'vertex'],
+      [preludeFirstLineOf(code), 'prelude'],
+    ];
+    for (const [line, stage] of cases) {
+      const device = new FakePipelineDevice({
+        pipelineError: new Error('shader validation error'),
+        compilationMessages: [{ type: 'error', message: `problem at ${line}`, lineNum: line, linePos: 1 }],
+      });
+      return expectCompileError(device, spec).then((err) => {
+        expect(err.message).toContain(`${stage} stage`);
+        expect(err.why).toContain(`[${stage}] ${line}:1`);
+      });
+    }
+  });
+
+  test('every diagnostic survives, not just the first, and warnings are not errors', () => {
+    const spec = diagnosticSpec();
+    const code = generateScaffold(spec).code;
+    const base = fragmentEntryLineOf(code);
+    const device = new FakePipelineDevice({
+      pipelineError: new Error('shader validation error'),
+      compilationMessages: [
+        { type: 'warning', message: 'unused variable', lineNum: base + 1, linePos: 3 },
+        { type: 'error', message: 'first real problem', lineNum: base + 1, linePos: 4 },
+        { type: 'error', message: 'second real problem', lineNum: base + 2, linePos: 5 },
+        { type: 'info', message: 'note', lineNum: base + 2, linePos: 6 },
+      ],
+    });
+    return expectCompileError(device, spec).then((err) => {
+      expect(err.message).toContain('first real problem');
+      expect(err.why).toContain('first real problem');
+      expect(err.why).toContain('second real problem');
+      // A warning is not a compile failure and must not be reported as one.
+      expect(err.why).not.toContain('unused variable');
+    });
+  });
+
+  test('the error-scope route is handled as well as the rejection route', () => {
+    // `createRenderPipelineAsync` can resolve and still leave a device error on
+    // the scope, and that is a real path — not a theoretical one.
+    const spec = diagnosticSpec();
+    const line = fragmentEntryLineOf(generateScaffold(spec).code) + 1;
+    const device = new FakePipelineDevice({
+      errorScopes: [new Error('scope failure') as unknown as GPUError],
+      compilationMessages: [{ type: 'error', message: 'the real reason', lineNum: line, linePos: 2 }],
+    });
+    return expectCompileError(device, spec).then((err) => {
+      expect(err.message).toContain('fragment stage');
+      expect(err.message).toContain('the real reason');
+      // No Error object on this route, so no cause — but nothing is lost.
+      expect(err.cause).toBeUndefined();
+    });
+  });
+
+  for (const mode of ['absent', 'throws'] as const) {
+    test(`it degrades gracefully when getCompilationInfo is '${mode}'`, () => {
+      const spec = diagnosticSpec();
+      const device = new FakePipelineDevice({
+        compilationInfo: mode,
+        pipelineError: new Error('While validating vertex stage: whatever'),
+      });
+      return expectCompileError(device, spec).then((err) => {
+        // The scope text is worse but it is not nothing, and the error says so
+        // rather than inventing a stage it cannot support.
+        expect(err.message).toContain('While validating vertex stage');
+        expect(err.why).toContain("diagnostics were unavailable");
+        expect(err.why).toContain('names a stage that may be wrong');
+      });
+    });
+  }
+
+  test('a module with no messages array is the same graceful degradation', () => {
+    const spec = diagnosticSpec();
+    const device = new FakePipelineDevice({ pipelineError: new Error('validation error') });
+    // Force the malformed shape the resolver must survive: a compilation info
+    // object with no `messages` on it at all.
+    (device as unknown as { createShaderModule: unknown }).createShaderModule = (): GPUShaderModule => ({
+      getCompilationInfo: () => Promise.resolve({}),
+    } as unknown as GPUShaderModule);
+    return expectCompileError(device, spec).then((err) => {
+      expect(err.message).toContain('validation error');
+      expect(err.why).toContain('diagnostics were unavailable');
+    });
+  });
+
+  test('a successful compile never asks for diagnostics at all', () => {
+    const device = new FakePipelineDevice();
+    return import('../src/material/material.ts').then(({ Material }) =>
+      Material.create(asPipelineDevice(device), diagnosticSpec())).then(() => {
+      expect(device.compilationInfoCalls).toBe(0);
+      expect(device.modules).toHaveLength(1);
+      expect(device.modules[0]!.code).toContain('fn vs(');
+    });
+  });
+});
+
+describe('stageAtLine — the attribution the diagnostics path depends on', () => {
+  const code = generateScaffold(diagnosticSpec()).code;
+
+  test('each section banner claims its own lines and nothing else', () => {
+    // The ranges are built from the banners themselves, so the assertion is that
+    // every line of the file is claimed by exactly one section and attributed to
+    // the one it is in — not that three chosen lines happen to work.
+    const total = code.split('\n').length;
+    const prelude = preludeBannerLineOf(code);
+    const vertex = vertexBannerLineOf(code);
+    const fragment = fragmentBannerLineOf(code);
+    expect(prelude).toBeLessThan(vertex);
+    expect(vertex).toBeLessThan(fragment);
+    expect(fragment).toBeLessThanOrEqual(total);
+    const sections: [ShaderStage, number, number][] = [
+      ['generated', 1, prelude - 1],
+      ['prelude', prelude, vertex - 1],
+      ['vertex', vertex, fragment - 1],
+      ['fragment', fragment, total],
+    ];
+    for (const [stage, from, to] of sections) {
+      for (let line = from; line <= to; line++) {
+        expect(stageAtLine(code, line), `line ${line}`).toBe(stage);
+      }
+    }
+  });
+
+  test('a line outside the program is not attributed to a stage it may not be in', () => {
+    // A diagnostic from an included file, or a lineNum of 0 from an
+    // implementation that does not track it. Walking the banners and returning
+    // whatever the last one was would report "fragment" in every one of these
+    // cases, which is the same class of mistake as reporting "vertex" by default
+    // and is worse because it looks deliberate.
+    const total = code.split('\n').length;
+    expect(stageAtLine(code, 0)).toBe('generated');
+    expect(stageAtLine(code, -3)).toBe('generated');
+    expect(stageAtLine(code, 99999)).toBe('generated');
+    expect(stageAtLine(code, 1.5)).toBe('generated');
+    expect(stageAtLine(code, Number.NaN)).toBe('generated');
+    // The bound is inclusive: the last line of the program is attributed.
+    expect(stageAtLine(code, total)).toBe('fragment');
+  });
+
+  test('it reads the generator\'s own banners, not a regex over the entry points', () => {
+    // The banners are what the template emits, so a template change moves both
+    // together. Asserted as a property of the text, not of the implementation.
+    expect(code).toContain('// ---- prelude (user-supplied declarations) ----');
+    expect(code).toContain('// ---- generated by apse: vertex stage ----');
+    expect(code).toContain('// ---- generated by apse: fragment stage ----');
+  });
+});
+
+// ===========================================================================
+// 19. The normal matrix layout
+//
+// apse shipped a bug here: a tight 3x3 written where WGSL's `mat3x3<f32>`
+// expects three 16-byte-aligned columns. Every normal in every mesh was wrong and
+// every material shaded flat, with no error at any point. The fix is in place; the
+// point of these tests is that it cannot come back, and that the *shader's*
+// reading of the bytes and the *packer's* writing of them are pinned to the same
+// layout rather than to two agreeing conventions.
+// ===========================================================================
+
+/** The byte offset and width apse gives `normalMatrix`, from the generated struct. */
+const NORMAL_MATRIX = OBJECT_BLOCK.fields.find((f) => f.name === 'normalMatrix')!;
+
+/** A non-uniform scale, so a normal matrix that is not the identity is visible. */
+const MODEL_NON_UNIFORM = new Float32Array([
+  2, 0, 0, 0,
+  0, 1, 0, 0,
+  0, 0, 1, 0,
+  0, 0, 0, 1,
+]);
+
+describe('the mat3x3f packed layout — the bug that shipped', () => {
+  test('the generated struct declares a mat3x3f at 64 bytes, three 16-byte columns', () => {
+    expect(NORMAL_MATRIX.type).toBe('mat3x3f');
+    expect(NORMAL_MATRIX.offset).toBe(64);
+    expect(NORMAL_MATRIX.size).toBe(48);
+    expect(NORMAL_MATRIX.components).toBe(12);
+    // 12 *components* and 16 *floats* are different numbers, and the gap between
+    // them is the entire bug: three columns of three, each padded to four.
+    expect(UNIFORM_TYPES.mat3x3f.components).toBe(12);
+    expect(UNIFORM_TYPES.mat3x3f.align).toBe(16);
+    expect(UNIFORM_TYPES.mat3x3f.size).toBe(48);
+    expect(OBJECT_BLOCK.wgsl).toContain('normalMatrix : mat3x3<f32>,');
+    // ...and the record around it, so a change to any neighbour is caught here.
+    expect(OBJECT_BLOCK.fields.map((f) => `${f.name}@${f.offset}`)).toEqual([
+      'model@0', 'normalMatrix@64', 'objectId@112', 'instanceId@116', 'visibility@120',
+    ]);
+    expect(OBJECT_BLOCK.stride).toBe(256);
+  });
+
+  /**
+   * Packs one object and returns the bytes apse uploaded, read out of the fake
+   * device's recorded `writeBuffer` call rather than out of a private field — so
+   * this asserts what actually reaches the GPU, through the same code path the
+   * renderer uses.
+   */
+  function packedRecord(normal: ArrayLike<number>, index = 0): { f32: Float32Array; u32: Uint32Array } {
+    const device = new FakePipelineDevice();
+    const u = new ObjectUniforms(asPipelineDevice(device), `test-${index}`, 4);
+    u.pack(index, MODEL_NON_UNIFORM, normal, 7, 3, 1);
+    u.uploadFrom(index + 1);
+    const write = device.writes.at(-1);
+    expect(write).toBeDefined();
+    // One record is one stride, even though only 124 of those 256 bytes are data.
+    expect(write!.size).toBe(OBJECT_BLOCK.stride);
+    const buffer = write!.bytes.buffer.slice(0) as ArrayBuffer;
+    return { f32: new Float32Array(buffer), u32: new Uint32Array(buffer) };
+  }
+
+  /** The 12 float words the shader reads as `mat3x3<f32>`. */
+  const NORMAL_WORDS = NORMAL_MATRIX.offset >> 2;
+
+  test('twelve data floats and three padding floats, in three four-word columns', () => {
+    // A padded, column-major 3x3, with the padding deliberately poisoned: if the
+    // packer ever copies words 3, 7 or 11 the sentinel lands in the buffer and
+    // this test fails with a number nobody has to interpret.
+    const normal = new Float32Array([
+      1, 2, 3, 999,
+      4, 5, 6, 999,
+      7, 8, 9, 999,
+    ]);
+    const { f32 } = packedRecord(normal);
+    expect(Array.from(f32.slice(NORMAL_WORDS, NORMAL_WORDS + 12))).toEqual([
+      1, 2, 3, 0,
+      4, 5, 6, 0,
+      7, 8, 9, 0,
+    ]);
+    // The ids and the visibility are immediately after, in the fields the WGSL
+    // declares next to the matrix. Read as u32, because that is how they are
+    // written: objectId 7 and instanceId 3 read as floats are denormals, and a
+    // test that compared them to 7 would pass for the wrong reason.
+    const ids = OBJECT_BLOCK.fields.find((f) => f.name === 'objectId')!.offset >> 2;
+    const { u32 } = packedRecord(normal);
+    expect(u32[ids]).toBe(7);
+    expect(u32[ids + 1]).toBe(3);
+    expect(f32[ids + 2]).toBe(1);
+    // Nothing beyond the record is touched: 64 model floats, then 12 matrix
+    // floats, then 2 ids, then the visibility, and the stride's remaining bytes
+    // are left alone.
+    expect(f32[NORMAL_WORDS + 15]).toBe(0);
+    expect(OBJECT_BLOCK.size).toBe(128);
+  });
+
+  test('a tight 3x3 is the wrong layout, and the shader reads it wrong in a specific way', () => {
+    // The exact regression, stated as a property rather than as a diff.
+    //
+    // Padded, which is what apse writes and what WGSL reads:
+    //     word:  0  1  2   3 | 4  5  6   7 | 8  9 10  11
+    //            e1 e2 e3 pad  e4 e5 e6 pad  e7 e8 e9 pad
+    // Tight, which is what the bug wrote:
+    //     word:  0  1  2  3  4  5  6  7  8
+    //            e1 e2 e3 e4 e5 e6 e7 e8 e9
+    //
+    // So column 0 is accidentally right, column 1 is shifted by one, and column 2
+    // reads the last element followed by whatever happened to be in the padding —
+    // which for a zeroed buffer is zero, i.e. the third axis of every normal
+    // collapsed to nothing and the whole scene shaded as though every face were
+    // lit head-on. That is the symptom, and it is why no error was ever raised.
+    const elements = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    const padded = [1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0];
+    const column = (w: readonly number[], j: number): number[] =>
+      [w[j * 4]!, w[j * 4 + 1]!, w[j * 4 + 2]!];
+
+    expect(column(padded, 0)).toEqual([1, 2, 3]);
+    expect(column(padded, 1)).toEqual([4, 5, 6]);
+    expect(column(padded, 2)).toEqual([7, 8, 9]);
+
+    expect(column(elements, 0)).toEqual([1, 2, 3]);
+    expect(column(elements, 1)).toEqual([5, 6, 7]);
+    // And the third column reads the last element followed by whatever the record
+    // happens to hold next, which in ObjectData is the object id and the instance
+    // id. So the tight write did not merely lose a column: it fed two integers
+    // into a normal's third component, for every object in the scene.
+    expect(column([...elements, 7, 3], 2)).toEqual([9, 7, 3]);
+
+    // ...and apse writes the padded one.
+    const { f32 } = packedRecord(new Float32Array(padded));
+    expect(Array.from(f32.slice(NORMAL_WORDS, NORMAL_WORDS + 12))).toEqual(padded);
+  });
+
+  test('the packer reads a 12-float padded array by column, not by position', () => {
+    // Both spellings produce the same bytes, so a caller cannot get it wrong by
+    // picking one. Identity is the readable witness: a row-major interpretation
+    // of an asymmetric array is visibly different, and identity hides nothing.
+    const { f32 } = packedRecord(new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]));
+    expect(Array.from(f32.slice(NORMAL_WORDS, NORMAL_WORDS + 12)))
+      .toEqual([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]);
+    // And the values are copied, not aliased: mutating the source afterwards
+    // cannot change what was uploaded.
+    const source = new Float32Array([1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0]);
+    const { f32: first } = packedRecord(source);
+    source[0] = -1;
+    expect(first[NORMAL_WORDS]).toBe(1);
+  });
+
+  test('the bytes the shader reads multiply a vector the way the matrix means to', () => {
+    // The end-to-end property. `mat3x3<f32>` is column-major, so m * v is
+    // column0 * v.x + column1 * v.y + column2 * v.z — and the three columns are
+    // the three 4-word groups above. A scale of 2 on X has an inverse-transpose
+    // normal matrix of 0.5 on X, so a normal along X must come back halved and a
+    // normal along Y unchanged.
+    const identityNormal = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]);
+    const identity = packedRecord(identityNormal).f32;
+    const column = (words: Float32Array, j: number): [number, number, number] =>
+      [words[NORMAL_WORDS + j * 4]!, words[NORMAL_WORDS + j * 4 + 1]!, words[NORMAL_WORDS + j * 4 + 2]!];
+    /** Exactly WGSL's `m * v` for a column-major mat3x3. */
+    const mul = (m: readonly (readonly [number, number, number])[], v: readonly [number, number, number]): number[] => {
+      const out = [0, 0, 0];
+      for (let j = 0; j < 3; j++) {
+        for (let k = 0; k < 3; k++) out[k]! += m[j]![k]! * v[k]!;
+      }
+      return out;
+    };
+
+    const identityMatrix = [column(identity, 0), column(identity, 1), column(identity, 2)];
+    expect(identityMatrix).toEqual([[1, 0, 0], [0, 1, 0], [0, 0, 1]]);
+    expect(mul(identityMatrix, [1, 0, 0])).toEqual([1, 0, 0]);
+    expect(mul(identityMatrix, [0, 1, 0])).toEqual([0, 1, 0]);
+
+    // A non-uniform scale: the inverse transpose of diag(2, 1, 1) is diag(0.5, 1, 1).
+    const scaled = packedRecord(new Float32Array([0.5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0])).f32;
+    const scaledMatrix = [column(scaled, 0), column(scaled, 1), column(scaled, 2)];
+    expect(scaledMatrix[0]).toEqual([0.5, 0, 0]);
+    expect(mul(scaledMatrix, [1, 0, 0])).toEqual([0.5, 0, 0]);
+    expect(mul(scaledMatrix, [0, 1, 0])).toEqual([0, 1, 0]);
+    // A diagonal is symmetric, so a transposed reading would agree — which is
+    // exactly why the rotation case below exists.
+  });
+
+  test('a rotated frame, which is the case a symmetric matrix hides', () => {
+    // Identity and a diagonal scale are both symmetric, so a transposed packer
+    // passes both. A rotation is not, and a rotation is what every mesh with a
+    // tangent frame actually has.
+    const c = Math.cos(0.7), s = Math.sin(0.7);
+    // Column-major: column j is the image of the j-th basis vector.
+    const rotated = packedRecord(new Float32Array([
+      c, -s, 0, 0,
+      s, c, 0, 0,
+      0, 0, 1, 0,
+    ])).f32;
+    const column = (j: number): [number, number, number] =>
+      [rotated[NORMAL_WORDS + j * 4]!, rotated[NORMAL_WORDS + j * 4 + 1]!, rotated[NORMAL_WORDS + j * 4 + 2]!];
+    const cols = [column(0), column(1), column(2)];
+
+    // Column-major: m * (1,0,0) is column 0.
+    expect(cols[0]![0]).toBeCloseTo(c, 6);
+    expect(cols[0]![1]).toBeCloseTo(-s, 6);
+    // The transposed reading gives (s, c, 0): the same matrix rotated the other
+    // way. A packer that wrote rows instead of columns would produce exactly
+    // this, and a uniformly-scaled scene would hide it completely.
+    const asRows: readonly (readonly [number, number, number])[] = [
+      [cols[0]![0], cols[1]![0], cols[2]![0]],
+      [cols[0]![1], cols[1]![1], cols[2]![1]],
+      [cols[0]![2], cols[1]![2], cols[2]![2]],
+    ];
+    expect(asRows[0]).not.toEqual(cols[0]);
+    expect(asRows[0]![1]).toBeCloseTo(s, 6);
+    // The rotation preserves length, which a wrong layout does not.
+    const length = Math.hypot(cols[0]![0], cols[0]![1], cols[0]![2]);
+    expect(length).toBeCloseTo(1, 6);
+  });
+
+  test('the byte offset for any object is the field offset plus whole strides', () => {
+    const device = new FakePipelineDevice();
+    const u = new ObjectUniforms(asPipelineDevice(device), 'offsets', 4);
+    expect(u.fieldOffset(0, 'normalMatrix')).toBe(64);
+    expect(u.fieldOffset(1, 'normalMatrix')).toBe(64 + 256);
+    expect(u.fieldOffset(3, 'normalMatrix')).toBe(64 + 3 * 256);
+    // The *dynamic* offset a draw binds is index * stride and must be a multiple
+    // of minUniformBufferOffsetAlignment; the field sits 64 bytes into that
+    // record. An object that did not get a whole stride would fail at the
+    // *second* object's draw, with nothing wrong in the first.
+    for (let i = 0; i < 4; i++) {
+      expect(i * OBJECT_BLOCK.stride % 256).toBe(0);
+      expect(u.fieldOffset(i, 'normalMatrix') - 64).toBe(i * 256);
+    }
+    expect(() => u.fieldOffset(0, 'nope')).toThrow();
+  });
+
+  test('every object in a frame gets its own matrix, at its own offset', () => {
+    // The one that would catch a stride regression: identical matrices in
+    // identical slots means the buffer was addressed wrongly, not packed wrongly.
+    const device = new FakePipelineDevice();
+    const u = new ObjectUniforms(asPipelineDevice(device), 'many', 4);
+    for (let i = 0; i < 3; i++) u.pack(i, MODEL_NON_UNIFORM, new Float32Array(12).fill(i + 1), i, 0, 1);
+    u.uploadFrom(3);
+    const words = new Float32Array(device.writes.at(-1)!.bytes.buffer.slice(0) as ArrayBuffer);
+    for (let i = 0; i < 3; i++) {
+      const at = (i * OBJECT_BLOCK.stride + NORMAL_MATRIX.offset) >> 2;
+      expect(Array.from(words.slice(at, at + 12))).toEqual([
+        i + 1, i + 1, i + 1, 0,
+        i + 1, i + 1, i + 1, 0,
+        i + 1, i + 1, i + 1, 0,
+      ]);
+    }
+  });
+
+  test('the shipped material transforms its normal with exactly that matrix', () => {
+    // The last link in the chain: the shader multiplies the packed mat3x3 by a
+    // vec3, and WGSL's matCxR * vecC is column-major. Asserted on the generated
+    // text because a mat3 * vec4 (the GLSL slip) is the other way this goes wrong.
+    for (const spec of [pbrMaterialSpec(), diffuseMaterialSpec(), anisotropicMaterialSpec()]) {
+      const body = stripComments(resolveSpec(spec).vertexBody);
+      expect(body).toContain('normalize(obj.normalMatrix * in.normal)');
+      expect(body).not.toContain('obj.normalMatrix * vec4f');
+    }
+  });
+});
+
+/** A generated body with its comments deleted and its whitespace collapsed. */
+function collapse(body: string): string {
+  return tokenKeyOf(body);
+}
+

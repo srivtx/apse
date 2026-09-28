@@ -28,7 +28,8 @@ export interface BoxOptions {
 
 type Vec3 = readonly [number, number, number];
 
-interface Face {
+/** One face's frame: its normal, two tangents, and a corner. */
+export interface BoxFace {
   readonly n: Vec3;
   /** Unit tangent, scaled by the box extent on the axis it points down. */
   readonly u: Vec3;
@@ -40,7 +41,10 @@ interface Face {
 
 // Six faces, each wound CCW as seen from outside. `cross(u, v) === n` for every
 // one of them, which is the single invariant the index generation relies on.
-const FACES: readonly Face[] = [
+//
+// Exported because `roundedBox` fills the same six faces and there is no reason
+// for two files to hold two copies of a table that has to agree.
+export const BOX_FACES: readonly BoxFace[] = [
   // +X — looking at the right face, u runs -Z and v runs +Y.
   { n: [1, 0, 0], u: [0, 0, -1], v: [0, 1, 0], o: [1, -1, 1] },
   // -X
@@ -75,8 +79,8 @@ export function box(opts: BoxOptions = {}): MeshData {
   const extent: Vec3 = [width, height, depth];
   const side = seg + 1;
   const perFace = side * side;
-  const vertexCount = perFace * FACES.length;
-  const indexCount = FACES.length * seg * seg * 6;
+  const vertexCount = perFace * BOX_FACES.length;
+  const indexCount = BOX_FACES.length * seg * seg * 6;
 
   const w = new VertexWriter(layout, vertexCount);
   const out = w.data;
@@ -88,8 +92,8 @@ export function box(opts: BoxOptions = {}): MeshData {
 
   let ii = 0;
   let base = 0;
-  for (let f = 0; f < FACES.length; f++) {
-    const face = FACES[f];
+  for (let f = 0; f < BOX_FACES.length; f++) {
+    const face = BOX_FACES[f];
     const nx = face.n[0];
     const ny = face.n[1];
     const nz = face.n[2];

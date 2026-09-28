@@ -15,6 +15,17 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  BUN_VERSION: 1.3.9
+  NODE_VERSION: 22
+  # puppeteer's postinstall downloads ~150 MB of Chrome. Only the bench job ever
+  # launches a browser, and it provisions one explicitly in its own step, so
+  # letting the postinstall do it would make a required, browser-free job depend
+  # on a large third-party download succeeding — flaky on a good day, and
+  # entirely unrelated to the code when it fails. Skipping it here makes
+  # `bun install` hermetic and leaves the browser decision where it belongs.
+  PUPPETEER_SKIP_DOWNLOAD: '1'
+
 jobs:
   verify:
     name: typecheck, tests, build, size gate
@@ -25,11 +36,37 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.9
+          bun-version: ${{ env.BUN_VERSION }}
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Every devDependency this repo has is a build-time or test-time tool:
+      # @webgpu/types and @types/bun are type-only, esbuild does the bundling,
+      # typescript emits the declarations, puppeteer and three are the bench.
+      # With no `bun install` step, node_modules does not exist and `tsc` fails
+      # on TS2688 for the two type libraries before it has read a line of our
+      # source. `--frozen-lockfile` makes that impossible to miss: the lockfile is
+      # committed, so a package.json that has drifted from it fails here loudly
+      # instead of silently resolving to something unpinned.
+      - name: install
+        run: bun install --frozen-lockfile
+
+      # `bench/dx/apse-custom-material.ts` has a *static* type-level import of
+      # `../../dist/index.js`, and tsconfig.json typechecks `bench/**`. dist/ is
+      # gitignored, so on a fresh checkout `tsc --noEmit` fails with TS2307 before
+      # the build has run — and `verify` runs typecheck first by design, so the
+      # build has to be done here or the chain can never start. `verify` still
+      # runs its own build; this one is a pre-declaration step, not a
+      # replacement, and the chain itself is unchanged.
+      #
+      # The real fix belongs in bench/dx/apse-custom-material.ts: a bench harness
+      # should import `src/index.ts` like the rest of the repo does, or the file
+      # should be excluded from the typecheck program. Until then, this is where
+      # the ordering lives.
+      - name: build (dist/ is type-referenced by bench/dx)
+        run: bun run build
 
       # `bun run verify` is typecheck + tests + build + size gate. The size gate
       # is part of the build rather than a separate job because a bundle-size
@@ -44,23 +81,103 @@ jobs:
     name: benchmark (headless Chrome, real GPU where available)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Benchmarks on a shared runner are not comparable to the numbers in the
-    # README, which come from an Apple M-series GPU. This job exists to catch
-    # large regressions, not to publish figures.
+    # Shared runners have no GPU, and Chrome's headless WebGPU needs one: it
+    # reaches the real adapter or it does not reach an adapter at all, and the
+    # software fallbacks (--enable-unsafe-swiftshader, --use-angle=swiftshader)
+    # that would paper over the gap make requestAdapter() return null, which
+    # bench/run.ts reads as "WebGPU unsupported" rather than "wrong flags". So on
+    # ubuntu-latest this job is expected to fail at the adapter probe, and the
+    # figures it prints are not comparable to the Apple M-series numbers in the
+    # README anyway.
+    #
+    # continue-on-error keeps it non-blocking for the run's conclusion, but it
+    # does NOT hide a failure: the job still reports red in the checks list, with
+    # the full log, for a human to read. It exists to catch a large regression on
+    # a machine that does have a GPU, not to publish figures.
+    #
+    # Note there is no `|| true` on the bench step and no `if: always()` that
+    # swallows the exit code. A real failure stays a real failure.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.9
+          bun-version: ${{ env.BUN_VERSION }}
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
 
+      - name: install
+        run: bun install --frozen-lockfile
+
+      # dist/ is gitignored, and bench/index.html loads the library as
+      # `import('/dist/index.js')` through the harness's own static server. With
+      # no build, that request 404s and the harness reports it as a failed
+      # dynamic import — which is exactly the failure this job used to produce
+      # on every commit, and why it looked broken rather than merely
+      # GPU-starved.
+      - name: build
+        run: bun run build
+
+      # three.js is imported by the harness straight out of node_modules as a
+      # comparison baseline, so the install above is what makes that path exist.
       - name: install browser
         run: npx puppeteer browsers install chrome
 
+      # Informational, never fatal. Printed so a reader of a red bench job can
+      # tell "no GPU on this runner" from "the renderer regressed".
+      - name: gpu probe
+        run: |
+          echo "GPU devices:"
+          ls -l /dev/dri 2>&1 || echo "  (none — this runner has no /dev/dri)"
+          echo
+          echo "GPU vendors:"
+          (command -v nvidia-smi >/dev/null && nvidia-smi -L) || echo "  (no nvidia-smi)"
+          echo
+          echo "CPUs: $(nproc)"
+
       - name: bench
         run: bun run bench
+
+  drift:
+    name: engine drift (bun latest, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Advisory on purpose. `packageManager` and the CI toolchain are both pinned
+    # to bun 1.3.9, and that pin is the contract; this job exists to tell us
+    # *before* a release when the pin is costing us something — a lockfile format
+    # change, a `bun test` behaviour change, a resolver change that would move
+    # the measured bundle sizes. It runs the same pinned lockfile, so it costs
+    # about a minute of runner time and cannot move the size numbers.
+    #
+    # It is deliberately not a required matrix leg. A required leg on an unpinned
+    # "latest" means a bun release lands, CI goes red, and the only fixes are to
+    # bump the pin (a change nobody chose) or to relax the gate (a change nobody
+    # wanted). This reports the drift and leaves the decision to a human.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: install
+        run: bun install --frozen-lockfile
+
+      # See the note in the verify job: bench/dx/apse-custom-material.ts
+      # type-references dist/index.js, so typecheck cannot start without it.
+      - name: build (dist/ is type-referenced by bench/dx)
+        run: bun run build
+
+      - name: verify
+        run: bun run verify
+
+      - name: report bun version
+        run: bun --version

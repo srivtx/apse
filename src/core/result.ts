@@ -13,6 +13,8 @@
  * and the compiler tells you which one you have before you run anything.
  */
 
+import { fail } from './error.ts';
+
 /** Recoverable failure. The set of reasons is finite and typed, not a string. */
 export interface Err<Code extends string = string> {
   readonly ok: false;
@@ -52,7 +54,16 @@ export function isErr<T, C extends string>(r: Result<T, C>): r is Err<C> {
 /** Unwraps, or throws with the failure's own message. The escape hatch. */
 export function unwrap<T, C extends string>(r: Result<T, C>): T {
   if (r.ok) return r.value;
-  throw new Error(`${r.code}: ${r.message} — fix: ${r.fix}`);
+  // An `AseError`, not a bare `Error`: no bare `Error` escapes the public
+  // surface, and a handler that catches everything must still be able to
+  // branch on `code`. A Result's code belongs to whoever produced it rather than
+  // to the catalog, so the code reported is the one for the *mistake* — asking
+  // for the value of a failed Result — and the Err travels in the message, where
+  // `unwrap` has always put it.
+  fail('INVALID_USAGE', `${r.code}: ${r.message} — fix: ${r.fix}`, {
+    why: 'unwrap() reads the value out of a Result that holds a failure. The failure is already fully described — its code, message and fix are the same three fields an AseError carries — so this throw exists only to make a missed check loud.',
+    fix: 'Branch on the Result with isErr() and handle the failure, or use unwrapOr() to substitute a default.',
+  });
 }
 
 /** Unwraps, or substitutes a default. */
