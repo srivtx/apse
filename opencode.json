@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "agent": {
+    "aps-orchestrator": {
+      "mode": "primary",
+      "description": "Integration owner for apse. Fans work out to scope-locked subagents, then integrates into shared files itself.",
+      "permission": {
+        "edit": { "*": "allow" },
+        "bash": { "*": "ask", "git *": "allow", "bun *": "allow", "npx tsc*": "allow" },
+        "task": {
+          "*": "deny",
+          "aps-geometry": "allow",
+          "aps-render": "allow",
+          "aps-material": "allow",
+          "aps-scene": "allow",
+          "aps-bench": "allow",
+          "aps-docs": "allow",
+          "explore": "allow"
+        }
+      }
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "git *": "allow",
+      "bun *": "allow",
+      "npx tsc*": "allow"
+    }
+  }
+}
