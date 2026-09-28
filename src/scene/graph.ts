@@ -43,6 +43,7 @@
  */
 
 import { fail } from '../core/error.ts';
+import { sceneObjectOffset } from '../core/slot.ts';
 import { transformPoint } from '../math/mat4.ts';
 import { containsSphere, create as createFrustum } from '../math/frustum.ts';
 import type { Sphere } from '../math/sphere.ts';
@@ -170,30 +171,6 @@ const _traverseStack: Node[] = [];
 interface ResourceState {
   readonly disposed?: boolean;
   readonly name?: string;
-}
-
-/**
- * Rejects an object-uniform stride that would produce misaligned dynamic offsets.
- *
- * **Why this is checked once, before the walk, and not per item.** The check
- * used to live nowhere, and the failure it is checking for is the one that
- * cannot be caught at the point of use: `0 * stride` is `0`, and `0` is a legal
- * dynamic offset on every device. So a scene with no visible meshes, or exactly
- * one, produces nothing wrong at all, and the corruption appears at the *second*
- * item — by which point the offset is in a bind group call and the item is on
- * its way to the command buffer. Validating the stride instead of the offsets
- * makes the empty scene and the one-item scene fail exactly as loudly as the
- * thousand-item one, which is the only version of the rule that is a rule.
- */
-function assertObjectStride(stride: number): void {
-  const ok = Number.isInteger(stride) && stride >= MIN_OBJECT_UNIFORM_STRIDE && stride % MIN_OBJECT_UNIFORM_STRIDE === 0;
-  if (ok) return;
-  fail('INVALID_USAGE',
-    `collectDrawItems was given an object uniform stride of ${stride} bytes.`, {
-    why: `A dynamic offset must be a multiple of minUniformBufferOffsetAlignment (256 on every profile). Object 0 is always at offset 0 and always valid, so a one-item scene is correct and a two-item scene is a silent corruption.`,
-    fix: `Pass a positive multiple of ${MIN_OBJECT_UNIFORM_STRIDE} — the default, and what \`ObjectUniforms\` is allocated with.`,
-    detail: { kind: 'numeric', field: 'objectUniformStride', value: stride, min: MIN_OBJECT_UNIFORM_STRIDE },
-  });
 }
 
 /**
@@ -473,14 +450,12 @@ export class Scene {
    * stronger contract: a `visible: false` item still has to be walked, sorted,
    * and skipped, and that is work this module is trying not to do.
    *
-   * `objectUniformStride` is in **bytes** and defaults to
-   * {@link OBJECT_UNIFORM_STRIDE}. `item.objectOffset` is `index * stride` and
-   * `item.objectId` is `index`, both indexed into `out` — the uniform packer
-   * writes object *k*'s transform at byte offset *k* × 256, and a shader reads
-   * the same number back out of the flat `objectId`. The stride must be a
-   * positive multiple of {@link MIN_OBJECT_UNIFORM_STRIDE}, and it is checked
-   * before the walk rather than per item: see {@link assertObjectStride} for why
-   * the per-item version of that check is not a check.
+   * `item.objectOffset` is {@link sceneObjectOffset} of `index` and
+   * `item.objectId` is `index`. The offset is **not** `index * 256`: byte 0 of
+   * the shared scene buffer is the frame, so object *k* begins at
+   * `SCENE_FRAME_BYTES + k * SCENE_UNIFORM_STRIDE`. A draw binding offset 0
+   * would read the camera as a world matrix — an in-range read, a successful
+   * draw, and every object at the wrong place.
    *
    * Instanced meshes are one item, not `instanceCount` of them. The count rides
    * on the item, so a thousand copies of a cube cost a thousand sphere tests, a
@@ -493,15 +468,7 @@ export class Scene {
    * node is tested against it. Nothing here allocates, on any frame, ever:
    * a scene that grew to 100,000 objects would still allocate zero.
    */
-  collectDrawItems(
-    out: DrawItem[],
-    camera: Camera,
-    objectUniformStride: number = OBJECT_UNIFORM_STRIDE,
-  ): DrawItem[] {
-    // Before anything else, and unconditionally: this is the one validation that
-    // cannot be deferred to the items, because a scene with zero or one item
-    // cannot produce a misaligned offset to complain about.
-    assertObjectStride(objectUniformStride);
+  collectDrawItems(out: DrawItem[], camera: Camera): DrawItem[] {
     updateWorldMatrices(this.root);
     camera.getFrustum(_frustum);
     out.length = 0;
@@ -531,7 +498,7 @@ export class Scene {
           _sphere.center = node.worldPosition;
           _sphere.radius = node.worldBoundingRadius;
           if (containsSphere(_frustum, _sphere)) {
-            out.push(this.#emit(node, camera, objectUniformStride, out.length));
+            out.push(this.#emit(node, camera, out.length));
           } else {
             culled++;
           }
@@ -569,10 +536,10 @@ export class Scene {
    *      transform from the vertex buffer, so a per-instance slot would be a
    *      second copy of the same 124 bytes `instanceCount` times over.
    */
-  #emit(node: MeshNode, camera: Camera, stride: number, index: number): DrawItem {
+  #emit(node: MeshNode, camera: Camera, index: number): DrawItem {
     const item = this.#pool[index] ?? (this.#pool[index] = new PooledDrawItem());
     item.objectId = index;
-    item.objectOffset = index * stride;
+    item.objectOffset = sceneObjectOffset(index);
     // A reference, not a copy. The transform pass writes into this array in
     // place and its identity is stable, so the renderer can pack it whenever it
     // likes and always see the current value.

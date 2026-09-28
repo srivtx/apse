@@ -28,6 +28,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
+import { BIND_GROUP, sceneObjectOffset } from '../src/core/slot.ts';
 import { isAseError } from '../src/core/error.ts';
 import type { AseErrorCode } from '../src/core/error.ts';
 import { isErr, isOk } from '../src/core/result.ts';
@@ -1580,10 +1581,13 @@ describe('the frame loop — instanced draws', () => {
       // of upload for one draw.
       const object = frame.device.writes.find((w) => w.label.includes('object'));
       expect(object?.size).toBe(256);
+      // The scene group is @0 and carries both the frame and the object, so the
+      // only dynamic offset in a frame is the object's. Binding 0 is the frame
+      // region, not object 0.
       const offsets = frame.scenePasses()[0]!.bindGroups
-        .filter((b) => b.group === 1)
+        .filter((b) => b.group === BIND_GROUP.scene)
         .flatMap((b) => b.offsets ?? []);
-      expect(offsets).toEqual([0]);
+      expect(offsets).toEqual([sceneObjectOffset(0)]);
     });
   });
 

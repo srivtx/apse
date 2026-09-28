@@ -114,10 +114,10 @@ const BUDGETS: Readonly<Record<string, number>> = {
 const LAYER_GRAPH: Readonly<Record<string, { readonly layers: readonly string[]; readonly modules: number }>> = {
   'core/index': { layers: ['core'], modules: 7 },
   'math/index': { layers: ['core', 'math'], modules: 8 },
-  'scene/index': { layers: ['core', 'math', 'scene'], modules: 9 },
+  'scene/index': { layers: ['core', 'math', 'scene'], modules: 11 },
   'geometry/index': { layers: ['core', 'math', 'geometry'], modules: 22 },
   'material/index': { layers: ['core', 'math', 'geometry', 'material'], modules: 23 },
-  'render/index': { layers: ['core', 'math', 'geometry', 'material', 'scene', 'render'], modules: 30 },
+  'render/index': { layers: ['core', 'math', 'geometry', 'material', 'scene', 'render'], modules: 27 },
   'index': {
     layers: ['core', 'math', 'geometry', 'material', 'scene', 'render', 'root'],
     modules: 50,

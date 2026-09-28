@@ -57,7 +57,6 @@ import {
   ObjectUniforms,
   deviceCache,
 } from '../material/material.ts';
-import { OBJECT_UNIFORM_STRIDE } from '../scene/graph.ts';
 import type { Scene } from '../scene/graph.ts';
 import type { Camera } from '../scene/camera.ts';
 import type { DrawItem, FrameTimingStats, RenderTarget } from './types.ts';
@@ -465,7 +464,7 @@ export class Renderer {
     this.#syncSize();
 
     // --- 2. cull ------------------------------------------------------------
-    const sceneItems = scene.collectDrawItems(this.#items, cam, OBJECT_UNIFORM_STRIDE);
+    const sceneItems = scene.collectDrawItems(this.#items, cam);
 
     // --- 3. sort ------------------------------------------------------------
     // The sorted array is what gets drawn. Sorting a copy and then encoding the
@@ -725,8 +724,11 @@ export class Renderer {
     this.#captureTarget?.dispose();
     this.#canvas.dispose();
     this.#sizer.dispose();
-    this.objectUniforms.dispose();
-    this.frameUniforms.dispose();
+    // The renderer allocated the shared scene buffer, so the renderer frees it.
+    // `FrameUniforms.dispose` and `ObjectUniforms.dispose` deliberately do not:
+    // they are two faces of one per-device allocation, and a `PresentPass` that
+    // disposed its face would take every other material's camera with it.
+    deviceCache(this.device.device).sceneUniforms().dispose();
     this.device.destroy();
   }
 
@@ -835,7 +837,6 @@ export class Renderer {
       this.#packedGeneration = growNumbers(this.#packedGeneration, u.capacity);
     }
 
-    const stride = OBJECT_BLOCK.stride;
     const gen = this.#packGeneration;
     let lo = Number.POSITIVE_INFINITY;
     let hi = Number.NEGATIVE_INFINITY;
@@ -870,7 +871,9 @@ export class Renderer {
       packed++;
     }
 
-    if (hi >= lo) u.uploadRange(lo * stride, (hi + 1) * stride);
+    // Slot indices, not byte offsets. `uploadRange` took bytes and would now
+    // start at the frame region, overwriting the camera with an object matrix.
+    if (hi >= lo) u.uploadObjects(lo, hi);
     this.#packedCount = packed;
     return count;
   }
@@ -976,7 +979,6 @@ export class Renderer {
     // The guards are worth nothing unless the draw list is grouped, which is
     // what the sort is for: in graph order every guard's state differs on every
     // draw. Sorting and guarding are one change, not two.
-    let lastFrameBG: GPUBindGroup | null = null;
     let lastMaterialBG: GPUBindGroup | null = null;
     let lastTextureBG: GPUBindGroup | null = null;
     let lastVB: GPUBuffer | null = null;
@@ -1025,7 +1027,6 @@ export class Renderer {
       // A pass has its own attachments, so nothing bound in the previous pass
       // can be assumed. Resetting the guards here is what makes them correct
       // rather than merely fast.
-      lastFrameBG = null;
       lastMaterialBG = null;
       lastTextureBG = null;
       lastVB = null;
@@ -1062,21 +1063,18 @@ export class Renderer {
         lastPipeline = material.renderPipeline;
       }
 
-      // The frame uniform is one buffer per device, so this binds once per pass
-      // and the comparison is the cost of noticing that.
-      const frameBG = material.frameBindGroup;
-      if (lastFrameBG !== frameBG) {
-        this.#encBindGroupCalls++;
-        enc.setBindGroup(BIND_GROUP.frame, frameBG);
-        lastFrameBG = frameBG;
-      }
-
-      // The one genuinely per-draw binding: the object transform, addressed by a
-      // dynamic offset. Reusing the offsets array matters — a `[offset]` literal
-      // per draw is 5000 short-lived arrays a frame at 5000 objects.
+      // One bind group, one bind, per draw. Frame and object share a buffer, so
+      // this used to be two calls and the frame half was pure overhead: it
+      // carried the same value on every draw of the pass.
+      //
+      // That second call was the whole per-draw gap against three.js. 1000
+      // objects meant 1000 object binds plus 2 frame binds, and this loop is
+      // 85-100% of the frame -- see bench/diag/perf/FINDING.md. `_dynamicOffsets`
+      // is reused rather than a `[offset]` literal, which would be 5000
+      // short-lived arrays a frame at 5000 objects.
       _dynamicOffsets[0] = item.objectOffset;
       this.#encBindGroupCalls++;
-      enc.setBindGroup(BIND_GROUP.object, material.objectBindGroup, _dynamicOffsets);
+      enc.setBindGroup(BIND_GROUP.scene, material.sceneBindGroup, _dynamicOffsets);
 
       // Group 2 is keyed to the pipeline, so it is cleared whenever the pipeline
       // changes rather than carried across one. Carrying it is a latent

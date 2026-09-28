@@ -33,6 +33,8 @@
 import { describe, expect, test } from 'bun:test';
 
 import { AseError, isAseError } from '../src/core/error.ts';
+import { BIND_GROUP } from '../src/core/slot.ts';
+import { DEFAULT_SCENE_LABEL } from '../src/material/material.ts';
 import type { AseErrorCode } from '../src/core/error.ts';
 import { FRAME_BLOCK, RESERVED_SLOT_NAMES } from '../src/core/slot.ts';
 import { UNIFORM_TYPES, buildUniformBlock } from '../src/core/uniform.ts';
@@ -519,7 +521,7 @@ describe('the generated tone map WGSL', () => {
 
   test('samples the source texture at a UV derived from @builtin(position)', () => {
     const { code, resolved } = shader();
-    expect(code).toContain('@group(3) @binding(0) var texture : texture_2d<f32>;');
+    expect(code).toContain(`@group(${BIND_GROUP.texture}) @binding(0) var texture : texture_2d<f32>;`);
     expect(code).toContain('textureSample(texture, textureSampler');
     expect(resolved.fragmentBody).toContain('in.clip.xy');
     expect(resolved.fragmentBody).toContain('textureDimensions(texture, 0)');
@@ -985,12 +987,19 @@ describe('PresentPass — texture accounting', () => {
     const pass = await present(h, destination(h), { toneMapping: {} });
     const created = h.gpu.buffers.slice(before);
     const owned = created.filter((b) => b.label === 'present:fullscreen:vertex' || b.label === 'apse:tonemap:material');
-    const shared = created.filter((b) => b.label.startsWith('apse:apse.'));
+    const shared = created.filter((b) => b.label.includes(DEFAULT_SCENE_LABEL));
     expect(owned).toHaveLength(2);
-    expect(shared).toHaveLength(2);
+    // One shared scene buffer, not a frame buffer and an object buffer. The
+    // frame lives at byte 0 of it and the objects follow, so a pass shares the
+    // renderer's rather than owning either half. Zero is also correct: the
+    // buffer allocates on first write, and this pass only binds.
+    expect(shared.length).toBeLessThanOrEqual(1);
 
     pass.dispose();
     for (const buffer of owned) expect(buffer.destroyed).toBe(true);
+    // The shared scene buffer survives: disposing a pass must not free the
+    // renderer's uniform storage, or every other material on the device loses
+    // its camera.
     for (const buffer of shared) expect(buffer.destroyed).toBe(false);
     expect(h.gpu.liveBuffers).toBe(before + shared.length);
   });
@@ -1152,10 +1161,10 @@ describe('PresentPass — the fullscreen render pass', () => {
     expect(recorded.ended).toBe(true);
     expect(recorded.pipeline).not.toBeNull();
     expect(recorded.draws).toEqual([{ vertexCount: 3, instances: 1 }]);
-    // All four bind groups: the scaffold declares frame and object on every
-    // material whether or not the body reads them, so an unsatisfied pipeline
-    // layout is a validation error, not a warning.
-    expect(recorded.bindGroups).toEqual([0, 1, 2, 3]);
+    // Three bind groups, not four: the scaffold declares the frame and the
+    // object on every material whether or not the body reads them, so an
+    // unsatisfied pipeline layout is a validation error, not a warning.
+    expect(recorded.bindGroups).toEqual([BIND_GROUP.scene, BIND_GROUP.material, BIND_GROUP.texture]);
     pass.dispose();
   });
 
@@ -1328,9 +1337,18 @@ describe('PresentPass — the pipeline', () => {
     const pass = await present(h, destination(h), { toneMapping: {} });
     expect(pass.material?.frameUniforms).toBe(pass.material?.frameUniforms);
     expect(pass.material?.objectUniforms).toBe(pass.material?.objectUniforms);
-    // Exactly one frame buffer for the device, and the pass shares it.
-    const frameBuffers = h.gpu.buffers.filter((b) => b.label === 'apse:apse.frame');
-    expect(frameBuffers).toHaveLength(1);
+    // Frame and object are two faces of ONE buffer per device, and both faces
+    // must resolve to the same underlying buffer -- two instances means the
+    // renderer writes uniforms this pass's bind group never reads: no error,
+    // every object at identity.
+    expect(pass.material?.frameUniforms.sceneBuffer).toBe(
+      pass.material?.objectUniforms.sceneBuffer,
+    );
+    // At most one shared scene buffer per device, and only once something has
+    // been written through it -- `SceneUniformBuffer` allocates lazily, so a
+    // pass that binds but never packs owns nothing yet.
+    const sceneBuffers = h.gpu.buffers.filter((b) => b.label.includes(DEFAULT_SCENE_LABEL));
+    expect(sceneBuffers.length).toBeLessThanOrEqual(1);
     pass.dispose();
   });
 });

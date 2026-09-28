@@ -71,3 +71,49 @@ draw removed.
 reported as INTERNAL_INVARIANT, which is `blame: 'library'`. A camera whose
 lookAt target equals its own position is a caller error and should be
 INVALID_USAGE. Found by tripping it while writing a probe.
+
+
+## Correction, after implementing the fix
+
+**The premise above was wrong, and implementing it proved it.**
+
+The census shows `setBindGroup` for the *frame* group at **2** calls for 920 draws,
+not 921. The `lastFrameBG` guard already suppressed it to once per pass. So
+before this change the per-draw cost was **one** `setBindGroup` (the object group),
+not two, and merging the frame into the object group removed a call that was
+already not being made.
+
+The per-draw cost, measured with 500 *distinct* meshes so nothing is suppressible:
+
+    setBindGroup:0    501   scene (frame + object, one dynamic offset)
+    setVertexBuffer:0 501
+    setIndexBuffer    500
+    drawIndexed       500
+                      ---
+    4.00 calls per draw
+
+Four per draw, and **none of them is redundant**:
+
+- one `setBindGroup` with the object's dynamic offset
+- one `setVertexBuffer` — a different vertex buffer each time, because the
+  meshes are different meshes
+- one `setIndexBuffer` — likewise
+- one `drawIndexed`
+
+three.js's WebGLRenderer gets to roughly 4 too. This is close to the floor for
+N distinct meshes on either API: you cannot draw a different buffer set without
+binding it. The 0.87 us vs 0.66 us gap is **not** two bind groups. It is
+probably the sort comparator, the draw-list bookkeeping, or the per-draw
+`assertDrawable` and cache-line behaviour around the two buffer getters — none
+of which has been isolated yet.
+
+**What the merge is still worth, on its own terms:** one bind group instead of
+two, one buffer instead of two, and no separate frame bind to keep correct. That
+is real but it is a small constant, not the 1.32x. Presenting it as the fix
+would be a second false claim in a file whose whole purpose is to stop them.
+
+**Also found and fixed while doing this:** `ObjectUniforms.dispose()` and
+`FrameUniforms.dispose()` destroyed the shared scene buffer, so disposing a
+`PresentPass` freed the renderer's uniform storage and every other material on
+the device silently lost its camera. The renderer allocates that buffer now, so
+the renderer frees it.

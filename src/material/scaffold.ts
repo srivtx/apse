@@ -63,6 +63,8 @@ import {
   MATERIAL_BLOCK,
   OBJECT_BLOCK,
   RESERVED_SLOT_NAMES,
+  SCENE_FRAME_BINDING,
+  SCENE_OBJECT_BINDING,
   collectSlotDefaults,
   resolveSlotTypes,
 } from '../core/slot.ts';
@@ -1097,8 +1099,13 @@ function varyingsStruct(resolved: ResolvedMaterialSpec): string {
 
 function bindings(resolved: ResolvedMaterialSpec): string[] {
   const lines: string[] = [];
-  lines.push(`@group(${BIND_GROUP.frame}) @binding(0) var<uniform> frame : Frame;`);
-  lines.push(`@group(${BIND_GROUP.object}) @binding(0) var<uniform> obj : ObjectData;`);
+  // Frame and object share one group and one buffer: binding 0 is the object
+  // with the dynamic offset a draw moves, binding 1 is the frame at byte 0.
+  // They cannot share a single binding, because the WGSL resource interface
+  // forbids two different resource variables in one module from taking the same
+  // (group, binding) pair.
+  lines.push(`@group(${BIND_GROUP.scene}) @binding(${SCENE_OBJECT_BINDING}) var<uniform> obj : ${OBJECT_BLOCK.structName};`);
+  lines.push(`@group(${BIND_GROUP.scene}) @binding(${SCENE_FRAME_BINDING}) var<uniform> frame : ${FRAME_BLOCK.structName};`);
   if (resolved.materialBlock !== null) {
     lines.push(`@group(${BIND_GROUP.material}) @binding(0) var<uniform> mat : ${resolved.materialBlock.structName};`);
   }
@@ -1510,20 +1517,21 @@ export function describeMaterial(spec: MaterialSpec, limits?: InterStageLimits):
     })),
     bindGroups: [
       {
-        index: BIND_GROUP.frame,
-        name: 'frame',
+        index: BIND_GROUP.scene,
+        name: 'scene',
         present: true,
-        entries: [{ binding: 0, resource: `uniform ${FRAME_BLOCK.structName} (${FRAME_BLOCK.size} B)`, visibility: vis }],
-      },
-      {
-        index: BIND_GROUP.object,
-        name: 'object',
-        present: true,
-        entries: [{
-          binding: 0,
-          resource: `uniform ${OBJECT_BLOCK.structName} (dynamic offset, stride ${OBJECT_BLOCK.stride} B)`,
-          visibility: vis,
-        }],
+        entries: [
+          {
+            binding: SCENE_OBJECT_BINDING,
+            resource: `uniform ${OBJECT_BLOCK.structName} (dynamic offset, stride ${OBJECT_BLOCK.stride} B)`,
+            visibility: vis,
+          },
+          {
+            binding: SCENE_FRAME_BINDING,
+            resource: `uniform ${FRAME_BLOCK.structName} (${FRAME_BLOCK.size} B)`,
+            visibility: vis,
+          },
+        ],
       },
       {
         index: BIND_GROUP.material,
@@ -1634,25 +1642,27 @@ export function validateGeneratedWGSL(code: string): { readonly ok: true } {
   // Groups 0-2 each expose exactly one variable, fixed by BIND_GROUP. Group 3
   // is the texture group and holds a variable per texture and per shared
   // sampler, so it is checked for membership rather than for a single name.
+  // Keyed by `group * 100 + binding`, not by group: the scene group holds two
+  // variables, so a group-keyed map would claim the frame's name for the object.
   const fixedName = new Map<number, string>([
-    [BIND_GROUP.frame, 'frame'],
-    [BIND_GROUP.object, 'obj'],
-    [BIND_GROUP.material, 'mat'],
+    [BIND_GROUP.scene * 100 + SCENE_OBJECT_BINDING, 'obj'],
+    [BIND_GROUP.scene * 100 + SCENE_FRAME_BINDING, 'frame'],
+    [BIND_GROUP.material * 100, 'mat'],
   ]);
-  const groups = new Set<number>([...fixedName.keys(), BIND_GROUP.texture]);
+  const groups = new Set<number>([BIND_GROUP.scene, BIND_GROUP.material, BIND_GROUP.texture]);
 
   for (const m of code.matchAll(/@group\((\d+)\)\s*@binding\((\d+)\)\s*var\s*(?:<(\w+)>\s*)?(\w+)/g)) {
     const group = Number(m[1]);
     const name = m[4];
     if (!groups.has(group)) {
       fail('INTERNAL_INVARIANT', `Generated WGSL binds @group(${group}), which is not in BIND_GROUP.`, {
-        why: `BIND_GROUP is { frame: ${BIND_GROUP.frame}, object: ${BIND_GROUP.object}, material: ${BIND_GROUP.material}, texture: ${BIND_GROUP.texture} } and the two must not drift, or the renderer's positional layouts would bind the wrong thing.`,
+        why: `BIND_GROUP is { scene: ${BIND_GROUP.scene}, material: ${BIND_GROUP.material}, texture: ${BIND_GROUP.texture} } and the two must not drift, or the renderer's positional layouts would bind the wrong thing.`,
         fix: 'Report this with the material spec that produced it.',
       });
     }
-    const want = fixedName.get(group);
+    const want = fixedName.get(group * 100 + Number(m[2]));
     if (want !== undefined && name !== want) {
-      fail('INTERNAL_INVARIANT', `Generated WGSL binds "${name}" at @group(${group}); that group must be "${want}".`, {
+      fail('INTERNAL_INVARIANT', `Generated WGSL binds "${name}" at @group(${group}) @binding(${m[2]}); that slot must be "${want}".`, {
         why: 'The bind group layouts the renderer builds are positional, so the variable a group exposes has to be the one the layout is described against.',
         fix: 'Report this with the material spec that produced it.',
       });

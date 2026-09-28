@@ -108,13 +108,20 @@ export interface Drawable {
 
   // --- GPU objects, created once at material construction ---
   readonly renderPipeline: GPURenderPipeline;
-  /** @group(0) — frame uniforms. */
+  /**
+   * @group(0) — frame and object uniforms, one buffer, bound **once per draw**
+   * with the object's dynamic offset. The frame sits at byte 0 behind
+   * `SCENE_FRAME_BYTES`; it does not need a bind of its own, and giving it one
+   * cost a second `setBindGroup` on every draw.
+   */
+  readonly sceneBindGroup: GPUBindGroup;
+  /** @deprecated Same object as {@link sceneBindGroup}. Kept for the interface. */
   readonly frameBindGroup: GPUBindGroup;
-  /** @group(1) — object uniforms, bound with a dynamic offset. */
+  /** @deprecated Same object as {@link sceneBindGroup}. Kept for the interface. */
   readonly objectBindGroup: GPUBindGroup;
-  /** @group(2) — material slots. Null when the material declares no slots. */
+  /** @group(1) — material slots. Null when the material declares no slots. */
   readonly materialBindGroup: GPUBindGroup | null;
-  /** @group(3) — textures and the shared sampler. Null when untextured. */
+  /** @group(2) — textures and the shared sampler. Null when untextured. */
   readonly textureBindGroup: GPUBindGroup | null;
 
   // --- State the renderer needs when sorting or opening a pass ---

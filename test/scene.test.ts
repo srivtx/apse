@@ -17,6 +17,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
+import { FRAME_BLOCK, SCENE_UNIFORM_STRIDE, sceneObjectOffset } from '../src/core/slot.ts';
 import { Resource } from '../src/core/resource.ts';
 import { STANDARD_LAYOUT } from '../src/geometry/layout.ts';
 import { mul, transformVec4 } from '../src/math/mat4.ts';
@@ -545,8 +546,10 @@ describe('collectDrawItems', () => {
     expect(OBJECT_UNIFORM_STRIDE).toBe(256);
     items.forEach((item, i) => {
       expect(item.objectId).toBe(i);
-      expect(item.objectOffset).toBe(i * 256);
+      // Offset from the frame region, not from byte 0.
+      expect(item.objectOffset).toBe(sceneObjectOffset(i));
       expect(item.objectOffset % 256).toBe(0);
+      expect(item.objectOffset).toBeGreaterThanOrEqual(FRAME_BLOCK.size);
       expect(item.instanceCount).toBe(1);
       expect(item.firstInstance).toBe(0);
       expect(item.material).toBe(material);
@@ -554,11 +557,9 @@ describe('collectDrawItems', () => {
       expect(item.phase).toBe('opaque');
     });
 
-    // The stride is a parameter, not a constant baked into the loop: a wider
-    // slot is legal and lands where it says it will. A *narrower* one is not a
-    // parameter at all — see "draw item validation" below.
-    const wide = scene.collectDrawItems([], lookingAtScene(), 512);
-    expect(wide[3].objectOffset).toBe(3 * 512);
+    // Consecutive objects are exactly one stride apart, and the first is clear
+    // of the frame region.
+    expect(items[1].objectOffset - items[0].objectOffset).toBe(256);
   });
 
   test('culling needs the world bounding sphere, which scales with the transform', () => {
@@ -613,43 +614,25 @@ describe('collectDrawItems', () => {
 // ---------------------------------------------------------------------------
 
 describe('draw item validation', () => {
-  test('a stride that is not a whole multiple of the offset alignment is refused', () => {
+  test('object offsets are stride-aligned and clear of the frame region', () => {
     const scene = new Scene();
-    scene.add(meshNode('m', 0, 0, -5));
+    for (let i = 0; i < 8; i++) scene.add(meshNode(`m${i}`, 0, 0, -5 - i));
     const camera = lookingAtScene();
 
-    // 64 is the interesting one: it is a multiple of nothing WebGPU aligns to,
-    // it is a plausible-looking "compact" stride, and the existing test suite
-    // used to bless it. It also produced a draw list that is *correct* for one
-    // object and invalid from the second one on.
-    for (const stride of [64, 128, 255, 0, -256, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expectCode(() => scene.collectDrawItems([], camera, stride), 'INVALID_USAGE');
+    // The stride is no longer a parameter, so there is no misaligned-stride
+    // refusal to test here -- the whole point of the change was that a caller
+    // cannot choose one. What must hold is that every offset is a multiple of
+    // minUniformBufferOffsetAlignment and that object 0 starts past the frame,
+    // because a draw binding offset 0 would read the camera as a world matrix.
+    const items = scene.collectDrawItems([], camera);
+    for (let i = 0; i < items.length; i++) {
+      expect(items[i]!.objectOffset % SCENE_UNIFORM_STRIDE).toBe(0);
+      expect(items[i]!.objectOffset).toBeGreaterThanOrEqual(FRAME_BLOCK.size);
+      expect(items[i]!.objectOffset).toBe(sceneObjectOffset(i));
     }
-
-    // And the refusal happens *before* the walk, which is the whole point: a
-    // scene with nothing in it, and a scene with exactly one node, have no
-    // misaligned offset to complain about, so a per-item check would pass both
-    // and let the corruption start at item 2.
-    const empty = new Scene();
-    expectCode(() => empty.collectDrawItems([], camera, 64), 'INVALID_USAGE');
-    const one = new Scene();
-    one.add(meshNode('only', 0, 0, -5));
-    expectCode(() => one.collectDrawItems([], camera, 64), 'INVALID_USAGE');
-
-    // The error names the field and the rule, not just the number.
-    try {
-      one.collectDrawItems([], camera, 64);
-    } catch (error) {
-      const e = error as { why: string; detail?: { field?: string } };
-      expect(e.why).toContain('minUniformBufferOffsetAlignment');
-      expect(e.detail?.field).toBe('objectUniformStride');
-    }
-
-    // Valid strides are untouched, and the default is the one the object
-    // uniform buffer is actually allocated with.
-    expect(one.collectDrawItems([], camera)[0].objectOffset).toBe(0);
-    expect(one.collectDrawItems([], camera, 256)[0].objectOffset % 256).toBe(0);
-    expect(one.collectDrawItems([], camera, 1024)[0].objectOffset % 256).toBe(0);
+    // Consecutive, whole strides apart.
+    expect(items[1]!.objectOffset - items[0]!.objectOffset).toBe(SCENE_UNIFORM_STRIDE);
+    expect(items[7]!.objectOffset - items[6]!.objectOffset).toBe(SCENE_UNIFORM_STRIDE);
   });
 
   test('a draw item whose geometry was released fails loudly instead of encoding freed buffers', () => {
@@ -862,8 +845,9 @@ describe('instancing in the draw list', () => {
     // both objects simply appear in the same place.
     expect(items[0].objectId).toBe(0);
     expect(items[1].objectId).toBe(1);
-    expect(items[0].objectOffset).toBe(0);
-    expect(items[1].objectOffset).toBe(OBJECT_UNIFORM_STRIDE);
+    // Object 0 starts after the frame region, not at byte 0.
+    expect(items[0].objectOffset).toBe(sceneObjectOffset(0));
+    expect(items[1].objectOffset).toBe(sceneObjectOffset(1));
     expect(new Set(items.map((i) => i.objectOffset)).size).toBe(2);
     // The count is per item, not per instance: a slot per instance would be the
     // same 124 bytes `instanceCount` times over, for a transform the vertex
@@ -939,7 +923,7 @@ describe('instancing in the draw list', () => {
     expect(swapped[0].instanceCount).toBe(1);
     expect(swapped[0].firstInstance).toBe(0);
     expect(swapped[0].objectId).toBe(0);
-    expect(swapped[0].objectOffset).toBe(0);
+    expect(swapped[0].objectOffset).toBe(sceneObjectOffset(0));
     expect(swapped[0].model).toBe(plain.world);
     // ...and the instanced node, now at index 1, still carries its own state.
     expect(swapped[1].instanceCount).toBe(32);

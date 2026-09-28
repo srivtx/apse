@@ -81,7 +81,7 @@
 
 import { fail } from '../core/error.ts';
 import { Resource, ResourceScope } from '../core/resource.ts';
-import { BIND_GROUP, FRAME_BLOCK } from '../core/slot.ts';
+import { BIND_GROUP, FRAME_BLOCK, SCENE_FRAME_BYTES } from '../core/slot.ts';
 import { upload } from '../geometry/mesh.ts';
 import type { GpuMesh } from '../geometry/mesh.ts';
 import { FRAGMENT_ENTRY, VERTEX_ENTRY, Material, deviceCache } from '../material/material.ts';
@@ -115,7 +115,16 @@ import type { RenderTarget } from './types.ts';
 // ---------------------------------------------------------------------------
 
 /** Byte offset 0 into the object block. A fullscreen pass has one "object". */
-const OBJECT_OFFSETS: readonly number[] = Object.freeze([0]);
+/**
+ * The dynamic offset the fullscreen triangle binds.
+ *
+ * **Not 0.** Byte 0 of the shared scene buffer is the frame region; object 0 now
+ * begins at `SCENE_FRAME_BYTES`. Binding 0 here would satisfy the binding with
+ * the camera and read `camPos` as the first float of a world matrix — a valid
+ * in-range read, a successful draw, and a fullscreen triangle transformed to
+ * nothing.
+ */
+const OBJECT_OFFSETS: readonly number[] = Object.freeze([SCENE_FRAME_BYTES]);
 
 /**
  * Float index of `frame.exposure` in the frame block's CPU mirror.
@@ -542,8 +551,9 @@ export class PresentPass extends Resource {
     // this binds is the renderer's own, written this frame; the tone map does
     // not read it (it takes its UV from the source texture's dimensions, so it
     // cannot be reading a stale one), but the binding has to be satisfied.
-    pass.setBindGroup(BIND_GROUP.frame, material.frameBindGroup);
-    pass.setBindGroup(BIND_GROUP.object, material.objectBindGroup, OBJECT_OFFSETS);
+    // Frame and object are one group and one buffer now, so this is one call
+    // where the draw loop used to make two.
+    pass.setBindGroup(BIND_GROUP.scene, material.sceneBindGroup, OBJECT_OFFSETS);
     pass.setBindGroup(BIND_GROUP.material, material.materialBindGroup);
     pass.setBindGroup(BIND_GROUP.texture, material.textureBindGroup);
     pass.setVertexBuffer(0, mesh.vertexBuffer);

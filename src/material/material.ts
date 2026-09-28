@@ -33,23 +33,30 @@
  * |-------------------------------|----------------|-----------------------|
  * | `GPURenderPipeline`           | device cache   | ≤ N, usually ≪ N      |
  * | `GPUPipelineLayout`           | device cache   | ≤ N                   |
- * | `GPUBindGroupLayout` (0-3)    | device cache   | ~4 total              |
+ * | `GPUBindGroupLayout` (0-2)    | device cache   | ~3 total              |
  * | `GPUSampler`                  | device cache   | 1 per distinct config |
- * | frame uniform buffer + group  | `FrameUniforms`| **1**                 |
- * | object uniform buffer + group | `ObjectUniforms`| **1**                 |
+ * | scene uniform buffer + group  | device cache   | **1**                 |
  * | material uniform buffer       | the material   | N                     |
  * | texture bind group            | the material   | ≤ N                   |
  *
- * The frame uniform is identical for every material in a frame. Allocating one
- * per material would mean 500 writes of 256 bytes of identical data and 500
- * bind group creations to save one uniform load in the shader — the shader
- * load happens either way. `FrameUniforms` is the fix, and it is exported so
- * the renderer can own the one instance that matters.
+ * The frame and the object share one buffer and one bind group, so both live in
+ * the same row. {@link FrameUniforms} and {@link ObjectUniforms} are two *faces*
+ * of that one allocation, and that they are the same allocation is the invariant
+ * this module is most careful about.
  *
- * The object buffer is shared for the same reason: `ObjectData` is the same
- * struct for every material, so there is nothing material-specific about it.
- * It is a single large buffer addressed with dynamic offsets, allocated
- * lazily on first draw and grown by doubling.
+ * The scene uniform is identical for every material in a frame, and the object
+ * block is identical for every material too, so both are shared. Allocating either
+ * per material would mean 500 writes of the same 256 bytes and 500 bind group
+ * creations to save one uniform load in the shader — the shader load happens
+ * either way. It is exported so the renderer can own the one instance that
+ * matters.
+ *
+ * The buffer is one buffer because binding it is the cost. A recorded census at
+ * 1000 boxes found 921 `setBindGroup` calls in a frame, of which 920 were the
+ * object group and 2 the frame group, and `setBindGroup` is the most expensive
+ * call in the WebGPU API — per-draw encode is 85-100% of the frame. Three.js packs
+ * per-object data into one uniform buffer in one bind group and pays one
+ * `setBindGroup` per draw; apse paid two. Now it pays one.
  *
  * # Disposal
  *
@@ -67,8 +74,8 @@
  */
 
 import { fail } from '../core/error.ts';
-import { FRAME_BLOCK, OBJECT_BLOCK } from '../core/slot.ts';
-import type { SlotType } from '../core/slot.ts';
+import { FRAME_BLOCK, OBJECT_BLOCK, SCENE_BLOCK } from '../core/slot.ts';
+import type { SceneBlockSpec, SlotType } from '../core/slot.ts';
 import { UniformBlock } from '../core/uniform.ts';
 import type { UniformBlockSpec } from '../core/uniform.ts';
 import { Resource } from '../core/resource.ts';
@@ -155,13 +162,13 @@ function base32(byteBase: number, fieldOffset: number): number {
 export class DeviceCache {
   readonly device: GPUDevice;
 
-  #frameBGL: GPUBindGroupLayout | null = null;
-  #objectBGL: GPUBindGroupLayout | null = null;
+  #sceneBGL: GPUBindGroupLayout | null = null;
   readonly #materialBGLs = new Map<number, GPUBindGroupLayout>();
   readonly #textureBGLs = new Map<string, GPUBindGroupLayout>();
   readonly #pipelineLayouts = new Map<string, GPUPipelineLayout>();
   readonly #pipelines = new Map<number, Promise<GPURenderPipeline>>();
   readonly #samplers = new Map<string, GPUSampler>();
+  #sceneUniforms: SceneUniformBuffer | null = null;
   readonly #frameUniforms = new Map<string, FrameUniforms>();
   readonly #objectUniforms = new Map<string, ObjectUniforms>();
 
@@ -169,36 +176,54 @@ export class DeviceCache {
     this.device = device;
   }
 
-  /** @group(0). Identical for every material, so built once. */
-  frameBindGroupLayout(): GPUBindGroupLayout {
-    if (this.#frameBGL !== null) return this.#frameBGL;
-    this.#frameBGL = this.device.createBindGroupLayout({
-      label: 'apse:frame',
-      entries: [{
-        binding: 0,
-        visibility: SHADER_STAGES,
-        buffer: { type: 'uniform', minBindingSize: FRAME_BLOCK.size },
-      }],
+  /**
+   * `@group(0)`: both reserved uniform regions, in one group.
+   *
+   * Two entries, because a WGSL module may declare exactly one variable per
+   * `(group, binding)` and the frame and the object are two different structs in
+   * one buffer. One of them is dynamic and the other is not:
+   *
+   *  - `@binding(0)` `obj` has `hasDynamicOffset`, and its range is a whole
+   *    {@link SCENE_BLOCK}.stride. A draw supplies the object's offset; the
+   *    stride is what a driver may round the range up to, so binding a whole
+   *    stride is what keeps the *last* object in a full buffer from asking for
+   *    bytes past its end.
+   *  - `@binding(1)` `frame` is static, at byte 0, and every draw in every pass
+   *    sees the same 432 bytes. `minBindingSize` is the struct's own size, not
+   *    the reserved region: the reserved region is padded so the *object* side
+   *    can be stride-addressed, and declaring the padding as a minimum would
+   *    make the binding larger than the frame ever is.
+   *
+   * Both together cover the frame region and one object stride, which is
+   * {@link SceneBlockSpec.minimumByteLength} — the smallest buffer a scene with
+   * any object at all can be.
+   */
+  sceneBindGroupLayout(): GPUBindGroupLayout {
+    if (this.#sceneBGL !== null) return this.#sceneBGL;
+    this.#sceneBGL = this.device.createBindGroupLayout({
+      label: 'apse:scene',
+      entries: [
+        {
+          binding: SCENE_BLOCK.object.binding,
+          visibility: SHADER_STAGES,
+          buffer: {
+            type: 'uniform',
+            hasDynamicOffset: true,
+            minBindingSize: OBJECT_BLOCK.size,
+          },
+        },
+        {
+          binding: SCENE_BLOCK.frame.binding,
+          visibility: SHADER_STAGES,
+          buffer: { type: 'uniform', minBindingSize: FRAME_BLOCK.size },
+        },
+      ],
     });
-    return this.#frameBGL;
-  }
-
-  /** @group(1). Identical for every material. Dynamic offset. */
-  objectBindGroupLayout(): GPUBindGroupLayout {
-    if (this.#objectBGL !== null) return this.#objectBGL;
-    this.#objectBGL = this.device.createBindGroupLayout({
-      label: 'apse:object',
-      entries: [{
-        binding: 0,
-        visibility: SHADER_STAGES,
-        buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: OBJECT_BLOCK.size },
-      }],
-    });
-    return this.#objectBGL;
+    return this.#sceneBGL;
   }
 
   /**
-   * @group(2). One per distinct block *size* — the generated `MaterialData`
+   * @group(1). One per distinct block *size* — the generated `MaterialData`
    * differs between materials, and `minBindingSize` is worth keeping, so the
    * size rather than the field list is the cache key. In practice an
    * application has a handful of distinct material block sizes.
@@ -218,7 +243,7 @@ export class DeviceCache {
     return created;
   }
 
-  /** @group(3). Keyed by the declared texture and sampler signature. */
+  /** @group(2). Keyed by the declared texture and sampler signature. */
   textureBindGroupLayout(resolved: ResolvedMaterialSpec): GPUBindGroupLayout {
     if (resolved.textures.length === 0) {
       fail('INTERNAL_INVARIANT', 'Asked for a texture bind group layout for an untextured material.', {
@@ -256,8 +281,10 @@ export class DeviceCache {
    * The pipeline layout.
    *
    * A `null` entry reserves a group index without declaring anything in it,
-   * which is what lets an untextured or slotless material keep `@group(3)` at
-   * 3 while omitting `@group(2)`. The renderer then never has to bind it.
+   * which is what lets an untextured or slotless material keep `@group(2)` at
+   * 2 while omitting `@group(1)`. The renderer then never has to bind it. The
+   * order is `BIND_GROUP` — scene, material, texture — and it is positional
+   * because that is what a pipeline layout is.
    */
   pipelineLayout(resolved: ResolvedMaterialSpec): GPUPipelineLayout {
     const key = `${resolved.materialBlock?.size ?? 0}:${textureLayoutKey(resolved)}`;
@@ -266,8 +293,7 @@ export class DeviceCache {
     const created = this.device.createPipelineLayout({
       label: `apse:layout:${key}`,
       bindGroupLayouts: [
-        this.frameBindGroupLayout(),
-        this.objectBindGroupLayout(),
+        this.sceneBindGroupLayout(),
         resolved.materialBlock === null ? undefined : this.materialBindGroupLayout(resolved.materialBlock.size),
         resolved.textures.length === 0 ? undefined : this.textureBindGroupLayout(resolved),
       ],
@@ -318,21 +344,31 @@ export class DeviceCache {
   }
 
   /**
-   * The shared frame uniforms, created on first use.
+   * The one scene uniform buffer for this device, and the one true instance.
    *
-   * The renderer normally creates one explicitly and hands it to every
-   * material; this is the fallback for a material built without a renderer, and
-   * it is keyed by label so an explicitly created instance wins.
+   * Not keyed by anything. Every route to a scene uniform — the renderer, a
+   * material with no renderer, a second renderer, a test — resolves through
+   * here, and they all get the same `GPUBuffer` and the same `GPUBindGroup`.
+   * That is not tidiness. If the renderer and a material each constructed their
+   * own, the renderer would write the camera matrices and the transforms into a
+   * buffer the material's bind group never reads, and every object would draw
+   * with an identity transform: no validation error, no console line, and a
+   * scene that is simply wrong. apse shipped that bug once. A single
+   * unkeyed instance makes it unrepresentable rather than merely discouraged —
+   * there is no second place to get a scene buffer from.
    */
+  sceneUniforms(): SceneUniformBuffer {
+    if (this.#sceneUniforms === null) this.#sceneUniforms = new SceneUniformBuffer(this);
+    return this.#sceneUniforms;
+  }
+
   /**
-   * The shared frame uniform for a device, and the one true instance of it.
+   * The frame face of {@link sceneUniforms}.
    *
-   * Both the renderer and every material resolve their frame and object uniforms
-   * through this cache, keyed by these labels. That indirection is the whole
-   * point: if the renderer and a material each constructed their own, the
-   * renderer would write the camera matrices into a buffer the material's bind
-   * group never reads, and every object would be drawn with an identity
-   * transform. Nothing would error. The scene would just be wrong.
+   * Memoised per label so `cache.frameUniforms(x) === cache.frameUniforms(x)`,
+   * but the label selects nothing about the *buffer*: two labels are two faces
+   * of one allocation. `DEFAULT_FRAME_LABEL` and `DEFAULT_OBJECT_LABEL` are
+   * different strings and resolve to the same buffer, which is exactly the point.
    */
   frameUniforms(label: string): FrameUniforms {
     const hit = this.#frameUniforms.get(label);
@@ -342,6 +378,11 @@ export class DeviceCache {
     return created;
   }
 
+  /**
+   * The object face of {@link sceneUniforms}. `maxObjects` is a floor on the
+   * shared buffer's capacity, not a private one: two callers asking for
+   * different sizes still write into the same allocation.
+   */
   objectUniforms(label: string, maxObjects: number): ObjectUniforms {
     const hit = this.#objectUniforms.get(label);
     if (hit !== undefined) return hit;
@@ -351,17 +392,17 @@ export class DeviceCache {
   }
 
   /**
-   * Disposes the shared uniform blocks this cache created.
+   * Destroys the shared scene uniform buffer this cache created.
    *
    * The bind group layouts, pipeline layouts, pipelines, and samplers are
    * *not* released: none of them has a `destroy()`, and all of them become
    * collectable when the device is. Call this from the renderer's teardown,
-   * before the device is dropped, so the two uniform buffers are freed
-   * deterministically rather than whenever the GC gets round to them.
+   * before the device is dropped, so the uniform buffer is freed
+   * deterministically rather than whenever the GC gets round to it.
    */
   disposeSharedUniforms(): void {
-    for (const u of this.#frameUniforms.values()) u.dispose();
-    for (const u of this.#objectUniforms.values()) u.dispose();
+    this.#sceneUniforms?.dispose();
+    this.#sceneUniforms = null;
     this.#frameUniforms.clear();
     this.#objectUniforms.clear();
   }
@@ -371,7 +412,7 @@ export class DeviceCache {
     return {
       pipelines: this.#pipelines.size,
       pipelineLayouts: this.#pipelineLayouts.size,
-      bindGroupLayouts: 1 + 1 + this.#materialBGLs.size + this.#textureBGLs.size,
+      bindGroupLayouts: 1 + this.#materialBGLs.size + this.#textureBGLs.size,
       samplers: this.#samplers.size,
     };
   }
@@ -649,133 +690,54 @@ function deviceLimits(device: GPUDevice): { maxInterStageShaderVariables: number
 }
 
 // ---------------------------------------------------------------------------
-// Shared frame uniforms
+// The shared scene uniform
+//
+// One `GPUBuffer` and one `GPUBindGroup` hold the frame at byte 0 and every
+// object's transform after it. Two classes below, `FrameUniforms` and
+// `ObjectUniforms`, are faces of it, because the frame is written whole once a
+// frame and the objects are written a slot at a time, and one class owning two
+// write disciplines would be a worse API than two names over one buffer.
 // ---------------------------------------------------------------------------
 
 /**
- * The frame uniform: one buffer, one bind group, for the whole frame.
+ * The scene uniform buffer: frame at byte 0, one object slot per stride after.
  *
- * Owned by the renderer, referenced by every material. 500 materials sharing
- * one 256-byte uniform instead of 500 is the difference between a scene that
- * uploads 128 KB of frame state per frame and one that uploads 256 bytes.
+ * This is the *only* place a `GPUBuffer` or a `GPUBindGroup` for the reserved
+ * uniforms is created. `DeviceCache.sceneUniforms` hands out one instance per
+ * device, `FrameUniforms` and `ObjectUniforms` hold a reference to it, and
+ * nothing else can make a second one — which is the property that makes the
+ * class of bug apse shipped (the renderer writing uniforms into a buffer no bind
+ * group reads) impossible rather than merely unlikely.
  *
- * A `Drawable.writeFrameUniform` is idempotent and forwards here, so a renderer
- * that walks materials and calls it per material behaves correctly — it just
- * performs redundant writes, which is why the renderer should call
- * {@link FrameUniforms.upload} once and skip the per-material path.
+ * # Allocation is lazy, and growth throws the mirror away
+ *
+ * The buffer is created on first *use*, not at material creation: a scene that is
+ * built but never rendered should not pay for a megabyte, and most materials in a
+ * typical project are never drawn. Growth destroys the old buffer and allocates a
+ * new one, because a `GPUBindGroup` captures the buffer it was created with and
+ * a new buffer is the only correct thing to bind. The CPU mirror is recreated
+ * with it, which is why {@link generation} exists: every object write made
+ * against the old mirror is gone, and any caller caching "this slot is already
+ * packed" has to be told.
+ *
+ * # Two mirrors, one buffer
+ *
+ * The frame keeps its own `ArrayBuffer` and the object array keeps another. They
+ * are concatenated by `writeBuffer`, which takes a byte offset into the source as
+ * well as a byte offset into the destination, so there is no reason to make them
+ * one allocation — and a reason not to: the frame's mirror then survives a
+ * growth of the object array, so a realloc cannot silently zero the camera.
  */
-export class FrameUniforms implements Disposable {
-  readonly spec: UniformBlockSpec = FRAME_BLOCK;
-  /** CPU-side mirror of the block. Packed by the same code as every other block. */
-  readonly block = new UniformBlock(FRAME_BLOCK);
-  readonly buffer: GPUBuffer;
-  readonly label: string;
-
-  readonly #cache: DeviceCache;
-  #bindGroup: GPUBindGroup | null = null;
-  #dirty = false;
-  #disposed = false;
-
-  constructor(device: GPUDevice, label = 'frame') {
-    this.#cache = deviceCache(device);
-    this.label = label;
-    this.buffer = device.createBuffer({
-      label: `apse:${label}`,
-      size: FRAME_BLOCK.size,
-      // STORAGE would allow read_write; a frame block is written by the CPU and
-      // read by the GPU, which is exactly UNIFORM | COPY_DST.
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-  }
-
-  /** @group(0). Created once, on first access. */
-  get bindGroup(): GPUBindGroup {
-    if (this.#disposed) {
-      fail('INTERNAL_INVARIANT', `FrameUniforms "${this.label}" was used after it was disposed.`, {
-        why: 'The buffer it binds is destroyed, so the draw would read freed memory.',
-        fix: 'Hold the FrameUniforms for as long as any material can still be drawn.',
-      });
-    }
-    if (this.#bindGroup === null) {
-      this.#bindGroup = this.#cache.device.createBindGroup({
-        label: `apse:${this.label}:group`,
-        layout: this.#cache.frameBindGroupLayout(),
-        entries: [{ binding: 0, resource: { buffer: this.buffer, offset: 0, size: FRAME_BLOCK.size } }],
-      });
-    }
-    return this.#bindGroup;
-  }
-
-  /**
-   * Copies a fully packed frame block onto the GPU.
-   *
-   * `bytes` must be exactly {@link UniformBlockSpec}.size — it is the block the
-   * renderer already packed, so re-packing it here would only add a copy.
-   */
-  upload(bytes: ArrayBuffer): void {
-    if (this.#disposed) return;
-    if (bytes.byteLength !== FRAME_BLOCK.size) {
-      fail('INTERNAL_INVARIANT',
-        `FrameUniforms.upload() got ${bytes.byteLength} bytes but the frame block is ${FRAME_BLOCK.size}.`, {
-        why: 'The frame block layout is generated by apse. A differently sized buffer means the caller packed against a different struct, and the GPU would read the fields at the wrong offsets.',
-        fix: `Pack against FRAME_BLOCK, or use \`uniforms.block\` and set fields by name.`,
-      });
-    }
-    this.#cache.device.queue.writeBuffer(this.buffer, 0, bytes);
-  }
-
-  /** Copies the internal mirror to the GPU. */
-  flush(): void {
-    if (this.#disposed || !this.#dirty) return;
-    this.#dirty = false;
-    this.#cache.device.queue.writeBuffer(this.buffer, 0, this.block.data);
-  }
-
-  /** Packs one field and marks the block for {@link flush}. */
-  set(name: string, value: number | ArrayLike<number>): void {
-    this.block.set(name, value);
-    this.#dirty = true;
-  }
-
-  /** @group(0) of `this.buffer`, for a manual bind. */
-  get size(): number {
-    return FRAME_BLOCK.size;
-  }
-
-  dispose(): void {
-    if (this.#disposed) return;
-    this.#disposed = true;
-    this.#bindGroup = null;
-    this.buffer.destroy();
-  }
-}
-
-
-// ---------------------------------------------------------------------------
-// Shared object uniforms
-// ---------------------------------------------------------------------------
-
-/**
- * The per-object transform block: one large buffer, addressed by dynamic
- * offset.
- *
- * `ObjectData` is the same struct for every material, so this is shared for the
- * same reason the frame block is. Each object occupies `OBJECT_BLOCK.stride`
- * bytes — the struct size rounded up to the 256-byte
- * `minUniformBufferOffsetAlignment` the API requires of a dynamic offset — and
- * the renderer writes a draw item's transform at `objectId * stride`.
- *
- * The buffer is **allocated lazily on first draw**, not at material creation:
- * a scene that is built but never rendered should not pay for a 1 MB
- * allocation, and most materials in a typical project are never drawn. When an
- * object index exceeds the capacity, the buffer **doubles** and the bind group
- * is rebuilt, because a bind group captures the buffer it was created with.
- */
-export class ObjectUniforms implements Disposable {
-  readonly spec: UniformBlockSpec = OBJECT_BLOCK;
-  readonly label: string;
-  /** Object slots the buffer can hold. Grows by doubling. */
+export class SceneUniformBuffer implements Disposable {
+  /** Where each region sits. Resolved once, from the built blocks. */
+  readonly spec: SceneBlockSpec = SCENE_BLOCK;
+  /** CPU mirror of the frame region. Written through `FrameUniforms.set`. */
+  readonly frameBlock = new UniformBlock(FRAME_BLOCK);
+  /** The device this buffer belongs to. A `GPUBuffer` is not shareable. */
+  readonly device: GPUDevice;
+  /** Object slots the buffer holds. Grows by doubling. */
   capacity: number;
+  readonly label: string;
 
   readonly #cache: DeviceCache;
   #buffer: GPUBuffer | null = null;
@@ -783,14 +745,18 @@ export class ObjectUniforms implements Disposable {
   #data: ArrayBuffer | null = null;
   #f32: Float32Array | null = null;
   #u32: Uint32Array | null = null;
+  #frameDirty = false;
+  /** Bumped by every reallocation. See {@link generation}. */
+  #generation = 1;
   #disposed = false;
 
-  constructor(device: GPUDevice, label = 'object', maxObjects = 4096) {
-    this.#cache = deviceCache(device);
+  constructor(cache: DeviceCache, label = DEFAULT_SCENE_LABEL) {
+    this.#cache = cache;
+    this.device = cache.device;
     this.label = label;
-    // One object is the true minimum: a zero-object buffer is not a legal
-    // allocation, and growing from zero would never terminate.
-    this.capacity = Math.max(1, maxObjects | 0);
+    // One object is the true minimum: a zero-slot buffer cannot hold a legal
+    // object binding, and doubling from zero would never terminate.
+    this.capacity = 1;
   }
 
   /** True once the buffer has been created by a draw. */
@@ -798,82 +764,131 @@ export class ObjectUniforms implements Disposable {
     return this.#buffer !== null;
   }
 
+  /**
+   * A token that changes exactly when the object mirror is replaced.
+   *
+   * A caller that skips packing a slot because the node's transform has not
+   * changed must also skip it because the *mirror* is new — the bytes it is
+   * comparing against no longer exist. This is the number to put in that cache's
+   * key, and it is why it is public.
+   */
+  get generation(): number {
+    return this.#generation;
+  }
+
   get buffer(): GPUBuffer {
-    if (this.#disposed) {
-      fail('INTERNAL_INVARIANT', `ObjectUniforms "${this.label}" was used after it was disposed.`, {
-        why: 'The transform buffer is gone, so every object in the scene would draw with an undefined transform.',
-        fix: 'Hold the ObjectUniforms for as long as any object can still be drawn.',
-      });
-    }
+    this.assertLive(`SceneUniformBuffer "${this.label}"`);
     this.allocate(this.capacity);
     return this.#buffer as GPUBuffer;
   }
 
-  /** @group(1). Rebuilt transparently after a growth. */
+  /**
+   * `@group(0)`. One bind, both regions. Rebuilt transparently after a growth.
+   */
   get bindGroup(): GPUBindGroup {
-    if (this.#disposed) {
-      fail('INTERNAL_INVARIANT', `ObjectUniforms "${this.label}" was used after it was disposed.`, {
-        why: 'The buffer it binds is destroyed.',
-        fix: 'Hold the ObjectUniforms for as long as any object can still be drawn.',
-      });
-    }
-    if (this.#buffer === null) this.allocate(this.capacity);
+    this.assertLive(`SceneUniformBuffer "${this.label}"`);
+    this.allocate(this.capacity);
     if (this.#bindGroup === null) {
       this.#bindGroup = this.#cache.device.createBindGroup({
         label: `apse:${this.label}:group`,
-        layout: this.#cache.objectBindGroupLayout(),
-        entries: [{
-          binding: 0,
-          resource: { buffer: this.#buffer!, offset: 0, size: OBJECT_BLOCK.size },
-        }],
+        layout: this.#cache.sceneBindGroupLayout(),
+        entries: [
+          {
+            binding: SCENE_BLOCK.object.binding,
+            resource: {
+              buffer: this.#buffer as GPUBuffer,
+              offset: 0,
+              // A whole stride rather than OBJECT_BLOCK.size. Both satisfy the
+              // spec — `setBindGroup` range-checks `offset + dynamicOffset +
+              // minBindingSize`, and `minBindingSize` is the struct — but the
+              // stride is the alignment a dynamic offset is measured in, so this
+              // is the range the shader's view is rounded to. It also makes the
+              // last slot's range end exactly at the end of the buffer instead of
+              // stopping 128 bytes short of it.
+              size: SCENE_BLOCK.object.byteLength,
+            },
+          },
+          {
+            binding: SCENE_BLOCK.frame.binding,
+            resource: {
+              buffer: this.#buffer as GPUBuffer,
+              offset: SCENE_BLOCK.frame.byteOffset,
+              size: FRAME_BLOCK.size,
+            },
+          },
+        ],
       });
     }
     return this.#bindGroup;
   }
 
-  /** Byte offset for object `index`, growing the buffer by doubling if needed. */
-  offsetFor(index: number): number {
+  /**
+   * Byte offset of object `index`, growing the buffer by doubling if needed.
+   *
+   * This is the value a draw passes as its dynamic offset, and it is the same
+   * value the packer writes at and `fieldOffset` reports, so the three cannot
+   * disagree.
+   */
+  objectOffsetFor(index: number): number {
+    this.assertLive(`SceneUniformBuffer "${this.label}"`);
     // Two ways to be unallocated: never allocated at all, or allocated smaller
     // than `index` needs. Only handling the second is a null-dereference
     // waiting for the first frame of a scene that fits inside the default
-    // capacity — which is most scenes.
-    if (this.#buffer === null) {
-      this.allocate(Math.max(1, this.capacity, index + 1));
-    } else if (index >= this.capacity) {
-      let next = Math.max(1, this.capacity);
-      while (next <= index) next *= 2;
-      this.allocate(next);
-    }
-    return index * OBJECT_BLOCK.stride;
+    // capacity — which is most scenes. The first allocation takes the reserved
+    // capacity rather than `index + 1`, so packing slot 0 does not shrink the
+    // buffer below what the caller asked to reserve and then reallocate twice.
+    if (this.#buffer === null) this.allocate(Math.max(1, this.capacity, index + 1));
+    else if (index >= this.capacity) this.allocate(index + 1);
+    return SCENE_BLOCK.object.byteOffset + index * SCENE_BLOCK.stride;
   }
 
-  /** Creates the buffer for `count` objects. Safe to call repeatedly. */
+  /** Asks for room for `count` objects without allocating it. */
+  reserve(count: number): void {
+    if (this.#disposed) return;
+    if (count > this.capacity && this.#buffer === null) this.capacity = Math.max(1, count | 0);
+  }
+
+  /** Grows the buffer to hold `count` object slots. Safe to call repeatedly. */
   allocate(count: number): void {
     if (this.#disposed) return;
     if (this.#buffer !== null && count <= this.capacity) return;
-    this.capacity = count;
+    // Grow by doubling, so a scene that keeps adding objects reallocates a
+    // logarithmic number of times rather than once per object. The renderer also
+    // rounds, and rounding twice is harmless; rounding nowhere is not.
+    this.capacity = nextPowerOfTwo(Math.max(1, count | 0));
     this.#buffer?.destroy();
-    // Grow by doubling so a scene that keeps adding objects reallocates a
-    // logarithmic number of times rather than once per object.
-    const bytes = count * OBJECT_BLOCK.stride;
     this.#buffer = this.#cache.device.createBuffer({
-      label: `apse:${this.label}:${count}`,
-      size: bytes,
+      // The object array is what sizes the buffer, so the count in the label is
+      // the object count — and the label names both regions, because a recorded
+      // write is all the frame debugger has to go on.
+      label: `apse:${this.label}:${this.capacity}`,
+      size: SCENE_BLOCK.object.byteOffset + this.capacity * SCENE_BLOCK.stride,
+      // STORAGE would allow read_write; both regions are written by the CPU and
+      // read by the GPU, which is exactly UNIFORM | COPY_DST.
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     // A bind group captures its buffer, so growth invalidates it.
     this.#bindGroup = null;
-    this.#data = new ArrayBuffer(bytes);
+    this.#data = new ArrayBuffer(this.capacity * SCENE_BLOCK.stride);
     this.#f32 = new Float32Array(this.#data);
     this.#u32 = new Uint32Array(this.#data);
+    // A new mirror means every previous write is gone, and the caller's cache of
+    // what it has already packed is now wrong. This is the line that tells it.
+    this.#generation++;
+    // The frame's *mirror* survived, but its bytes on the GPU did not: a new
+    // buffer is zeroed, and a zeroed `Frame` is a zeroed `viewProj` — degenerate
+    // triangles, successful draws, empty screen. A block that was clean before
+    // the growth would otherwise never be flushed again, so it is marked dirty
+    // here. One 432-byte write, once, on the frame that grew the buffer.
+    this.#frameDirty = true;
   }
 
   /**
    * Packs one object's fields at `index`, into the CPU mirror.
    *
    * Nothing is uploaded here: the renderer packs every object during the
-   * traversal and then calls {@link uploadFrom} once, so a 2000-object frame is
-   * one `writeBuffer` rather than 2000.
+   * traversal and then calls {@link uploadObjects} once, so a 2000-object frame
+   * is one `writeBuffer` rather than 2000.
    *
    * The field offsets come from `OBJECT_BLOCK` — the same generated struct the
    * WGSL declares — so a transform cannot be written at the wrong byte. The
@@ -888,9 +903,12 @@ export class ObjectUniforms implements Disposable {
     instanceId = 0,
     visibility = 1,
   ): void {
-    if (this.#f32 === null) this.offsetFor(index);
-    const base = index * OBJECT_BLOCK.stride;
-    const f32 = this.#f32!;
+    this.objectOffsetFor(index);
+    // The mirror is the object array alone, so the frame's base offset does not
+    // appear here. `writeBuffer` takes the destination offset separately, which
+    // is what keeps the two regions from having to share an allocation.
+    const base = index * SCENE_BLOCK.stride;
+    const f32 = this.#f32 as Float32Array;
 
     // model: mat4x4f at the start of the record.
     for (let i = 0; i < 16; i++) f32[base32(base, MODEL_FIELD.offset) + i] = model[i];
@@ -909,54 +927,102 @@ export class ObjectUniforms implements Disposable {
 
     // objectId and instanceId are adjacent u32s in ObjectData.
     const ids = base32(base, OBJECT_ID_FIELD.offset);
-    this.#u32![ids] = objectId >>> 0;
-    this.#u32![ids + 1] = instanceId >>> 0;
+    (this.#u32 as Uint32Array)[ids] = objectId >>> 0;
+    (this.#u32 as Uint32Array)[ids + 1] = instanceId >>> 0;
     f32[base32(base, VISIBILITY_FIELD.offset)] = visibility;
   }
 
-  /** Byte offset of a named field within object `index`. */
-  fieldOffset(index: number, field: string): number {
-    const f = OBJECT_BLOCK.fields.find((x) => x.name === field);
-    if (f === undefined) {
-      fail('INTERNAL_INVARIANT', `ObjectUniforms has no field "${field}".`, {
-        why: 'ObjectData is generated by apse; writing an unknown field means the writer and the struct disagree.',
-        fix: 'Report this with the material that triggered it.',
-      });
-    }
-    return index * OBJECT_BLOCK.stride + f.offset;
-  }
-
-  /** Uploads `count` objects from the CPU mirror. */
+  /** Uploads object slots `[0, count)` in one write. */
   uploadFrom(count: number): void {
-    if (this.#disposed || this.#buffer === null || this.#data === null) return;
-    const bytes = Math.min(count, this.capacity) * OBJECT_BLOCK.stride;
-    if (bytes === 0) return;
-    this.#cache.device.queue.writeBuffer(this.#buffer, 0, this.#data, 0, bytes);
+    const slots = Math.max(0, Math.min(count, this.capacity));
+    if (slots === 0) return;
+    const bytes = slots * SCENE_BLOCK.stride;
+    this.write(SCENE_BLOCK.object.byteOffset, 0, bytes);
   }
 
   /**
-   * Uploads only object slots `[lo, hi]`.
+   * Uploads one object's own bytes — `OBJECT_BLOCK.size` of them, and nothing
+   * else.
    *
-   * The whole buffer is `count * 256` bytes — 1.28 MB at 5000 objects, of which
-   * only 124 bytes per slot is data. Uploading all of it every frame is the
-   * single largest avoidable cost in the frame, and a static scene pays it for
-   * nothing.
-   *
-   * `lo` and `hi` are **byte** offsets into the buffer, rounded to the 256-byte
-   * slot stride by the caller. `writeBuffer`'s data offset is in bytes too,
-   * because the source is an `ArrayBuffer`.
+   * The narrowest upload apse can make for an object: it cannot reach the frame,
+   * and it cannot reach either neighbour. `OBJECT_BLOCK.size` is 128, a multiple
+   * of 4, so it is a legal `writeBuffer` size; a range that were not would
+   * invalidate the whole command buffer with nothing to catch it.
    */
-  uploadRange(lo: number, hi: number): void {
-    if (this.#disposed || this.#buffer === null || this.#data === null) return;
-    const capacityBytes = this.capacity * OBJECT_BLOCK.stride;
-    const a = Math.max(0, lo);
-    const b = Math.min(capacityBytes, hi);
-    if (b <= a) return;
-    this.#cache.device.queue.writeBuffer(this.#buffer, a, this.#data, a, b - a);
+  uploadObject(index: number): void {
+    if (index < 0 || index >= this.capacity) return;
+    this.write(
+      SCENE_BLOCK.object.byteOffset + index * SCENE_BLOCK.stride,
+      index * SCENE_BLOCK.stride,
+      OBJECT_BLOCK.size,
+    );
   }
 
+  /**
+   * Uploads object slots `[lo, hi]`, both ends inclusive, in one write.
+   *
+   * Whole strides, so one `writeBuffer` covers the range. Slots, not bytes: byte
+   * 0 of this buffer is the *frame*, so a byte-offset API here is an API that can
+   * overwrite the camera, and the type of the argument is the cheapest guard
+   * against it.
+   */
+  uploadObjects(lo: number, hi: number): void {
+    const a = Math.max(0, lo);
+    const b = Math.min(hi, this.capacity - 1);
+    if (b < a) return;
+    this.write(
+      SCENE_BLOCK.object.byteOffset + a * SCENE_BLOCK.stride,
+      a * SCENE_BLOCK.stride,
+      (b - a + 1) * SCENE_BLOCK.stride,
+    );
+  }
+
+  /** Bytes the buffer occupies for its current capacity. */
   get byteLength(): number {
-    return this.capacity * OBJECT_BLOCK.stride;
+    return SCENE_BLOCK.object.byteOffset + this.capacity * SCENE_BLOCK.stride;
+  }
+
+  // --- the frame region ------------------------------------------------------
+
+  /** Marks the frame block dirty. `flush` is a no-op without it. */
+  markFrameDirty(): void {
+    this.#frameDirty = true;
+  }
+
+  /** Copies the frame mirror to byte 0. A no-op when nothing marked it dirty. */
+  flushFrame(): void {
+    if (!this.#frameDirty || this.#disposed) return;
+    this.uploadFrame(this.frameBlock.data);
+  }
+
+  /**
+   * Copies an already-packed frame block onto byte 0.
+   *
+   * `bytes` must be exactly {@link UniformBlockSpec}.size — it is the block the
+   * renderer already packed, so re-packing it here would only add a copy. The
+   * source is the frame's own mirror, not the object array's: the two are
+   * separate allocations precisely so a growth of the objects cannot take the
+   * camera with it.
+   *
+   * This allocates if nothing has yet. The frame is at byte 0 of a buffer the
+   * objects also live in, so the first frame of a scene with nothing packed yet
+   * is still a first write to that buffer.
+   */
+  uploadFrame(bytes: ArrayBuffer): void {
+    if (this.#disposed) return;
+    if (bytes.byteLength !== FRAME_BLOCK.size) {
+      fail('INTERNAL_INVARIANT',
+        `Uploading a frame block of ${bytes.byteLength} bytes, but the frame block is ${FRAME_BLOCK.size}.`, {
+        why: 'The frame block layout is generated by apse. A differently sized buffer means the caller packed against a different struct, and the GPU would read the fields at the wrong offsets.',
+        fix: `Pack against FRAME_BLOCK, or use \`uniforms.block\` and set fields by name.`,
+      });
+    }
+    // Cleared *after* the write, not before: reading `this.buffer` can allocate,
+    // and an allocation marks the frame dirty because the new buffer is zeroed.
+    // The bytes are on the GPU by the time this line runs, so clean is the truth
+    // either way.
+    this.#cache.device.queue.writeBuffer(this.buffer, SCENE_BLOCK.frame.byteOffset, bytes);
+    this.#frameDirty = false;
   }
 
   dispose(): void {
@@ -969,6 +1035,296 @@ export class ObjectUniforms implements Disposable {
     this.#f32 = null;
     this.#u32 = null;
   }
+
+  /**
+   * The one `writeBuffer` call, with both offsets kept straight.
+   *
+   * `bufferOffset` is where the bytes land in the GPU buffer and `dataOffset` is
+   * where they start in the mirror, and they differ by the frame region's size
+   * for every object write. Writing one number where the other belongs is a
+   * silent corruption of somebody else's data, so they are separate parameters.
+   */
+  write(bufferOffset: number, dataOffset: number, size: number): void {
+    if (this.#disposed || this.#buffer === null || this.#data === null) return;
+    this.#cache.device.queue.writeBuffer(this.#buffer, bufferOffset, this.#data, dataOffset, size);
+  }
+
+  private assertLive(what: string): void {
+    if (!this.#disposed) return;
+    fail('INTERNAL_INVARIANT', `${what} was used after it was disposed.`, {
+      why: 'The buffer it binds is destroyed, so every object in the scene would draw with an undefined transform.',
+      fix: 'Hold the shared uniforms for as long as any object can still be drawn.',
+    });
+  }
+}
+
+/**
+ * Smallest power of two that is ≥ `n`, and 1 for anything below it.
+ *
+ * Local rather than imported: `material` sits below `render` in the layer graph
+ * and a power-of-two helper is four lines of arithmetic, not a dependency across
+ * a boundary the size gate exists to police.
+ */
+function nextPowerOfTwo(n: number): number {
+  let out = 1;
+  while (out < n) out *= 2;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Shared frame uniforms
+// ---------------------------------------------------------------------------
+
+/**
+ * The frame region of {@link SceneUniformBuffer}, as its own name.
+ *
+ * 500 materials sharing one 432-byte region instead of 500 is the difference
+ * between a scene that uploads 216 KB of identical frame state per frame and one
+ * that uploads 432 bytes.
+ *
+ * A `Drawable.writeFrameUniform` is idempotent and forwards here, so a renderer
+ * that walks materials and calls it per material behaves correctly — it just
+ * performs redundant writes, which is why the renderer should call
+ * {@link FrameUniforms.flush} once and skip the per-material path.
+ *
+ * It is a face, not an owner: the buffer and the bind group are
+ * {@link DeviceCache.sceneUniforms}' and are shared with {@link ObjectUniforms}.
+ */
+export class FrameUniforms implements Disposable {
+  readonly spec: UniformBlockSpec = FRAME_BLOCK;
+  readonly label: string;
+
+  readonly #scene: SceneUniformBuffer;
+
+  constructor(device: GPUDevice, label = DEFAULT_FRAME_LABEL) {
+    this.#scene = deviceCache(device).sceneUniforms();
+    this.label = label;
+  }
+
+  /** CPU-side mirror of the block. Packed by the same code as every other block. */
+  get block(): UniformBlock {
+    return this.#scene.frameBlock;
+  }
+
+  /** The shared buffer. Byte 0 through {@link UniformBlockSpec}.size is this. */
+  get buffer(): GPUBuffer {
+    return this.#scene.buffer;
+  }
+
+  /**
+   * `@group(0)`, covering the frame *and* the object. One bind per draw.
+   *
+   * The frame's own bytes are at a fixed offset inside it, so a pass binds this
+   * once and never touches it again.
+   */
+  get sceneBindGroup(): GPUBindGroup {
+    return this.#scene.bindGroup;
+  }
+
+  /**
+   * @deprecated Use {@link sceneBindGroup}. Kept so `Drawable`, which still names
+   * the frame group, keeps compiling; it is the same object, and the object
+   * region is the only part a draw varies.
+   */
+  get bindGroup(): GPUBindGroup {
+    return this.#scene.bindGroup;
+  }
+
+  /** The buffer both faces share. Identity here *is* the invariant. */
+  get sceneBuffer(): SceneUniformBuffer {
+    return this.#scene;
+  }
+
+  /** Changes when the object array is reallocated. See {@link SceneUniformBuffer.generation}. */
+  get generation(): number {
+    return this.#scene.generation;
+  }
+
+  /**
+   * Copies a fully packed frame block to byte 0.
+   *
+   * `bytes` must be exactly {@link UniformBlockSpec}.size — it is the block the
+   * renderer already packed, so re-packing it here would only add a copy.
+   */
+  upload(bytes: ArrayBuffer): void {
+    this.#scene.uploadFrame(bytes);
+  }
+
+  /**
+   * Copies the internal mirror to the GPU, if anything marked it dirty.
+   *
+   * Writing frame state through {@link set} rather than through {@link block} is
+   * not a style preference: `set` is what marks the block dirty, and `flush` on a
+   * clean block does nothing. Write the block behind its back and the GPU keeps
+   * a zeroed uniform buffer — every `frame.viewProj` is zero, every triangle is
+   * degenerate, every draw succeeds, and the screen is empty. There is no error
+   * to find.
+   */
+  flush(): void {
+    this.#scene.flushFrame();
+  }
+
+  /** Packs one field and marks the block for {@link flush}. */
+  set(name: string, value: number | ArrayLike<number>): void {
+    this.#scene.frameBlock.set(name, value);
+    this.#scene.markFrameDirty();
+  }
+
+  /** Bytes this region occupies, padding included. */
+  get size(): number {
+    return FRAME_BLOCK.size;
+  }
+
+  /**
+   * Releases this face's handle to the shared buffer.
+   *
+   * **It does not free the buffer.** The scene buffer is one allocation per
+   * device, and its lifetime belongs to whoever allocated it -- the renderer.
+   * A face disposing it would mean `PresentPass.dispose()` destroyed the
+   * renderer's uniform storage, so every other material on the device lost its
+   * camera: no validation error, every object at identity, on the next frame.
+   */
+  dispose(): void {}
+}
+
+// ---------------------------------------------------------------------------
+// Shared object uniforms
+// ---------------------------------------------------------------------------
+
+/**
+ * The object array of {@link SceneUniformBuffer}, as its own name.
+ *
+ * `ObjectData` is the same struct for every material, so this is shared with
+ * {@link FrameUniforms} for the same reason the frame is. Each object occupies
+ * {@link UniformBlockSpec}.stride bytes — the struct size rounded up to the
+ * 256-byte `minUniformBufferOffsetAlignment` the API requires of a dynamic
+ * offset — and the renderer writes a draw item's transform at
+ * {@link SCENE_BLOCK}.object.byteOffset + `objectId` * stride.
+ *
+ * The buffer is **allocated lazily on first draw**, not at material creation:
+ * a scene that is built but never rendered should not pay for a 1 MB
+ * allocation, and most materials in a typical project are never drawn. When an
+ * object index exceeds the capacity, the buffer **doubles** and the bind group
+ * is rebuilt, because a bind group captures the buffer it was created with.
+ */
+export class ObjectUniforms implements Disposable {
+  readonly spec: UniformBlockSpec = OBJECT_BLOCK;
+  readonly label: string;
+
+  readonly #scene: SceneUniformBuffer;
+
+  constructor(device: GPUDevice, label = DEFAULT_OBJECT_LABEL, maxObjects = DEFAULT_MAX_OBJECTS) {
+    this.#scene = deviceCache(device).sceneUniforms();
+    this.label = label;
+    // A floor on the shared capacity, not a private one: a second caller asking
+    // for more raises the same buffer's capacity rather than making another.
+    this.#scene.reserve(maxObjects);
+  }
+
+  /** Object slots the shared buffer holds. Grows by doubling. */
+  get capacity(): number {
+    return this.#scene.capacity;
+  }
+
+  /** True once the buffer has been created by a draw. */
+  get allocated(): boolean {
+    return this.#scene.allocated;
+  }
+
+  get buffer(): GPUBuffer {
+    return this.#scene.buffer;
+  }
+
+  /** `@group(0)`. The same bind group {@link FrameUniforms} hands out. */
+  get sceneBindGroup(): GPUBindGroup {
+    return this.#scene.bindGroup;
+  }
+
+  /**
+   * @deprecated Use {@link sceneBindGroup}. Kept so `Drawable`, which still
+   * names the object group, keeps compiling. It is the same object the frame
+   * returns, which is the point.
+   */
+  get bindGroup(): GPUBindGroup {
+    return this.#scene.bindGroup;
+  }
+
+  /** The buffer both faces share. Identity here *is* the invariant. */
+  get sceneBuffer(): SceneUniformBuffer {
+    return this.#scene;
+  }
+
+  /** Changes when the object array is reallocated. See {@link SceneUniformBuffer.generation}. */
+  get generation(): number {
+    return this.#scene.generation;
+  }
+
+  /**
+   * The dynamic offset for object `index`, growing the buffer by doubling if
+   * needed. This is what a draw passes to `setBindGroup`.
+   */
+  offsetFor(index: number): number {
+    return this.#scene.objectOffsetFor(index);
+  }
+
+  /** Grows the shared buffer to hold `count` object slots. Safe to call repeatedly. */
+  allocate(count: number): void {
+    this.#scene.allocate(count);
+  }
+
+  /**
+   * Packs one object's fields at `index`, into the CPU mirror. Nothing is
+   * uploaded; call {@link uploadObjects} once the frame's objects are packed.
+   */
+  pack(
+    index: number,
+    model: ArrayLike<number>,
+    normalMatrix?: ArrayLike<number>,
+    objectId: number = index,
+    instanceId = 0,
+    visibility = 1,
+  ): void {
+    this.#scene.pack(index, model, normalMatrix, objectId, instanceId, visibility);
+  }
+
+  /** Byte offset of a named field within object `index`, in the GPU buffer. */
+  fieldOffset(index: number, field: string): number {
+    const f = OBJECT_BLOCK.fields.find((x) => x.name === field);
+    if (f === undefined) {
+      fail('INTERNAL_INVARIANT', `ObjectUniforms has no field "${field}".`, {
+        why: 'ObjectData is generated by apse; writing an unknown field means the writer and the struct disagree.',
+        fix: 'Report this with the material that triggered it.',
+      });
+    }
+    return SCENE_BLOCK.object.byteOffset + index * SCENE_BLOCK.stride + f.offset;
+  }
+
+  /** Uploads object slots `[0, count)`. */
+  uploadFrom(count: number): void {
+    this.#scene.uploadFrom(count);
+  }
+
+  /** Uploads one object's own bytes and nothing else. */
+  uploadObject(index: number): void {
+    this.#scene.uploadObject(index);
+  }
+
+  /** Uploads object slots `[lo, hi]`, both ends inclusive, in one write. */
+  uploadObjects(lo: number, hi: number): void {
+    this.#scene.uploadObjects(lo, hi);
+  }
+
+  /** Bytes the shared buffer occupies, frame region included. */
+  get byteLength(): number {
+    return this.#scene.byteLength;
+  }
+
+  /**
+   * Releases this face's handle to the shared buffer. It does **not** free it --
+   * see {@link FrameUniforms.dispose}. The buffer is one allocation per device
+   * and the renderer owns it.
+   */
+  dispose(): void {}
 }
 
 // ---------------------------------------------------------------------------
@@ -977,11 +1333,12 @@ export class ObjectUniforms implements Disposable {
 
 export interface MaterialOptions {
   /**
-   * The shared frame uniforms. Omit and one is created per device on demand.
+   * The shared frame uniforms. Omit and the device's own is used — which is the
+   * same instance, so omitting is correct and passing a foreign one is not.
    * Pass the renderer's instance so the whole app writes one buffer.
    */
   readonly frame?: FrameUniforms;
-  /** The shared object uniforms. Same reasoning. */
+  /** The shared object uniforms. Same reasoning, and the same buffer as `frame`. */
   readonly object?: ObjectUniforms;
   /** Object slots to reserve. Default 4096. Only used when `object` is omitted. */
   readonly maxObjects?: number;
@@ -989,11 +1346,17 @@ export interface MaterialOptions {
 
 /**
  * Canonical cache keys for the shared uniform blocks. Exported so a second
- * consumer — the renderer, an editor, a test — resolves the *same* instances
+ * consumer — the renderer, an editor, a test — resolves the *same* faces
  * rather than constructing parallel ones.
+ *
+ * The two labels are deliberately different strings over one buffer. They name
+ * the two ways the buffer is written, and either one resolves to the same
+ * `GPUBuffer` and the same `GPUBindGroup`.
  */
 export const DEFAULT_FRAME_LABEL = 'apse.frame';
 export const DEFAULT_OBJECT_LABEL = 'apse.object';
+/** Debug label for the merged buffer. Names both regions, because it holds both. */
+export const DEFAULT_SCENE_LABEL = 'apse:scene:frame+object';
 export const DEFAULT_MAX_OBJECTS = 4096;
 
 export class Material extends Resource implements Drawable {
@@ -1072,7 +1435,20 @@ export class Material extends Resource implements Drawable {
     this.textured = r.textures.length > 0;
 
     this.#frame = opts.frame ?? this.#cache.frameUniforms(DEFAULT_FRAME_LABEL);
-    this.#object = opts.object ?? this.#cache.objectUniforms(DEFAULT_OBJECT_LABEL, opts.maxObjects ?? 4096);
+    this.#object = opts.object ?? this.#cache.objectUniforms(DEFAULT_OBJECT_LABEL, opts.maxObjects ?? DEFAULT_MAX_OBJECTS);
+    // Both faces have to be the same buffer on the *same device*, or the
+    // pipeline layout this material was compiled against is satisfied by a bind
+    // group whose frame region is not the one the renderer writes. Nothing
+    // downstream can detect that, so it is checked here, where both values are
+    // in hand.
+    const scene = this.#frame.sceneBuffer;
+    if (scene !== this.#object.sceneBuffer || scene.device !== device) {
+      fail('INVALID_USAGE',
+        'A Material was given frame or object uniforms that are not this device\'s shared scene buffer.', {
+        why: 'The frame state and the per-object transforms live in one buffer in one bind group, so a material\'s pipeline layout is satisfied by exactly one of them. A different buffer — or the same shape of buffer on another device — means the renderer writes one and this material reads the other: no validation error, no warning, and every object drawn with an identity transform.',
+        fix: 'Pass the renderer\'s `frameUniforms` and `objectUniforms`, or omit both and let the device cache supply them.',
+      });
+    }
 
     this.#materialBlock = r.materialBlock;
     if (this.#materialBlock === null) {
@@ -1120,17 +1496,32 @@ export class Material extends Resource implements Drawable {
 
   // --- Drawable: GPU objects -------------------------------------------------
 
-  /** @group(0). The shared frame bind group, not a per-material one. */
+  /**
+   * `@group(0)`. The one bind a draw pays for, carrying the frame at a fixed
+   * offset and the object at the dynamic offset in the same buffer.
+   */
+  get sceneBindGroup(): GPUBindGroup {
+    return this.#object.sceneBindGroup;
+  }
+
+  /**
+   * @deprecated Use {@link sceneBindGroup}. `Drawable` still names the frame
+   * group, so this stays to keep it compiling; it returns the *same* bind group,
+   * and the frame's bytes are a fixed region inside it.
+   */
   get frameBindGroup(): GPUBindGroup {
-    return this.#frame.bindGroup;
+    return this.#object.sceneBindGroup;
   }
 
-  /** @group(1). The shared object bind group, bound with a dynamic offset. */
+  /**
+   * @deprecated Use {@link sceneBindGroup}. Returns the same bind group, bound
+   * with the object's dynamic offset.
+   */
   get objectBindGroup(): GPUBindGroup {
-    return this.#object.bindGroup;
+    return this.#object.sceneBindGroup;
   }
 
-  /** @group(2). Null when the material declares no slots. */
+  /** @group(1). Null when the material declares no slots. */
   get materialBindGroup(): GPUBindGroup | null {
     if (this.#materialBlock === null || this.#materialBuffer === null) return null;
     if (this.#materialBindGroup === null) {
@@ -1147,7 +1538,7 @@ export class Material extends Resource implements Drawable {
   }
 
   /**
-   * @group(3). Null when the material declares no textures.
+   * @group(2). Null when the material declares no textures.
    *
    * Rebuilt lazily whenever a view is assigned, and shared between materials
    * that were given the same views, because the bind group is fully determined
@@ -1311,6 +1702,17 @@ export class Material extends Resource implements Drawable {
   /** The shared object uniforms this material draws with. */
   get objectUniforms(): ObjectUniforms {
     return this.#object;
+  }
+
+  /**
+   * The one buffer and bind group both of the above are faces of.
+   *
+   * Exposed so a caller — the renderer, a test, an inspector — can assert that
+   * they really are the same allocation rather than two that happen to have
+   * equal contents.
+   */
+  get sceneUniforms(): SceneUniformBuffer {
+    return this.#object.sceneBuffer;
   }
 
   /** CPU-side mirror of the material block. Read it in tests and tooling. */

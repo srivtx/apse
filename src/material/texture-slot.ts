@@ -7,6 +7,8 @@
  * write `texture(albedo, uv)` without ever touching a `@group` or a `@binding`.
  */
 
+import { BIND_GROUP } from '../core/slot.ts';
+
 export type TextureKind =
   | '2d'
   | 'cube'
@@ -50,7 +52,7 @@ export interface ResolvedTextureSlot {
   readonly addressMode: 'repeat' | 'clamp-to-edge' | 'mirror-repeat';
   readonly compare: boolean;
   readonly label: string;
-  /** `@binding(n)` within group 3. Assigned by the material, in declaration order. */
+  /** `@binding(n)` within the texture bind group. Assigned by the material, in declaration order. */
   readonly bindingIndex: number;
 }
 
@@ -89,9 +91,13 @@ export function wgslTextureType(sampleType: TextureSampleType): string {
 /** WGSL declaration for a texture binding, respecting its view dimension. */
 export function wgslTextureDecl(name: string, slot: ResolvedTextureSlot): string {
   const dim = textureViewDimension(slot.kind);
+  // The group comes from BIND_GROUP, never a literal. A hardcoded 3 survived a
+  // renumbering of the other groups and emitted textures into a group no bind
+  // group layout was built for, while samplers went to the real one -- a
+  // validation error at draw, from a file nobody opens when the groups change.
   if (slot.sampleType === 'depth') {
-    return `@group(3) @binding(${slot.bindingIndex}) var ${name} : texture_depth_${dim === '2d' ? '2d' : '2d_array'};`;
+    return `@group(${BIND_GROUP.texture}) @binding(${slot.bindingIndex}) var ${name} : texture_depth_${dim === '2d' ? '2d' : '2d_array'};`;
   }
   const scalar = slot.sampleType === 'sint' ? 'i32' : slot.sampleType === 'uint' ? 'u32' : 'f32';
-  return `@group(3) @binding(${slot.bindingIndex}) var ${name} : texture_${dim}<${scalar}>;`;
+  return `@group(${BIND_GROUP.texture}) @binding(${slot.bindingIndex}) var ${name} : texture_${dim}<${scalar}>;`;
 }
