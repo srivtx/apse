@@ -91,7 +91,9 @@ Measured, not asserted. Every number here comes from a harness in `bench/` you c
 |---|---:|---:|---|
 | bundle, tree-shaken, full renderer + PBR + scene graph | **45.3 KB** gzip | ~133 KB | apse, 2.9× |
 | heap per scene-graph object | 1,060 B / 21 heap objects | 1,216 B / 57 heap objects | apse, 1.15× by size, **2.7× by object count** |
-| custom material, lines of code | 80 | 83 (`ShaderMaterial`) · 38 (`onBeforeCompile`) · **15 (node material)** | **three.js** |
+| custom material, BRDF written by hand | 80 | 83 (`ShaderMaterial`) | tie |
+| custom material, prebuilt BRDF, set properties | 5 | 5 (`MeshStandardNodeMaterial`) | tie |
+| material types shipped with a full BRDF | 2 | 8 | **three.js** |
 | generated code per material | 77 lines from 22 authored | 1,984 lines from 6 authored | neither — see below |
 | silent-vs-typed diagnostics, 9 scenarios | better 5 · worse 2 · equal 2 | — | apse, narrowly |
 | CPU frame time, 5000 objects | 3.80 ms | 3.50 ms | **three.js** |
@@ -99,11 +101,24 @@ Measured, not asserted. Every number here comes from a harness in `bench/` you c
 
 **The three claims this README used to make that do not survive measurement:**
 
-1. *"A custom material is dramatically simpler."* It is not. apse is 80 lines, three.js
-   `ShaderMaterial` is 83 — a tie. And three.js's **node material path is 15 lines**, which
-   beats apse outright. That is the real competition for the scaffold, and apse currently
-   loses it. The scaffold's genuine win is not brevity, it is **generated code**: 77 lines
-   from 22 authored, against 1,984 generated from 6 on `onBeforeCompile`.
+1. *"A custom material is dramatically simpler."* It is not. Writing the same two-light
+   Lambert+Blinn-Phong material by hand: **80 lines in apse, 83 in three.js** — a tie. The
+   scaffold's genuine win is not brevity, it is **generated code**: 77 WGSL lines from 22
+   authored, against 1,984 generated from 6 on `onBeforeCompile`, and no `#include` names,
+   no `customProgramCacheKey`, no `userData.shader.uniforms`.
+
+   An earlier version of this file claimed three.js's node-material path was "15 lines, which
+   beats apse outright". **That comparison was wrong and has been removed.** Those 15 lines
+   are property assignment on `MeshStandardNodeMaterial` — a complete, library-provided
+   Cook-Torrance BRDF. The apse side of that comparison was asked to *write the same BRDF by
+   hand*. It compared a prebuilt shader against a hand-written one, and said nothing about
+   either scaffold. Measured fairly — a prebuilt BRDF, properties set — both libraries are
+   about 5 lines.
+
+   The real gap is one level up: **apse ships 2 material types with full BRDFs, three.js
+   ships 8.** apse's `pbrMaterial` has one directional light, no rim term, and no IBL. If you
+   need two lights and a fresnel rim, you write the shader; in three.js you set properties.
+   That is a shipped-materials gap, not a scaffold gap, and it is the cheapest one to close.
 
 2. *"An `Object3D` costs 1,804 bytes."* It does not. Measured with a Chrome heap snapshot
    and GC forced: **1,216 B**, 13× less than claimed, against apse's 1,060 B. The real
