@@ -1097,21 +1097,28 @@ export class Renderer {
 
       const instances = item.instanceCount;
       const first = item.firstInstance;
-      if (geometry.indexBuffer !== null) {
-        if (lastIB !== geometry.indexBuffer) {
+      // Read each buffer once. These are accessors, not fields: `GpuMesh` checks
+      // liveness on every read, so `lastVB !== geometry.vertexBuffer` written as
+      // `enc.setVertexBuffer(0, geometry.vertexBuffer)` costs two calls and two
+      // checks where a local costs one of each. At 1,000 draws that is 2,000
+      // redundant liveness checks per frame, and this loop is 85-100% of it.
+      const ib = geometry.indexBuffer;
+      const vb = geometry.vertexBuffer;
+      if (ib !== null) {
+        if (lastIB !== ib) {
           this.#encBufferCalls++;
-          enc.setIndexBuffer(geometry.indexBuffer, indexFormatOf(geometry));
-          lastIB = geometry.indexBuffer;
+          enc.setIndexBuffer(ib, indexFormatOf(geometry));
+          lastIB = ib;
         }
-        if (lastVB !== geometry.vertexBuffer) {
+        if (lastVB !== vb) {
           this.#encBufferCalls++;
-          enc.setVertexBuffer(0, geometry.vertexBuffer);
-          lastVB = geometry.vertexBuffer;
+          enc.setVertexBuffer(0, vb);
+          lastVB = vb;
         }
-      } else if (lastVB !== geometry.vertexBuffer) {
+      } else if (lastVB !== vb) {
         this.#encBufferCalls++;
-        enc.setVertexBuffer(0, geometry.vertexBuffer);
-        lastVB = geometry.vertexBuffer;
+        enc.setVertexBuffer(0, vb);
+        lastVB = vb;
       }
       // Counted once, after the branch: an unindexed mesh's `indexCount` is its
       // vertex count, so both forms submit the same number of triangles.
