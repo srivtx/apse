@@ -624,8 +624,21 @@ export interface GpuMeshOptions {
 export class GpuMesh extends Resource implements DrawableGeometryRange {
   readonly name: string;
   readonly layout: VertexLayout;
-  readonly vertexBuffer: GPUBuffer;
-  readonly indexBuffer: GPUBuffer | null;
+  /**
+   * Slot 0. Reading either buffer through a live mesh is free; reading one
+   * after `dispose()` is a caller error, so both accessors check. The renderer
+   * re-reads a buffer only when it differs from the last one it bound, so this
+   * is one compare per state change rather than one per frame.
+   */
+  get vertexBuffer(): GPUBuffer {
+    this.assertLive(`Mesh "${this.name}"`);
+    return this.#vertexBuffer;
+  }
+
+  get indexBuffer(): GPUBuffer | null {
+    this.assertLive(`Mesh "${this.name}"`);
+    return this.#indexBuffer;
+  }
   readonly indexCount: number;
   readonly instanceCount: number;
   readonly firstInstance: number;
@@ -651,9 +664,11 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
   #vHi = 0;
   #iLo = 0;
   #iHi = 0;
+  #vertexBuffer!: GPUBuffer;
+  #indexBuffer: GPUBuffer | null = null;
 
   constructor(device: GPUDevice, data: MeshData, opts: GpuMeshOptions = {}) {
-    super();
+    super('MESH_DISPOSED');
     const name = opts.name ?? data.name;
     const vertexBytes = data.layout.byteLength(data.vertexCount);
     const indexBytes = data.indexData === null ? 0 : data.indexData.byteLength;
@@ -700,8 +715,8 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
 
     this.name = name;
     this.layout = layout;
-    this.vertexBuffer = vertexBuffer;
-    this.indexBuffer = indexBuffer;
+    this.#vertexBuffer = vertexBuffer;
+    this.#indexBuffer = indexBuffer;
     this.indexCount = data.indexCount;
     this.indexFormat = data.indexData === null ? null : data.indexData instanceof Uint32Array ? 'uint32' : 'uint16';
     this.vertexCount = data.vertexCount;
@@ -847,8 +862,8 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
   }
 
   protected onDispose(): void {
-    this.vertexBuffer.destroy();
-    this.indexBuffer?.destroy();
+    this.#vertexBuffer.destroy();
+    this.#indexBuffer?.destroy();
   }
 }
 

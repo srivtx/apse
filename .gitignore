@@ -8,6 +8,7 @@ dist/
 # Benchmark artefacts. The harness writes a screenshot and a JSON report; they
 # are results of a local run on someone else's hardware, not source.
 bench/results/
+bench/diag/*/results/
 
 # Editor
 .idea/

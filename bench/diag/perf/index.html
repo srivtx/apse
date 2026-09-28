@@ -1,0 +1,1285 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>apse perf harness</title>
+<style>
+  body { background: #050508; color: #ccc; font: 12px monospace; margin: 0; }
+  canvas { display: block; width: 1280px; height: 720px; }
+</style>
+</head>
+<body>
+<script type="module">
+/**
+ * The measurement page for the per-draw-CPU question.
+ *
+ * It holds *contexts*, one per apse renderer configuration, each with its own
+ * canvas, device, geometries, materials and scene map. Two contexts can coexist:
+ * two WebGPU devices in one page were verified to construct, render and submit
+ * with no validation and no uncaptured errors (see two-device.html), so the
+ * present-pass A/B is measured in one page and interleaved, rather than across
+ * two page loads where per-page variance is larger than the effect being
+ * measured.
+ *
+ * The contexts come from the query string:
+ *   ?tones=default            one context, present pass on (the shipped default)
+ *   ?tones=default,none       two contexts: the default, and
+ *                             { toneMapping: null, hdr: false }
+ */
+
+const g = globalThis;
+g.__ready = false;
+g.__err = null;
+
+const RENDER_W = 1280;
+const RENDER_H = 720;
+
+function quantile(sorted, p) {
+  if (sorted.length === 0) return 0;
+  const i = (sorted.length - 1) * p;
+  const lo = Math.floor(i), hi = Math.ceil(i);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+function dist(samples) {
+  const s = samples.slice().sort((a, b) => a - b);
+  const sum = s.reduce((a, b) => a + b, 0);
+  return {
+    n: s.length,
+    min: +s[0].toFixed(5),
+    p50: +quantile(s, 0.5).toFixed(5),
+    p90: +quantile(s, 0.9).toFixed(5),
+    p99: +quantile(s, 0.99).toFixed(5),
+    max: +s[s.length - 1].toFixed(5),
+    mean: +(sum / s.length).toFixed(5),
+    samples: s.map((v) => +v.toFixed(5)),
+  };
+}
+
+/**
+ * How fine is performance.now() here?
+ *
+ * Without cross-origin isolation Chrome clamps it to 100us. That silently floors
+ * every sub-100us measurement, and it is not a rounding detail: a one-draw
+ * instanced frame is cheaper than one quantum, so the first version of this
+ * harness reported 0.000ms for every instanced scene. Every sub-quantum number
+ * in this file is therefore measured in batches, and the quantum is reported
+ * next to the results so the reader can see the achievable resolution.
+ */
+function quantiseProbe() {
+  let min = Infinity;
+  for (let i = 0; i < 20000; i++) {
+    const a = performance.now();
+    let b = performance.now();
+    let guard = 0;
+    while (b === a && guard++ < 1000) b = performance.now();
+    if (b > a && b - a < min) min = b - a;
+  }
+  return min === Infinity ? 0 : min;
+}
+
+let clock = 0;
+let api = null;
+
+const params = new URLSearchParams(location.search);
+const TONES = (params.get('tones') ?? 'default').split(',').map((s) => s.trim()).filter(Boolean);
+
+/**
+ * One renderer configuration: its own canvas, device, geometries, materials,
+ * calibrated background and scene map. Nothing is shared between contexts,
+ * because the scene format differs between them (rgba16float with the present
+ * pass, the canvas format without it) and a material compiled for one is a hard
+ * error in the other.
+ */
+class Ctx {
+  constructor(index, tone) {
+    this.index = index;
+    this.tone = tone;
+    this.scenes = new Map();
+    this.validationErrors = [];
+    this.background = null;
+  }
+
+  async init() {
+    const canvas = document.createElement('canvas');
+    canvas.width = RENDER_W;
+    canvas.height = RENDER_H;
+    canvas.style.width = RENDER_W + 'px';
+    canvas.style.height = RENDER_H + 'px';
+    document.body.appendChild(canvas);
+    // CanvasSizer reads clientWidth/clientHeight. Without these defined the
+    // backing store can collapse to 1x1 and the GPU is never really touched.
+    Object.defineProperty(canvas, 'clientWidth', { value: RENDER_W, configurable: true });
+    Object.defineProperty(canvas, 'clientHeight', { value: RENDER_H, configurable: true });
+    this.canvas = canvas;
+
+    const { Renderer, Scene, MeshNode, PerspectiveCamera } = api;
+    this.Renderer = Renderer; this.Scene = Scene; this.MeshNode = MeshNode; this.PerspectiveCamera = PerspectiveCamera;
+
+    const opts = this.tone === 'none'
+      ? { sampleCount: 1, toneMapping: null, hdr: false }
+      : { sampleCount: 1 };
+    this.renderer = await Renderer.create(canvas, {
+      ...opts,
+      onValidationError: (m) => this.validationErrors.push(String(m)),
+    });
+
+    const back = { w: canvas.width, h: canvas.height };
+    if (back.w !== RENDER_W || back.h !== RENDER_H) {
+      throw new Error(`ctx ${this.index} canvas backing store is ${back.w}x${back.h}, expected ${RENDER_W}x${RENDER_H}`);
+    }
+
+    const d = this.renderer.device.device;
+    this.geometries = {
+      cube: api.upload(d, api.box({ width: 1 })),
+      sphere: api.upload(d, api.sphere({ radius: 0.6, widthSegments: 24, heightSegments: 16 })),
+    };
+    // Every material must be compiled for the scene format, which is
+    // rgba16float whenever the present pass is on. Omitting it is a hard
+    // format error, not a dark image.
+    this.pbrMat = await api.pbrMaterial(d, { targetFormat: this.renderer.sceneFormat });
+    this.instLayout = api.instancedLayout();
+    this.instMat = await api.instancedMaterial(d, {
+      layout: this.instLayout, targetFormat: this.renderer.sceneFormat,
+    });
+
+    this.env = {
+      index: this.index,
+      tone: this.tone,
+      adapter: this.renderer.describeGpu(),
+      featureLevel: this.renderer.featureLevel,
+      software: /swiftshader|llvmpipe|software|lavapipe|basic render/i.test(this.renderer.describeGpu()),
+      backing: back,
+      sceneFormat: this.renderer.sceneFormat,
+      hasTimestamps: this.renderer.stats.gpu != null,
+      presentOn: this.tone !== 'none',
+    };
+    this.background = await this.calibrateBackground();
+    return this.env;
+  }
+
+  toImage(f) {
+    const { data, width, height, bytesPerRow, format } = f;
+    const out = new Uint8ClampedArray(width * height * 4);
+    const bgra = format.startsWith('bgra');
+    const f16 = format === 'rgba16float' || format === 'bgra16float';
+    for (let y = 0; y < height; y++) {
+      const src = y * bytesPerRow;
+      const dst = y * width * 4;
+      for (let x = 0; x < width; x++) {
+        const o = dst + x * 4;
+        if (f16) {
+          // The capture target is 8-bit by construction. Decoding half-floats
+          // anyway, because reading them as bytes yields a plausible-looking
+          // image that is simply wrong.
+          for (let c = 0; c < 4; c++) {
+            const dv = new DataView(data.buffer, data.byteOffset + src + (x * 4 + c) * 2, 2);
+            out[o + c] = halfTo8(dv.getUint16(0, true));
+          }
+        } else if (bgra) {
+          out[o] = data[src + x * 4 + 2];
+          out[o + 1] = data[src + x * 4 + 1];
+          out[o + 2] = data[src + x * 4 + 0];
+          out[o + 3] = data[src + x * 4 + 3];
+        } else {
+          out[o] = data[src + x * 4 + 0];
+          out[o + 1] = data[src + x * 4 + 1];
+          out[o + 2] = data[src + x * 4 + 2];
+          out[o + 3] = data[src + x * 4 + 3];
+        }
+      }
+    }
+    return { data: out, width, height };
+  }
+
+  /**
+   * Calibrates this context's background by rendering an *empty* scene and
+   * reading it back. Self-calibrating: it does not assume what the clear colour
+   * is, so a change to the default cannot turn "drew nothing" into "drew
+   * everything". Per context, because two contexts on two devices do not have to
+   * agree on a clear colour and comparing them produced a coverage assertion
+   * that read 100% lit for an empty scene.
+   */
+  async calibrateBackground() {
+    const { Scene, PerspectiveCamera } = this;
+    const scene = new Scene('bg');
+    const camera = new PerspectiveCamera({ fov: 50, near: 0.1, far: 400, aspect: RENDER_W / RENDER_H });
+    camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+    const f = await this.renderer.capture(scene, camera);
+    const img = this.toImage(f);
+    return { data: img.data, width: img.width, height: img.height, format: f.format };
+  }
+
+  camera() {
+    const c = new this.PerspectiveCamera({ fov: 50, near: 0.1, far: 400, aspect: RENDER_W / RENDER_H });
+    c.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+    return c;
+  }
+}
+
+function halfTo8(h) {
+  const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, f = h & 0x3ff;
+  let v;
+  if (e === 0) v = (f / 1024) * Math.pow(2, -14);
+  else if (e === 31) v = f ? NaN : Infinity;
+  else v = (1 + f / 1024) * Math.pow(2, e - 15);
+  v *= s;
+  if (!(v > 0)) return 0;
+  const lin = Math.min(v, 1);
+  const enc = lin <= 0.0031308 ? lin * 12.92 : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055;
+  return Math.round(enc * 255);
+}
+
+// ---------------------------------------------------------------------------
+// three.js baseline
+// ---------------------------------------------------------------------------
+
+let three = null;
+
+async function initThree() {
+  const THREE = await import('/node_modules/three/build/three.module.js');
+  const canvas = document.createElement('canvas');
+  canvas.width = RENDER_W; canvas.height = RENDER_H;
+  canvas.style.width = RENDER_W + 'px'; canvas.style.height = RENDER_H + 'px';
+  document.body.appendChild(canvas);
+  const r = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+  r.setPixelRatio(1);
+  r.setSize(RENDER_W, RENDER_H, false);
+  r.setClearColor(0x050508, 1);
+
+  const material = new THREE.MeshStandardMaterial({ roughness: 0.4, metalness: 0 });
+  const geo = { cube: new THREE.BoxGeometry(1, 1, 1), sphere: new THREE.SphereGeometry(0.6, 24, 16) };
+  // An ambient plus a key light, so MeshStandardMaterial is actually lit rather
+  // than rendering black — which would make the coverage assertion pass for the
+  // wrong reason.
+  three = { THREE, renderer: r, material, geo, scenes: new Map(), background: null };
+  three.background = (() => {
+    const s = new THREE.Scene();
+    r.render(s, threeCamera());
+    const gl = r.getContext();
+    const px = new Uint8Array(RENDER_W * RENDER_H * 4);
+    gl.readPixels(0, 0, RENDER_W, RENDER_H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return px;
+  })();
+  return { gl: r.getContext().getParameter(r.getContext().VERSION), revision: THREE.REVISION };
+}
+
+function threeCamera() {
+  const c = new three.THREE.PerspectiveCamera(50, RENDER_W / RENDER_H, 0.1, 400);
+  c.position.set(0, 0, 120);
+  c.lookAt(0, 0, 0);
+  c.updateMatrixWorld();
+  return c;
+}
+
+// ---------------------------------------------------------------------------
+// scene construction
+// ---------------------------------------------------------------------------
+
+/**
+ * Grid layout, shared by both engines, so it is the same scene.
+ *
+ * Two variants, and the difference matters for what the sweep can conclude:
+ *
+ *   `fixed`  every object is `baseScale` regardless of count. The grid extent is
+ *            constant, so adding objects adds *overlap* and the fragment cost
+ *            grows with N. Apse and three.js still see identical geometry at a
+ *            given N, which is what the per-N comparison needs, but a rise in
+ *            frame time across N is ambiguous between CPU and GPU.
+ *
+ *   `spread` spacing is held at twice the object size, so `scale = extent /
+ *            (2 * side)`. Objects keep a constant pixel size and never overlap,
+ *            which removes the overdraw confound — and, critically, keeps every
+ *            object above one pixel. The first attempt at this used
+ *            `baseScale * sqrt(reference / objects)`, which drives each object
+ *            below a pixel somewhere past 30k instances: a sub-pixel triangle
+ *            covers no pixel centre, so the frame is genuinely empty and the
+ *            coverage assertion, correctly, reports that nothing drew. That is a
+ *            fact about rasterisation, not about the renderer, and it is why the
+ *            scale law here is derived from the grid rather than from the count.
+ */
+function grid(objects, { variant, baseScale = 0.55, extent = 90 }) {
+  const side = Math.ceil(Math.sqrt(objects));
+  const step = side > 1 ? extent / (side - 1) : 0;
+  const scale = variant === 'spread' ? extent / (2 * side) : baseScale;
+  const out = new Array(objects);
+  for (let i = 0; i < objects; i++) {
+    out[i] = [(i % side) * step - extent / 2, 0, Math.floor(i / side) * step - extent / 2];
+  }
+  return { side, step, scale, positions: out };
+}
+
+function buildApsePerDraw(ctx, spec) {
+  const { MeshNode, Scene, geometries, pbrMat } = ctx;
+  const geo = geometries[spec.geometry ?? 'cube'];
+  const { scale, positions } = grid(spec.objects, spec);
+  const scene = new Scene(spec.name);
+  const camera = ctx.camera();
+  const nodes = [];
+  for (let i = 0; i < spec.objects; i++) {
+    const n = new MeshNode({ name: 'n' + i, mesh: geo, material: pbrMat });
+    const p = positions[i];
+    n.setPosition(p[0], p[1], p[2]);
+    n.setScale(scale);
+    scene.add(n);
+    nodes.push(n);
+  }
+  ctx.scenes.set(spec.name, { engine: 'apse', mode: 'per-draw', scene, camera, nodes, objects: spec.objects, scale });
+  return { name: spec.name, objects: spec.objects, scale: +scale.toFixed(4), nodes: nodes.length };
+}
+
+function buildApseInstanced(ctx, spec) {
+  const { MeshNode, Scene, renderer, geometries, instLayout, instMat } = ctx;
+  const { scale, positions } = grid(spec.objects, spec);
+  const n = spec.objects;
+  const transforms = new Float32Array(n * 16);
+  const m = new Float32Array(16);
+  for (let i = 0; i < n; i++) {
+    m.fill(0);
+    m[0] = m[5] = m[10] = scale; m[15] = 1;
+    const p = positions[i];
+    m[12] = p[0]; m[13] = p[1]; m[14] = p[2];
+    transforms.set(m, i * 16);
+  }
+  const d = renderer.device.device;
+  const data = api.InstanceData.fromMatrices(transforms);
+  const inst = api.uploadInstances(d, data);
+  // The mesh must be uploaded with the instanced layout *and* the instance
+  // buffer: the pipeline's slot-1 declaration comes from the layout, and the
+  // buffer bound to it is a property of the mesh.
+  const mesh = api.upload(d, api.box({ width: 1 }), { layout: instLayout, instances: inst });
+  void geometries;
+
+  const scene = new Scene(spec.name);
+  const camera = ctx.camera();
+  const node = new MeshNode({ name: 'all', mesh, material: instMat });
+  scene.add(node);
+  ctx.scenes.set(spec.name, { engine: 'apse', mode: 'instanced', scene, camera, nodes: [node], objects: n, scale });
+  return { name: spec.name, objects: n, scale: +scale.toFixed(4), nodes: 1 };
+}
+
+function buildThreePerDraw(spec) {
+  const { THREE, renderer: r, material, geo } = three;
+  const layout = grid(spec.objects, spec);
+  const scene = new THREE.Scene();
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.4);
+  key.position.set(30, 60, 40);
+  scene.add(key);
+  for (let i = 0; i < spec.objects; i++) {
+    const m = new THREE.Mesh(geo[spec.geometry ?? 'cube'], material);
+    const p = layout.positions[i];
+    m.position.set(p[0], p[1], p[2]);
+    m.scale.setScalar(layout.scale);
+    m.updateMatrix();
+    m.updateMatrixWorld(true);
+    scene.add(m);
+  }
+  three.scenes.set(spec.name, { engine: 'three', mode: 'per-draw', scene, camera: threeCamera(), nodes: [], objects: spec.objects, scale: layout.scale });
+  return { name: spec.name, objects: spec.objects, scale: +layout.scale.toFixed(4) };
+}
+
+function buildThreeInstanced(spec) {
+  const { THREE, material, geo } = three;
+  const layout = grid(spec.objects, spec);
+  const n = spec.objects;
+  const scene = new THREE.Scene();
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.4);
+  key.position.set(30, 60, 40);
+  scene.add(key);
+
+  const im = new THREE.InstancedMesh(geo[spec.geometry ?? 'cube'], material, n);
+  const m4 = new THREE.Matrix4();
+  for (let i = 0; i < n; i++) {
+    const p = layout.positions[i];
+    m4.makeScale(layout.scale, layout.scale, layout.scale);
+    m4.setPosition(p[0], p[1], p[2]);
+    im.setMatrixAt(i, m4);
+  }
+  im.instanceMatrix.needsUpdate = true;
+  // apse's instanced path is a single node, so its frustum test is one test and
+  // it always draws. Disabling three's per-object cull is what makes the two the
+  // same shape of work, rather than measuring three culling 100k instances.
+  im.frustumCulled = false;
+  im.computeBoundingSphere();
+  scene.add(im);
+  three.scenes.set(spec.name, { engine: 'three', mode: 'instanced', scene, camera: threeCamera(), nodes: [im], objects: n, scale: layout.scale });
+  return { name: spec.name, objects: n, scale: +layout.scale.toFixed(4) };
+}
+
+function getScene(which, name) {
+  if (which === 'three') return three.scenes.get(name);
+  return contexts[which].scenes.get(name);
+}
+
+// ---------------------------------------------------------------------------
+// pixel readback
+// ---------------------------------------------------------------------------
+
+/**
+ * Coverage for a scene, against that engine's own calibrated empty frame.
+ * Reports lit pixels *and* the number of distinct columns containing a lit
+ * pixel, because a single lit column is the signature of a degenerate render
+ * (everything collapsed into one column) that a pixel count alone misses.
+ *
+ * Also reports a *dilated* count: a 3x3 max over the difference image, so a
+ * fragment smaller than a pixel centre still registers. "Did anything draw"
+ * stays answerable without the check silently passing or failing on geometry
+ * rather than on the renderer.
+ */
+async function coverage(ctx, name) {
+  const e = ctx.scenes.get(name);
+  const f = await ctx.renderer.capture(e.scene, e.camera);
+  const img = ctx.toImage(f);
+  const a = ctx.background.data, b = img.data;
+  const W = img.width, H = img.height;
+  const diff = new Uint8Array(W * H);
+  let maxDelta = 0;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const o = (y * W + x) * 4;
+      const d = Math.min(255, Math.abs(a[o] - b[o]) + Math.abs(a[o + 1] - b[o + 1]) + Math.abs(a[o + 2] - b[o + 2]));
+      diff[y * W + x] = d;
+      if (d > maxDelta) maxDelta = d;
+    }
+  }
+  let lit = 0, litDilated = 0;
+  const cols = new Uint8Array(W);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (diff[i] > 6) { lit++; cols[x] = 1; }
+      // 3x3 max: does this pixel differ, or does anything touching it?
+      let m = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= H) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= W) continue;
+          const v = diff[yy * W + xx];
+          if (v > m) m = v;
+        }
+      }
+      if (m > 6) litDilated++;
+    }
+  }
+  let litColumns = 0;
+  for (let x = 0; x < W; x++) litColumns += cols[x];
+  return {
+    litPixels: lit, litPixelsDilated: litDilated, total: W * H,
+    coverage: +(lit / (W * H)).toFixed(6), coverageDilated: +(litDilated / (W * H)).toFixed(6),
+    litColumns, maxDelta,
+  };
+}
+
+function coverageThree(name) {
+  const e = three.scenes.get(name);
+  three.renderer.render(e.scene, e.camera);
+  const gl = three.renderer.getContext();
+  const px = new Uint8Array(RENDER_W * RENDER_H * 4);
+  gl.readPixels(0, 0, RENDER_W, RENDER_H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const a = three.background;
+  const W = RENDER_W, H = RENDER_H;
+  const diff = new Uint8Array(W * H);
+  let maxDelta = 0;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const o = (y * W + x) * 4;
+      const d = Math.min(255, Math.abs(a[o] - px[o]) + Math.abs(a[o + 1] - px[o + 1]) + Math.abs(a[o + 2] - px[o + 2]));
+      diff[y * W + x] = d;
+      if (d > maxDelta) maxDelta = d;
+    }
+  }
+  let lit = 0, litDilated = 0;
+  const cols = new Uint8Array(W);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (diff[y * W + x] > 6) { lit++; cols[x] = 1; }
+      let m = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= H) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= W) continue;
+          const v = diff[yy * W + xx]; if (v > m) m = v;
+        }
+      }
+      if (m > 6) litDilated++;
+    }
+  }
+  let litColumns = 0;
+  for (let x = 0; x < W; x++) litColumns += cols[x];
+  return {
+    litPixels: lit, litPixelsDilated: litDilated, total: W * H,
+    coverage: +(lit / (W * H)).toFixed(6), coverageDilated: +(litDilated / (W * H)).toFixed(6),
+    litColumns, maxDelta,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// instrumentation
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase probe.
+ *
+ * Two tiers, because one measurement is not trustworthy at both ends:
+ *
+ *   timed   — cull, writeBuffer, encoder.finish, queue.submit, and the
+ *             render-entry-to-finish bracket. Four to five timers per *frame*,
+ *             not per draw, so the instrumentation cost is a few microseconds
+ *             and the durations are each accumulated over the whole loop before
+ *             being divided by the frame count. Accumulating before dividing is
+ *             what makes a 5us submit measurable at all on a 100us clock.
+ *
+ *   counted — exact per-call counts of the WebGPU draw API. Counts involve no
+ *             timer, so they carry no clock error and no instrumentation cost
+ *             worth mentioning.
+ *
+ * Per-call *timing* of the draw API is deliberately absent. performance.now()
+ * is clamped to 100us here, so each of 1000 individual setBindGroup calls reads
+ * as 0 or 0.1ms, and summing them produced 154% of the frame. The per-draw cost
+ * is measured instead by {@link microbench} in a controlled loop, and multiplied
+ * by these counts; that product is a model and is labelled as one.
+ */
+function makeProbe({ time }) {
+  const acc = {
+    frames: 0,
+    cull: 0, writeBuffer: 0, writeBufferBytes: 0, finish: 0, submit: 0,
+    bracket: 0, presentTotal: 0,
+    drawIndexed: 0, draw: 0, setPipeline: 0, setBindGroup: 0,
+    createBindGroup: 0, beginRenderPass: 0, passEnd: 0, passes: 0, writeBufferCalls: 0,
+  };
+  let renderEntry = 0, finishEntry = 0, passStart = 0, lastPass = 0, lastPassAcc = 0;
+  const undo = [];
+
+  const t = () => (time ? performance.now() : 0);
+
+  const origRender = null;
+  void origRender;
+
+  // cull
+  undo.push(patch(SceneProto(), 'collectDrawItems', (fn) => function (...a) {
+    const s = t(); const r = fn.apply(this, a);
+    if (time) acc.cull += performance.now() - s;
+    return r;
+  }, false));
+
+  // writeBuffer: a dirty-scene pack writes the object range every frame, a static
+  // scene writes nothing after its first frame. Two calls vs one is how the pack
+  // phase is detected from outside.
+  undo.push(patch(GPUQueue.prototype, 'writeBuffer', (fn) => function (...a) {
+    const s = t(); const r = fn.apply(this, a);
+    if (time) {
+      acc.writeBuffer += performance.now() - s;
+      // writeBuffer(buffer, bufferOffset, data, dataOffset?, size?). The byte
+      // count is the third argument; the second is a numeric offset, so reading
+      // a[1].byteLength always gave 0.
+      acc.writeBufferBytes += (a[2]?.byteLength ?? a[4] ?? 0);
+      acc.writeBufferCalls++;
+    }
+    return r;
+  }, false));
+
+  // finish is where the encode bracket closes.
+  undo.push(patch(GPUCommandEncoder.prototype, 'finish', (fn) => function (...a) {
+    if (time) finishEntry = performance.now();
+    const r = fn.apply(this, a);
+    if (time) { acc.finish += performance.now() - finishEntry; acc.bracket += finishEntry - renderEntry; }
+    return r;
+  }, false));
+
+  undo.push(patch(GPUQueue.prototype, 'submit', (fn) => function (...a) {
+    const s = t(); const r = fn.apply(this, a);
+    if (time) acc.submit += performance.now() - s;
+    return r;
+  }, false));
+
+  // exact counts, no timers
+  undo.push(patch(GPURenderPassEncoder.prototype, 'drawIndexed', (fn) => function (...a) {
+    acc.drawIndexed++; return fn.apply(this, a);
+  }, true));
+  undo.push(patch(GPURenderPassEncoder.prototype, 'draw', (fn) => function (...a) {
+    acc.draw++; return fn.apply(this, a);
+  }, true));
+  undo.push(patch(GPURenderPassEncoder.prototype, 'setPipeline', (fn) => function (...a) {
+    acc.setPipeline++; return fn.apply(this, a);
+  }, true));
+  undo.push(patch(GPURenderPassEncoder.prototype, 'setBindGroup', (fn) => function (...a) {
+    acc.setBindGroup++; return fn.apply(this, a);
+  }, true));
+  undo.push(patch(GPUDevice.prototype, 'createBindGroup', (fn) => function (...a) {
+    acc.createBindGroup++; return fn.apply(this, a);
+  }, true));
+
+  // Render passes. beginRenderPass is timed; end is timed. The *last* pass to
+  // end in a frame is the present pass, since it is encoded after every scene
+  // pass, so its duration is accumulated separately.
+  undo.push(patch(GPUCommandEncoder.prototype, 'beginRenderPass', (fn) => function (...a) {
+    const s = t();
+    const p = fn.apply(this, a);
+    if (time) { acc.beginRenderPass += performance.now() - s; lastPassAcc = 0; }
+    acc.passes++;
+    passStart = time ? performance.now() : 0;
+    return p;
+  }, true));
+  undo.push(patch(GPURenderPassEncoder.prototype, 'end', (fn) => function (...a) {
+    const r = fn.apply(this, a);
+    if (time) { const dd = performance.now() - passStart; acc.passEnd += dd; lastPass = dd; lastPassAcc += dd; }
+    return r;
+  }, false));
+
+  return {
+    acc,
+    /**
+     * Called immediately before renderer.render(), so the bracket starts there.
+     * Also the frame counter, in both passes: it used to be incremented by the
+     * cull timer, which the count-only pass does not install, so every
+     * per-frame count in that pass was divided by one.
+     */
+    enter() {
+      acc.frames++;
+      if (time) { renderEntry = performance.now(); lastPassAcc = 0; lastPass = 0; }
+    },
+    leave() { if (time) acc.presentTotal += lastPass; },
+    reset() { for (const k of Object.keys(acc)) acc[k] = 0; },
+    report(totalMs) {
+      const d = acc.frames || 1;
+      const perFrame = (k) => +(acc[k] / d).toFixed(5);
+      return {
+        frames: d,
+        frameMs: +(totalMs / d).toFixed(5),
+        cullMs: perFrame('cull'),
+        // Everything from render() entry to encoder.finish(): cull, sort, pack,
+        // upload arithmetic, every draw's API calls, and the present pass.
+        encodeBracketMs: perFrame('bracket'),
+        writeBufferMs: perFrame('writeBuffer'),
+        writeBufferKB: +(acc.writeBufferBytes / d / 1024).toFixed(2),
+        writeBufferCalls: acc.writeBufferCalls / d,
+        finishMs: perFrame('finish'),
+        submitMs: perFrame('submit'),
+        presentEncodeMs: perFrame('presentTotal'),
+        passSetupMs: perFrame('beginRenderPass'),
+        passEndMs: perFrame('passEnd'),
+        passesPerFrame: acc.passes / d,
+        counts: {
+          drawIndexed: acc.drawIndexed / d,
+          draw: acc.draw / d,
+          drawTotal: (acc.drawIndexed + acc.draw) / d,
+          setPipeline: acc.setPipeline / d,
+          setBindGroup: acc.setBindGroup / d,
+          createBindGroup: acc.createBindGroup / d,
+        },
+      };
+    },
+    restore() { for (const u of undo) u(); },
+  };
+}
+
+let _sceneProto = null;
+function SceneProto() {
+  if (_sceneProto === null) _sceneProto = api.Scene.prototype;
+  return _sceneProto;
+}
+
+/** Replaces a method, optionally forcing a wrapper even in count-only mode. */
+function patch(proto, name, make, always) {
+  const orig = proto[name];
+  if (typeof orig !== 'function') return () => { /* method absent; nothing to restore */ };
+  proto[name] = make(orig);
+  void always;
+  return () => { proto[name] = orig; };
+}
+
+/**
+ * Per-call cost of the WebGPU draw API, measured in a controlled loop.
+ *
+ * Times a block of K repetitions so the interval spans many clock quanta, then
+ * divides. Run against the scene's real pipeline, bind group and geometry, so
+ * the number is the cost apse actually pays and not the cost of a trivial case.
+ */
+async function microbench(ctx, name, K = 4000) {
+  const e = ctx.scenes.get(name);
+  const { renderer } = ctx;
+  const d = renderer.device.device;
+
+  // Take the real pipeline and bind group by rendering one frame and reading
+  // them off the stats' own counters is not possible, so instead rebuild a
+  // minimal equivalent: the same material, layout and geometry.
+  const out = {};
+  const enc = () => d.createCommandEncoder();
+
+  // We need a pipeline. apse does not expose its compiled pipeline, so the
+  // microbench uses a trivial pipeline with the same shape (one dynamic bind
+  // group, indexed triangle list) — enough to price the API calls themselves.
+  const mod = d.createShaderModule({
+    label: 'apse.bench.micro',
+    code: `
+      struct VOut { @builtin(position) pos: vec4f, @location(0) n: vec3f };
+      @group(0) @binding(0) var<uniform> u: vec4f;
+      @vertex fn vs(@location(0) p: vec3f) -> VOut {
+        var o: VOut; o.pos = u * vec4f(p, 1.0); o.n = vec3f(0.0, 1.0, 0.0); return o;
+      }
+      @fragment fn fs(i: VOut) -> @location(0) vec4f { return vec4f(i.n, 1.0); }`,
+  });
+  const hasDynamic = d.features.has('shader-f16');
+  void hasDynamic;
+  const bgl = d.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', hasDynamicOffset: true } }],
+  });
+  const pipe = d.createRenderPipeline({
+    layout: d.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex: { module: mod, entryPoint: 'vs', buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
+    fragment: { module: mod, entryPoint: 'fs', targets: [{ format: renderer.sceneFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const ubo = d.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const offsets = new Uint32Array(Array.from({ length: 64 }, (_, i) => i * 256));
+  const bg = d.createBindGroup({
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: ubo, size: 256 } }],
+  });
+  const vbo = d.createBuffer({ size: 3 * 12, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  d.queue.writeBuffer(vbo, 0, new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0, 0.5, 0]));
+  // The indexed variant needs an index buffer bound, or the pass is invalid and
+  // the whole command buffer is discarded.
+  // 4 indices, not 3: writeBuffer requires a multiple of 4 bytes and 3 uint16s
+  // is 6. The extra index is never drawn.
+  const ibo = d.createBuffer({ size: 4 * 2, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+  d.queue.writeBuffer(ibo, 0, new Uint16Array([0, 1, 2, 0]));
+  const tex = d.createTexture({
+    size: [RENDER_W, RENDER_H], format: renderer.sceneFormat,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const view = tex.createView();
+
+  const runBlock = (kind, reps) => {
+    const encoder = enc();
+    const p = encoder.beginRenderPass({
+      colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    p.setPipeline(pipe);
+    p.setVertexBuffer(0, vbo);
+    p.setIndexBuffer(ibo, 'uint16');
+    const t0 = performance.now();
+    // The pipeline declares a dynamic bind group at 0, so it must be set on
+    // every iteration whatever is being timed. Leaving it unset makes the pass
+    // invalid and the whole command buffer is discarded — which is exactly what
+    // the validation guard caught the first time round.
+    for (let i = 0; i < reps; i++) {
+      p.setBindGroup(0, bg, [offsets[i & 63]]);
+      if (kind === 'pipeline') p.setPipeline(pipe);
+      if (kind === 'draw') p.draw(3);
+      if (kind === 'indexed') p.drawIndexed(3, 1);
+    }
+    const t1 = performance.now();
+    p.end();
+    d.queue.submit([encoder.finish()]);
+    return (t1 - t0) / reps;
+  };
+
+  // Cumulative by construction: every variant issues setBindGroup first,
+  // because the pipeline declares one and an unset bind group invalidates the
+  // pass. So 'pipeline' is bindGroup+setPipeline, 'draw' is bindGroup+draw, and
+  // the numbers are read as increments, not as isolated costs.
+  for (const kind of ['bindGroup', 'pipeline', 'draw', 'indexed']) {
+    runBlock(kind, 200); // warm
+    await d.queue.onSubmittedWorkDone();
+    const reps = K;
+    const samples = [];
+    for (let r = 0; r < 7; r++) samples.push(runBlock(kind, reps));
+    out[kind + 'PerCallUs'] = +(quantile(samples.slice().sort((a, b) => a - b), 0.5) * 1000).toFixed(4);
+  }
+  out.cumulative = true;
+
+  // --- the pure-JS phases, priced directly -------------------------------
+  //
+  // The bracket above is one number covering sort + pack + frame uniform + the
+  // per-draw encode path. To say *which loop to fix*, each pure-JS phase is
+  // priced on its own, against real inputs captured from a real frame of this
+  // scene. These are the same public functions renderer.render() calls, so this
+  // is a measurement of the real work and not a re-implementation of it.
+  out.jsPhases = await microbenchJsPhases(ctx, name, K);
+
+  // --- the marginal cost of one more draw, measured rather than modelled ---
+  //
+  // The per-draw WebGPU API microbench above runs against a deliberately trivial
+  // pipeline: one dynamic bind group, three vertices, one index buffer, a small
+  // uniform block. apse's real draw binds a 256-byte-strided slot in a buffer
+  // that is megabytes long and indexes a real vertex and index buffer, so the
+  // microbench is a *lower bound* on the real per-draw cost and cannot be used
+  // to close the bracket. What does close it is the slope of frame time against
+  // object count, which is the per-draw cost by definition and needs no model.
+  out.marginal = await marginalPerDraw(ctx, name, K);
+  // The combination apse actually issues per object.
+  {
+    const run = (reps) => {
+      const encoder = enc();
+      const p = encoder.beginRenderPass({
+        colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+      });
+      p.setPipeline(pipe);
+      p.setVertexBuffer(0, vbo);
+      p.setIndexBuffer(ibo, 'uint16');
+      const t0 = performance.now();
+      for (let i = 0; i < reps; i++) {
+        p.setBindGroup(0, bg, [offsets[i & 63]]);
+        p.draw(3);
+      }
+      const t1 = performance.now();
+      p.end();
+      d.queue.submit([encoder.finish()]);
+      return (t1 - t0) / reps;
+    };
+    run(200);
+    await d.queue.onSubmittedWorkDone();
+    const samples = [];
+    for (let r = 0; r < 7; r++) samples.push(run(K));
+    out.perDrawComboUs = +(quantile(samples.slice().sort((a, b) => a - b), 0.5) * 1000).toFixed(4);
+  }
+  out.reps = K;
+  tex.destroy(); ubo.destroy(); vbo.destroy(); ibo.destroy(); mod.destroy?.();
+  void e;
+  return out;
+}
+
+/**
+ * Prices the pure-JS phases of a frame on their own.
+ *
+ * The encode bracket is a single number spanning sort, pack, the frame uniform
+ * and the per-draw API calls, which is enough to say the frame is bound but not
+ * enough to say *which loop to fix*. This runs each of the real functions that
+ * `Renderer.render` calls, over real inputs captured from a real frame of this
+ * scene:
+ *
+ *   cull/walk   Scene.collectDrawItems into a reused array
+ *   sort        sortDrawItems — the same export renderer.render calls
+ *   pack        ObjectUniforms.pack for every object, plus uploadRange
+ *
+ * The inputs are this scene's own draw items and models, so the numbers are the
+ * cost of this scene and not of a synthetic one. Each is timed as a block of
+ * repetitions divided by the repetition count, so it is above the clock quantum.
+ */
+async function microbenchJsPhases(ctx, name, reps) {
+  const e = ctx.scenes.get(name);
+  const { renderer, Scene } = ctx;
+  const cam = e.camera;
+  const items = [];
+
+  // Capture a real frame's draw items. These are pooled objects owned by the
+  // scene, so they are only read here, never retained past this call.
+  Scene.prototype.collectDrawItems.call(e.scene, items, cam, 256);
+
+  const models = [];
+  for (let i = 0; i < items.length; i++) models.push(items[i].model);
+
+  const time = (fn, n) => {
+    for (let i = 0; i < Math.min(50, n); i++) fn();      // warm
+    const s = [];
+    for (let r = 0; r < 7; r++) {
+      const t0 = performance.now();
+      for (let i = 0; i < n; i++) fn();
+      s.push((performance.now() - t0) / n);
+    }
+    return +quantile(s.slice().sort((a, b) => a - b), 0.5);
+  };
+
+  const out = { items: items.length, reps: 0 };
+
+  // cull / walk. collectDrawItems fills a caller-supplied array; reusing one
+  // matches how the renderer calls it, and the renderer clears it each frame.
+  {
+    const buf = [];
+    const n = Math.max(1, Math.min(reps, 500));
+    out.cullMs = time(() => { buf.length = 0; Scene.prototype.collectDrawItems.call(e.scene, buf, cam, 256); }, n);
+    out.reps = n;
+  }
+
+  // sort. The renderer hands the collected array straight to sortDrawItems, which
+  // sorts in place. Sorting the same array repeatedly is not a no-op, but it is
+  // the same work every time and it is the same array shape, so the per-call
+  // cost is representative. A copy per call would measure the copy.
+  if (items.length > 1) {
+    out.sortMs = time(() => { api.sortDrawItems(items); }, Math.max(1, Math.min(reps, 200)));
+  }
+
+  // pack + upload. ObjectUniforms is the renderer's own object buffer, so this
+  // writes into the buffer the next frame will read — which is exactly what the
+  // renderer does, and why this must run after the timing above rather than
+  // during it.
+  {
+    const u = renderer.objectUniforms;
+    const n = items.length;
+    const normal = new Float32Array(12);
+    const n2 = Math.max(1, Math.min(reps, 50));
+    if (n > 0 && typeof u.pack === 'function') {
+      // A *full* pack of every object, which is what a fully dirty frame does.
+      // A static frame packs none, so this is an upper bound for a static scene.
+      out.packFullMs = time(() => {
+        for (let i = 0; i < n; i++) u.pack(i, models[i], normal, i, 0, 1);
+        u.uploadRange(0, n);
+      }, n2);
+      out.packedPerCall = n;
+    }
+  }
+
+  // frame uniform: fourteen scalar/matrix writes and one flush, shared by every
+  // material. One writeBuffer per frame however many materials there are.
+  {
+    const f = renderer.frameUniforms;
+    if (f && typeof f.set === 'function') {
+      const pair = new Float32Array(2);
+      out.frameUniformMs = time(() => {
+        f.set('view', cam.view);
+        f.set('proj', cam.projection);
+        f.set('viewProj', cam.viewProj);
+        f.set('invView', cam.invView);
+        f.set('invProj', cam.invProj);
+        f.set('invViewProj', cam.invViewProj);
+        f.set('camPos', cam.worldPosition);
+        f.set('time', 0);
+        f.set('delta', 0.016);
+        f.set('elapsed', 1);
+        f.set('resolution', pair);
+        f.set('viewport', pair);
+        f.set('alpha', 1);
+        f.flush();
+      }, Math.max(1, Math.min(reps, 400)));
+    }
+  }
+
+  // Size sync. #syncSize() reads the canvas's client size every frame, which is
+  // a DOM read; whether it costs anything is a question, not an assumption.
+  {
+    const c = ctx.canvas;
+    out.syncSizeMs = time(() => { void c.clientWidth; void c.clientHeight; }, Math.max(1, Math.min(reps, 2000)));
+  }
+  return out;
+}
+
+/**
+ * The marginal cost of one draw, from the slope of frame time against object
+ * count.
+ *
+ * Scenes identical in every respect except object count, laid out with constant
+ * object size and no overlap, so the only difference between their frames is
+ * the number of draws. The slope of CPU time against draw count is then the
+ * per-draw cost, measured, with no model in it.
+ *
+ * A static scene is used on purpose: it isolates the per-draw *encode* cost
+ * from the pack cost, which only exists when objects are dirty.
+ */
+async function marginalPerDraw(ctx, name, K) {
+  const base = ctx.scenes.get(name);
+  const objects = base.objects;
+  const points = [];
+  for (const mult of [0.5, 1, 2]) {
+    const n = Math.max(2, Math.round(objects * mult));
+    const spec = { name: `${name}-m${mult}`, objects: n, geometry: 'cube', variant: 'spread' };
+    // Reuse the same builder the sweep uses, so this is the same scene shape.
+    if (base.mode === 'instanced') buildApseInstanced(ctx, spec);
+    else buildApsePerDraw(ctx, spec);
+    const e = ctx.scenes.get(spec.name);
+    for (let i = 0; i < 20; i++) { e.camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]); ctx.renderer.render(e.scene, e.camera); }
+    await ctx.renderer.device.device.queue.onSubmittedWorkDone();
+    const reps = Math.max(1, Math.min(K, 200));
+    const per = [];
+    for (let r = 0; r < 7; r++) {
+      const t0 = performance.now();
+      for (let i = 0; i < reps; i++) { e.camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]); ctx.renderer.render(e.scene, e.camera); }
+      per.push((performance.now() - t0) / reps);
+    }
+    await ctx.renderer.device.device.queue.onSubmittedWorkDone();
+    const draws = ctx.renderer.stats.drawCalls;
+    points.push({ objects: n, draws, ms: +quantile(per.slice().sort((a, b) => a - b), 0.5).toFixed(5) });
+    if (e.scene && typeof e.scene.clear === 'function') e.scene.clear();
+    ctx.scenes.delete(spec.name);
+  }
+  // Least-squares slope of ms against draws. Reported, but the two-point slope
+  // between the largest and smallest scene is given alongside it: a least-
+  // squares line through three points is pulled by the fixed per-frame cost
+  // sitting in the intercept, and over a 4x range the endpoints are the more
+  // honest estimate of the marginal cost. Both are printed; neither is hidden.
+  const N = points.length;
+  const sx = points.reduce((a, p) => a + p.draws, 0);
+  const sy = points.reduce((a, p) => a + p.ms, 0);
+  const sxx = points.reduce((a, p) => a + p.draws * p.draws, 0);
+  const sxy = points.reduce((a, p) => a + p.draws * p.ms, 0);
+  const denom = N * sxx - sx * sx;
+  const lsq = denom === 0 ? 0 : (N * sxy - sx * sy) / denom;
+  const lo = points[0], hi = points[points.length - 1];
+  const two = hi.draws === lo.draws ? 0 : (hi.ms - lo.ms) / (hi.draws - lo.draws);
+  const intercept = lo.ms - two * lo.draws;
+  return {
+    points,
+    usPerDrawLsq: +(lsq * 1000).toFixed(4),
+    usPerDraw: +(two * 1000).toFixed(4),
+    usPerDrawMethod: 'two-point slope between the smallest and largest scene',
+    fixedMsPerFrame: +intercept.toFixed(5),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// the timing loop
+// ---------------------------------------------------------------------------
+
+function animate(entry) {
+  // Marks every object dirty, so #packObjects does the full pack instead of
+  // skipping every object as clean. `rotation` is a live quaternion view, so it
+  // is written in place and followed by markDirty() — the documented path.
+  //
+  // The time spent here is the caller's cost, not the renderer's, so it is
+  // measured separately and reported apart from the phase split.
+  const t = performance.now();
+  const nodes = entry.nodes;
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    const h = ((i * 0.001) % (Math.PI * 2)) * 0.5;
+    n.rotation[0] = 0; n.rotation[1] = Math.sin(h); n.rotation[2] = 0; n.rotation[3] = Math.cos(h);
+    n.markDirty();
+  }
+  return performance.now() - t;
+}
+
+function frameApse(ctx, entry, { animated }) {
+  entry.camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+  let anim = 0;
+  if (animated) anim = animate(entry);
+  const t0 = performance.now();
+  ctx.renderer.render(entry.scene, entry.camera);
+  return { renderMs: performance.now() - t0, animMs: anim };
+}
+
+function frameThree(entry) {
+  entry.camera.updateMatrixWorld();
+  const t0 = performance.now();
+  three.renderer.render(entry.scene, entry.camera);
+  return { renderMs: performance.now() - t0, animMs: 0 };
+}
+
+function statsOf(entry) {
+  if (entry.engine === 'apse') {
+    const s = entry.rendererRef.stats;
+    return { drawCalls: s.drawCalls, triangles: s.triangles, uniformBytes: s.uniformBytes };
+  }
+  const s = three.renderer.info.render;
+  return { drawCalls: s.calls, triangles: s.triangles, uniformBytes: 0 };
+}
+
+let contexts = [];
+const THREE_FENCE_PIXEL = new Uint8Array(4);
+
+async function measureOne(ctxIndex, name, opts = {}) {
+  const {
+    samples = 120, warmup = 20, animated = false, trials = 1,
+    batch = 0, drainEvery = 0,
+  } = opts;
+  const isThree = ctxIndex === 'three';
+  const ctx = isThree ? null : contexts[ctxIndex];
+  const entry = getScene(ctxIndex, name);
+  if (!entry) throw new Error('no scene ' + name);
+  if (!isThree) entry.rendererRef = ctx.renderer;
+  const frame = isThree ? (e) => frameThree(e) : (e) => frameApse(ctx, e, { animated });
+  // The GPU fence for three.js is a 1-pixel readPixels, not gl.finish().
+  //
+  // gl.finish() is a no-op for the question being asked here: with the measured
+  // "end to end" times coming out *exactly equal* to the CPU times at every
+  // instance count, it is clearly not waiting for the GPU at all. Chrome
+  // implements it as a flush rather than a wait, and since nothing is reading
+  // the canvas back, the driver is free to discard the work — so a
+  // gl.finish()-fenced three.js number measures nothing but the CPU.
+  //
+  // readPixels has to return real pixels, so it cannot be discarded and the
+  // call does not return until the frame is done. That makes it the equivalent
+  // of onSubmittedWorkDone for the WebGL side, and it is what makes the
+  // end-to-end column comparable between the two engines.
+  const fence = isThree
+    ? () => {
+        const gl = three.renderer.getContext();
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, THREE_FENCE_PIXEL);
+        return Promise.resolve();
+      }
+    : () => ctx.renderer.device.device.queue.onSubmittedWorkDone();
+  // Always drain several times over a run, so a queued backlog can never be
+  // what is being measured. The await sits outside every sample.
+  const drain = drainEvery > 0 ? drainEvery : Math.max(1, Math.floor(samples / 3));
+
+  for (let i = 0; i < warmup; i++) frame(entry);
+  await fence();
+
+  const out = {
+    name, engine: isThree ? 'three' : 'apse', mode: entry.mode, objects: entry.objects,
+    scale: +entry.scale.toFixed(4), animated, clockMs: clock,
+  };
+
+  // --- per-frame CPU, unbatched -----------------------------------------
+  const times = [];
+  let anim = 0;
+  for (let i = 0; i < samples; i++) {
+    const r = frame(entry);
+    times.push(r.renderMs);
+    anim += r.animMs;
+    if (drain > 0 && (i + 1) % drain === 0) await fence();
+  }
+  await fence();
+  out.render = dist(times);
+  out.animMsPerFrame = +(anim / samples).toFixed(5);
+  out.stats = statsOf(entry);
+  out.hasGpuTiming = !isThree && ctx.renderer.stats.gpu != null;
+  if (out.hasGpuTiming) out.gpuMs = ctx.renderer.stats.gpu;
+
+  // --- batched CPU + fenced end-to-end ----------------------------------
+  // The batch is sized so one block spans ~4ms, i.e. ~40 clock quanta, which
+  // resolves a per-frame cost of tens of microseconds.
+  //
+  // The floor is 4, not 1. render.p50 is itself quantised, so for a frame in
+  // the 0.3-3ms range it rounds *up* to the next 0.1ms step and the derived K
+  // comes out as 1, which leaves the batched number quantised to the same
+  // 0.1ms as the unbatched one — the batching would buy nothing exactly where
+  // it is most needed. Sampling K directly in that range costs 4x the frames
+  // and buys 4x the resolution.
+  {
+    const perFrameSec = Math.max(out.render.p50 / 1000, 1e-6);
+    const K = batch > 0 ? batch : Math.min(500, Math.max(4, Math.round(0.004 / perFrameSec)));
+    const bSamples = Math.min(samples, 40);
+    out.batch = K;
+    const bCpu = [], bWall = [];
+    for (let t = 0; t < trials; t++) {
+      for (let i = 0; i < bSamples; i++) {
+        if (animated) animate(entry);
+        const c0 = performance.now();
+        for (let k = 0; k < K; k++) frame(entry);
+        const c1 = performance.now();
+        await fence();
+        const c2 = performance.now();
+        bCpu.push((c1 - c0) / K);
+        bWall.push((c2 - c0) / K);
+      }
+    }
+    out.batched = dist(bCpu);
+    out.fenced = dist(bWall);
+    // What one batched sample actually resolves to, given the clock quantum.
+    out.batchedResolutionMs = +(clock / K).toFixed(6);
+  }
+  return out;
+}
+
+/**
+ * Phase attribution for an apse scene. Two passes: one timed, one counted.
+ * The counted pass adds no timers at all, so its frame time is a clean control
+ * for how much the timed pass inflated things.
+ */
+async function probeOne(ctxIndex, name, opts = {}) {
+  const { samples = 120, warmup = 20, animated = false } = opts;
+  const ctx = contexts[ctxIndex];
+  const entry = getScene(ctxIndex, name);
+  const fence = () => ctx.renderer.device.device.queue.onSubmittedWorkDone();
+  const frame = () => frameApse(ctx, entry, { animated });
+
+  for (let i = 0; i < warmup; i++) frame();
+  await fence();
+
+  // counted-only pass: the control, and the source of the exact call counts
+  const counter = makeProbe({ time: false });
+  counter.reset();
+  const cTimes = [];
+  for (let i = 0; i < samples; i++) {
+    if (animated) animate(entry);
+    counter.enter();
+    const t0 = performance.now();
+    ctx.renderer.render(entry.scene, entry.camera);
+    cTimes.push(performance.now() - t0);
+  }
+  await fence();
+  const counts = counter.report(cTimes.reduce((a, b) => a + b, 0)).counts;
+  counter.restore();
+
+  // timed pass
+  const timer = makeProbe({ time: true });
+  timer.reset();
+  const tTimes = [];
+  for (let i = 0; i < samples; i++) {
+    if (animated) animate(entry);
+    timer.enter();
+    const t0 = performance.now();
+    ctx.renderer.render(entry.scene, entry.camera);
+    tTimes.push(performance.now() - t0);
+    timer.leave();
+  }
+  await fence();
+  const timed = timer.report(tTimes.reduce((a, b) => a + b, 0));
+  timer.restore();
+
+  return {
+    controlRender: dist(cTimes),
+    timedRender: dist(tTimes),
+    timed: { ...timed, counts },
+    microbench: await microbench(ctx, name),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// exported API
+// ---------------------------------------------------------------------------
+
+g.__boot = async () => {
+  clock = quantiseProbe();
+  api = await import('/dist/index.js');
+  contexts = [];
+  for (let i = 0; i < TONES.length; i++) {
+    const c = new Ctx(i, TONES[i]);
+    contexts.push(c);
+    await c.init();
+  }
+  const threeEnv = await initThree();
+  const first = contexts[0].env;
+  g.__ready = true;
+  return {
+    ...first,
+    contexts: contexts.map((c) => c.env),
+    three: threeEnv,
+    clockMs: clock,
+    crossOriginIsolated: self.crossOriginIsolated === true,
+    date: new Date().toISOString(),
+    ua: navigator.userAgent,
+  };
+};
+
+g.__build = (ctxIndex, engine, mode, spec) => {
+  const which = engine === 'three' ? 'three' : Number(ctxIndex);
+  if (engine === 'apse') {
+    const ctx = contexts[which];
+    return mode === 'per-draw' ? buildApsePerDraw(ctx, spec) : buildApseInstanced(ctx, spec);
+  }
+  return mode === 'per-draw' ? buildThreePerDraw(spec) : buildThreeInstanced(spec);
+};
+
+g.__measure = (ctxIndex, name, opts) =>
+  measureOne(ctxIndex === 'three' ? 'three' : Number(ctxIndex), name, opts ?? {});
+
+g.__probe = (ctxIndex, name, opts) => probeOne(Number(ctxIndex), name, opts ?? {});
+
+g.__coverage = async (ctxIndex, name) => {
+  if (ctxIndex === 'three') return coverageThree(name);
+  return coverage(contexts[Number(ctxIndex)], name);
+};
+
+g.__errors = (ctxIndex) => {
+  if (ctxIndex === 'three') return [];
+  return contexts[Number(ctxIndex)].validationErrors.slice();
+};
+
+g.__disposeScene = (ctxIndex, name) => {
+  const s = getScene(ctxIndex, name);
+  if (s && s.scene && typeof s.scene.clear === 'function') s.scene.clear();
+  if (ctxIndex === 'three') three.scenes.delete(name); else contexts[Number(ctxIndex)].scenes.delete(name);
+  return true;
+};
+
+window.addEventListener('error', (e) => { g.__err = String(e.message ?? e); });
+window.addEventListener('unhandledrejection', (e) => { g.__err = String(e.reason?.message ?? e.reason); });
+</script>
+</body>
+</html>

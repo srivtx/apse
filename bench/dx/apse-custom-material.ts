@@ -21,8 +21,8 @@
  * where it appears: see `out.normalW` in DX_VERTEX.
  */
 
-import { Material, generateScaffold, describeMaterial } from '../../dist/index.js';
-import type { MaterialSpec } from '../../dist/index.js';
+import { Material, generateScaffold, describeMaterial } from '../../src/index.ts';
+import type { MaterialSpec } from '../../src/index.ts';
 
 // ---------------------------------------------------------------------------
 // Shared inputs. Imported by the three.js version; see the note above.

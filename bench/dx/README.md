@@ -78,7 +78,7 @@ materials are each bound to a different colour target format (handled by leaving
 apse's `targets` at its default, which matches `capture()`).
 
 **Not measured:** whether the two agree on a rotated or non-uniformly-scaled
-mesh. apse's `obj.normalMatrix` is broken in this build (see §6), so the
+mesh. apse's `mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch) is broken in this build (see §6), so the
 comparison uses `obj.model` for the normal transform, which is exact for a
 rotation-only transform and is what both shaders do here.
 
@@ -244,7 +244,7 @@ All three of those *are* real on V2, which is the path the claim is really about
 
 Beyond the documented `MaterialSpec`, the author has to know:
 
-1. **`obj.normalMatrix` is broken.** See §6. This is not a learning cost, it is a
+1. **`mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch) is broken.** See §6. This is not a learning cost, it is a
    defect, and the material here works around it.
 2. **`prelude` is the only place a `fn` may go.** A body that declares a
    function, a struct, or anything with an `@attribute` is rejected. Measured, and
@@ -454,7 +454,7 @@ only way to ask the question, and it produces the same
 | | three.js | apse |
 |---|---|---|
 | silent, and the object's appearance is wrong | 2 (missing cache key, `.replace` no-op) | 1 (unassigned varying) |
-| silent, and it is the library's own data | 0 | **1 (`obj.normalMatrix`, §6)** |
+| silent, and it is the library's own data | 0 | **1 (`mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch), §6)** |
 | throws with the offending token named | 1 (unknown `#include`) | 0 |
 | `console.error` with the offending line quoted | 2 (varying mismatch, type error) | 0 |
 | typed error naming the field and listing the alternatives | 0 | **1 (body identifier)** |
@@ -462,7 +462,7 @@ only way to ask the question, and it produces the same
 
 ---
 
-## 6. A defect found while measuring: `obj.normalMatrix` is wrong
+## 6. A defect found while measuring: `mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch) is wrong
 
 Not part of the brief, but it made the comparison impossible until it was found,
 and it is silent, so it belongs here.
@@ -510,7 +510,7 @@ diff  maxChannelDiff 255, meanAbsDiff 65.53, 64108 of 64108 covered pixels diffe
 rendered: yes.  threw: no.  warning: none.
 ```
 
-apse's own `pbrMaterial` uses `obj.normalMatrix`, and it renders the same sphere
+apse's own `pbrMaterial` uses `mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch), and it renders the same sphere
 as a single flat colour — `covered mean luma == maxLuma == 55`. The existing
 `bench/index.html` readback check does not catch this, because it asks "does any
 pixel differ from the clear colour", and a flat lit sphere does.
@@ -627,7 +627,7 @@ that apse's own JSDoc points at is 15 lines, which is a stronger argument for
 
 **And the case against apse is not a matter of taste.** apse has one silent
 failure three.js does not have, in its own generated data rather than in the
-author's shader: `obj.normalMatrix` arrives on the GPU as `(1,0,0), (1,0,0),
+author's shader: `mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch) arrives on the GPU as `(1,0,0), (1,0,0),
 (1,NaN,NaN)` for an identity transform, which makes apse's own PBR material
 render flat. It also has two error paths that produce
 `is invalid due to a previous error` when the real diagnostic is available and
@@ -779,7 +779,7 @@ export async function createDxMaterial(
 // @count:end
 ```
 
-Note `out.normalW` uses `obj.model`, not `obj.normalMatrix`. That is §6, and it is
+Note `out.normalW` uses `obj.model`, not `mat.normalMatrix` (now fixed: normalMatrixOf writes a padded 12-float scratch). That is §6, and it is
 a defect in apse, not a style choice.
 
 ## Appendix B — the three.js `ShaderMaterial` version, in full

@@ -59,12 +59,24 @@
   },
   "typesVersions": {
     "*": {
-      "core": ["./dist/core/index.d.ts"],
-      "math": ["./dist/math/index.d.ts"],
-      "geometry": ["./dist/geometry/index.d.ts"],
-      "material": ["./dist/material/index.d.ts"],
-      "scene": ["./dist/scene/index.d.ts"],
-      "render": ["./dist/render/index.d.ts"]
+      "core": [
+        "./dist/core/index.d.ts"
+      ],
+      "math": [
+        "./dist/math/index.d.ts"
+      ],
+      "geometry": [
+        "./dist/geometry/index.d.ts"
+      ],
+      "material": [
+        "./dist/material/index.d.ts"
+      ],
+      "scene": [
+        "./dist/scene/index.d.ts"
+      ],
+      "render": [
+        "./dist/render/index.d.ts"
+      ]
     }
   },
   "files": [
@@ -83,7 +95,8 @@
     "bench": "bun run bench/run.ts",
     "size-gate": "bun run scripts/size-gate.ts",
     "verify": "bun run typecheck && bun test && bun run build && bun run scripts/size-gate.ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "bench:perf": "bun run bench/diag/perf/run.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

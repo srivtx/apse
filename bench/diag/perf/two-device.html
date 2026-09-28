@@ -1,0 +1,53 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>two-device probe</title></head>
+<body>
+<script type="module">
+// Does a second WebGPU device work in the same page? The existing harness
+// asserts it does not ("Chrome drops the first WebGPU instance when a second
+// device is created"), and works around it with one renderer per page. If that
+// is no longer true, the present-pass A/B can be measured in one page and the
+// cross-page variance disappears.
+const g = globalThis;
+g.__result = null;
+g.__done = false;
+try {
+  const a1 = await navigator.gpu.requestAdapter();
+  const d1 = await a1.requestDevice();
+  const a2 = await navigator.gpu.requestAdapter();
+  const d2 = await a2.requestDevice();
+  g.__result = { gotAdapter2: !!a2, gotDevice2: !!d2, sameDevice: d1 === d2 };
+  // Actually use both, and surface an error scope, because two devices that
+  // construct fine and then invalidate each other is the actual failure.
+  const errs = [];
+  d1.addEventListener('uncapturederror', (e) => errs.push('d1: ' + e.error.message));
+  d2.addEventListener('uncapturederror', (e) => errs.push('d2: ' + e.error.message));
+  d1.pushErrorScope('validation');
+  d2.pushErrorScope('validation');
+  for (const d of [d1, d2]) {
+    const buf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const mod = d.createShaderModule({ code: '@vertex fn vs() -> @builtin(position) vec4f { return vec4f(0,0,0,1); } @fragment fn fs() -> @location(0) vec4f { return vec4f(1); }' });
+    const pipe = d.createRenderPipeline({ layout: 'auto', vertex: { module: mod, entryPoint: 'vs' }, fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'bgra8unorm' }] }, primitive: { topology: 'triangle-list' } });
+    const tex = d.createTexture({ size: [64, 64], format: 'bgra8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const enc = d.createCommandEncoder();
+    const p = enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    p.setPipeline(pipe);
+    p.setBindGroup(0, d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [] }));
+    p.draw(3);
+    p.end();
+    d.queue.submit([enc.finish()]);
+    void buf;
+  }
+  const e1 = await d1.popErrorScope();
+  const e2 = await d2.popErrorScope();
+  await d1.queue.onSubmittedWorkDone();
+  await d2.queue.onSubmittedWorkDone();
+  g.__result.e1 = e1 ? e1.message : null;
+  g.__result.e2 = e2 ? e2.message : null;
+  g.__result.uncaptured = errs;
+  g.__result.ok = true;
+} catch (e) {
+  g.__result = { ok: false, error: String(e && e.message || e) };
+}
+g.__done = true;
+</script>
+</body></html>

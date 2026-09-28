@@ -42,12 +42,43 @@ figure. If apse is slower, that is the headline, not a footnote.
   geometry-heavy scene and a draw-call-heavy scene measure different bottlenecks; do not
   average them into one flattering number.
 
-## Current known state to verify, not assume
+## What the README is currently waiting for
 
-At HEAD, apse was ~1.3–1.4× slower than three.js on cube scenes and a tie on spheres. That
-split is the clue: it points at per-draw CPU cost, not shader or memory bandwidth. Instancing
-now reaches the draw list and the renderer issues one `drawIndexed` for N instances, so the
-instanced scenes are the ones most likely to change the story. Measure them.
+The README's performance section is a **placeholder**. There is no frame time in it and there
+will not be one until your run produces one. It promises the reader these scenes, so produce
+exactly these or say why you could not:
+
+- **instanced** at 10,000 / 50,000 / 100,000 instances, against the same object count issued
+  one `drawIndexed` each. This is the row that matters: it is the first measurement of the
+  regime instancing was built for.
+- **per-node** at 1,000 and 5,000 `MeshNode`s. This is the comparison the pre-instancing
+  numbers made, and it is the one a reader will check you against, so it has to be in the same
+  run as the instanced rows.
+- **tone-mapped against not**, so the present pass's cost is a number rather than a footnote.
+- **CPU and GPU separately.** `FrameStats.gpu` is `null` without `timestamp-query` and is a
+  1–2 frame-late reading where it exists. Report them as separate columns and do not imply
+  they describe the same instant; a device that cannot be timed is a legitimate result, and
+  saying "GPU unavailable on this device" is worth more than a number you cannot stand behind.
+
+Note that `bench/run.ts` currently carries a comment saying instanced scenes are not
+benchmarked, while `bench/index.html` has an instanced scene in it. That comment is yours to
+fix or remove. Until the harness and the comment agree, the docs cannot describe it as
+in progress with any confidence — and a reader who spots the contradiction stops trusting the
+rest of the page.
+
+## Two stale claims in the tree you should know about
+
+Both are in files you own, both are false against current `src/`, and both will be found by
+anyone who checks:
+
+- `bench/diag/README.md` says "4 of apse's 42 codes are never raised anywhere in `src/`",
+  naming `MATERIAL_DISPOSED`, `MESH_DISPOSED`, `VARYING_MISMATCH`, `SHADER_NO_ENTRYPOINT`.
+  The last two were deleted, two codes were added, and — see the next point — two of the
+  remaining two are still not raised.
+- `bench/diag/README.md` §2.1 says "apse never calls `getCompilationInfo()`" and reports
+  `obj.normalMatrix` arriving as `(1,0,0), (1,0,0), (1,NaN,NaN)`. Both were fixed:
+  `normalMatrixOf` now writes a padded 12-float scratch, and the compilation info is
+  surfaced. The scenario table's counts may have shifted as a result. Re-run it.
 
 ## Report format
 

@@ -47,12 +47,28 @@ history use `git log` / `git diff`, which you are allowed.
   multi-buffer one, and is what an instanced pipeline needs.
 - Compatibility mode zeroes `maxStorageBuffersInVertexStage`, so instance data must be a
   vertex buffer with `stepMode: 'instance'`, never a vertex-stage storage buffer.
-- Bounds must be conservative. An under-estimated bound silently drops visible objects.
+- **The renderer binds slot 1 on `instanceBuffer !== null`, never on
+  `instanceCount > 1`.** A mesh uploaded with a thousand instances and asked to draw one has
+  a count of 1 and a non-null buffer. Keep `DrawableGeometry` reporting both, and keep them
+  independent — the renderer's guard depends on the distinction being expressible.
+- Bounds must be conservative **and finite**. An under-estimated bound silently drops visible
+  objects; a `NaN` vertex produces a *finite* bound that does not contain the mesh, which the
+  frustum then rejects — a visible hole with a draw list that looks right. `MeshData` rejects
+  non-finite positions with the vertex index named; keep that check.
+- **Winding order has no validator.** `capsule()` shipped with all 168 triangles inside-out:
+  invisible from both sides, valid index buffer, valid pipeline, no error. Test the winding of
+  every new primitive against its own material's `frontFace` and `cull`.
+- **Merged normals are renormalised, and that is not redundant.** Baking through a transform
+  leaves a normal at the transform's length, which is correct only for a rigid one — the case
+  a test uses. A 2:1:1 scale produced a normal of length 0.5 and still rendered plausibly.
 - `getMappedRange()` is detached by `unmap()`; `.slice()` inside the mapped window or you
   read zeroes.
 - `sideEffects: false` is a promise. Primitives are pure functions needing no device.
 - No top-level work, no prototype patching. String-literal unions, never `enum`.
   `import type` is required. Import paths carry `.ts`.
+- A code nobody can reach is not a code. If a failure is structurally unrepresentable, put the
+  guarantee in the type system — `VARYING_MISMATCH` and `SHADER_NO_ENTRYPOINT` were deleted
+  from the catalog for exactly that reason rather than left as a lie in the public API.
 
 ## Report format
 

@@ -57,9 +57,21 @@ Classification is of **what the developer sees**, not of what the library intend
 
 Two further numbers that matter more than the tally:
 
-- **4 of apse's 42 codes are never raised anywhere in `src/`.** `MATERIAL_DISPOSED`,
-  `MESH_DISPOSED`, `VARYING_MISMATCH`, `SHADER_NO_ENTRYPOINT`. The catalog advertises a
-  failure surface that four of its members do not cover.
+- **This finding is resolved.** The original run found 4 unreachable codes:
+  `MATERIAL_DISPOSED`, `MESH_DISPOSED`, `VARYING_MISMATCH`, `SHADER_NO_ENTRYPOINT`. The
+  first two are now raised — `Material` and `GpuMesh` pass their code to `super()`, and
+  `GpuMesh`'s buffer accessors call `assertLive`, so a caller that keeps drawing a
+  released mesh is told `MESH_DISPOSED` instead of getting a destroyed buffer. The last
+  two were **deleted rather than wired**: `VARYING_MISMATCH` describes a disagreement
+  between a varying declaration and a second copy of it, and there is only one copy;
+  `SHADER_NO_ENTRYPOINT` describes a missing entry point in generated text, and the
+  scaffold always emits both. Both were structurally unrepresentable, not merely unused,
+  so keeping them in a public catalog was a lie. Two codes were added in their place:
+  `RESOURCE_DISPOSED` and `INVALID_USAGE`.
+- **`INTERNAL_INVARIANT` is now the only `blame: 'library'` code**, and every other code
+  is `blame: 'caller'` or `blame: 'environment'`. Before this change 55 of 140 `fail()`
+  sites reported a caller's mistake as a bug in apse. See `ERROR_BLAME` in
+  `src/core/error-catalog.ts`.
 - **38 of 140 `fail()` call sites — 55 sites — are `INTERNAL_INVARIANT`**, whose catalog
   entry reads *"This always indicates a bug in apse, not in your code."* The most-raised
   code is the one that says the fault is not yours. (The call sites supply their own
@@ -73,7 +85,7 @@ Two further numbers that matter more than the tally:
 
 ### 2.1 The compiler's real diagnostic, and the error that replaces it
 
-apse never calls `getCompilationInfo()` — `grep -rn getCompilationInfo src/ test/` returns
+apse called `getCompilationInfo()` nowhere — `grep -rn getCompilationInfo src/ test/` returns
 nothing. The information exists. It arrives as an **uncaptured** WebGPU error:
 
 ```

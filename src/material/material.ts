@@ -1051,7 +1051,7 @@ export class Material extends Resource implements Drawable {
     pipeline: GPURenderPipeline,
     opts: MaterialOptions,
   ) {
-    super();
+    super('MATERIAL_DISPOSED');
     const r = generated.resolved;
     this.#device = device;
     this.#cache = deviceCache(device);

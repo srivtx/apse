@@ -244,6 +244,15 @@ dynamic offset per draw. As laid out: `model` (mat4x4f, 64 bytes at offset 0),
 `objectId` and `instanceId` (u32 at 112 and 116), `visibility` (f32 at 120). That
 is 124 bytes of data and 128 of struct.
 
+**A `mat3x3f` is padded, and a producer that ignores that produces `NaN`.** The
+consumer reads column *j* at `j * 4`, so a producer writing a tightly packed
+9-float matrix makes indices 9 and 10 read past the end of the array. `pack()` takes
+a 12-float scratch and leaves 3, 7 and 11 at zero; `normalMatrixOf` in
+`renderer.ts` writes into exactly that shape, and `IDENTITY_NORMAL` is stored in it
+too. This shipped as a bug — `obj.normalMatrix` arrived as `(1,NaN,NaN)` for an
+identity transform and saturated every lit surface — so it is in
+[Invariants learned the hard way](#invariants-learned-the-hard-way) as well.
+
 The stride between objects is **256 bytes**, not 124 and not 128.
 `minUniformBufferOffsetAlignment` is 256 on every profile and every dynamic offset
 must be a multiple of it. Object 1 at offset 128 is invalid, and it surfaces as a
@@ -315,12 +324,55 @@ in the machine fixes it.
    mid-pass; a pipeline change *within* a phase does not need a new pass. The
    colour format is checked against the target before `setPipeline` — a mismatch
    invalidates the whole command buffer with no exception, and Dawn's message names
-   two format enums rather than the mistake.
-7. **submit** — one `queue.submit`.
+   two format enums rather than the mistake. The per-instance vertex buffer, if
+   the draw item has one, is bound to **slot 1** immediately before the draw.
+6b. **present** — one more pass, on the *same* encoder, after the scene passes have
+   ended: a fullscreen triangle, the HDR intermediate as a sampled texture, and
+   the ACES curve out to the canvas. On by default, and the reason the scene
+   target is `rgba16float` rather than the canvas — so every material has to be
+   compiled for `renderer.sceneFormat`. `toneMapping: null` skips the pass
+   entirely and gives back the direct path; `hdr: false` keeps the pass but drops
+   the intermediate to the destination's own format, which is the version where a
+   tone map is fed an already-clipped image and is nearly a no-op. Neither escape
+   is free, which is why the default is the slow one.
+7. **submit** — the timestamp readback is *encoded* first, into the same command
+   buffer and after every stamped pass has ended:
+
+   ```txt
+   resolveQuerySet(querySet, 0, pairs*2, resolve, 0)
+   copyBufferToBuffer(resolve, 0, staging[slot], 0, byteSize)
+   ```
+
+   Both are commands on the queue, so they must sit in the same command buffer as
+   the passes they measure. Encoded after them, they observe this frame's
+   timestamps; encoded into a different buffer, the result travels through the CPU
+   and lands a frame later than it needs to. A mapped buffer cannot be a copy
+   destination, which is why there is a staging buffer at all — and why there are
+   at least **two** of them, so this frame's copy never lands on the buffer the
+   previous frame's `mapAsync` is still using.
+
+   Then one `queue.submit`, and `GpuTimer.poll()`. Never awaited. The `mapAsync`
+   cannot resolve until the copy has actually run on the queue, and blocking here
+   would stall every frame for a number the caller cannot act on until the frame
+   after anyway. The reading therefore lands one or two frames late, which is why
+   `stats.gpu` is a trend and not a verdict — and why the previous behaviour,
+   reporting a hardcoded `0`, was not a simplification but a lie on every frame.
 8. **stats** — `FrameStats` over a rolling window, plus budget checks. Averaged
    rather than per-frame because one slow frame is a GC pause, not a regression;
    the window is the difference between a budget that reports a problem and one
-   that fires every time a shader finishes compiling.
+   that fires every time a shader finishes compiling. `gpu` is `null` when no
+   reading arrived, and `NaN` — not `0` — goes into the averaging ring, because a
+   `0` there would be averaged in as though the GPU had been timed at zero. The
+   `gpu` budget is checked only when a measurement exists.
+
+**Three timestamp pairs, never a fourth.** A frame can open an opaque pass, a
+transparent pass, and the present, and **a write index may be written only once per
+submission** — opening a pair in one pass and closing it in the next is a
+validation error, and a validation error on a render pass discards the pass. One
+pair would time whichever pass happened to carry it, which on a transparent-heavy
+frame is the wrong one. Pairs past the ones a frame actually stamped are skipped
+rather than summed, so a frame that opened one pass cannot be credited with a
+present pass it did not have.
 
 **`render()` is synchronous on purpose.** Every caller that wants a frame *now* — a
 test, a benchmark, a screenshot, one draw into a readback buffer — should not have
@@ -330,9 +382,13 @@ synchronous `render()`.
 
 **`start()` clamps dt to 100 ms** because a backgrounded tab resumes with a delta
 of seconds and `position += velocity * dt` teleports. Clamping once, here, means no
-user code has to. Note that the uniform's `frame.delta` is written from
-`#lastDelta`, which the frame loop never advances — a shader reading `frame.delta`
-sees 0 today. `frame.time` and `frame.elapsed` are correct.
+user code has to. The clamp is applied to the uniform as well as to the callback:
+`#lastDelta` is what `frame.delta` is written from, so a shader that integrates
+from `frame.delta` sees the same clamped value the callback does, and a frame
+driven by `renderer.render()` directly — with no `dt` of its own — sees the wall
+clock delta, clamped the same way. An earlier version of this file said
+`frame.delta` was always 0 because the loop never advanced `#lastDelta`; that was
+true when it was written and is not now.
 
 `capture()` is the only supported way to get pixels out of a canvas, and it does so
 by rendering to an offscreen `COPY_SRC` target and copying out of it. A WebGPU
@@ -496,11 +552,13 @@ leaves layouts, pipelines, and samplers, none of which has a `destroy()`.
 
 ## The error contract
 
-Every error carries five things: `code` (a stable slug — branch on this, never on
-`message`), `message` (what you asked for and what was there, values interpolated),
-`why` (the technical rule violated), `fix` (the single corrective action), and
-`link` (the docs anchor for that code). All five are on every error; no code path
-produces a bare `Error`. `toString()` is `CODE: message — fix: <fix>`; `toJSON()`
+Every error carries six things of its own: `code` (a stable slug — branch on this,
+never on `message`), `why` (the technical rule violated), `fix` (the single
+corrective action), `link` (the docs anchor for that code), `blame` (whose fault it
+is, from the mapped table below) and `detail` (structured context, `undefined`
+where a code has none), plus `message` from `Error`. All are on every error; no
+code path produces a bare `Error`. `toString()` is
+`CODE: message — fix: <fix>`; `toJSON()`
 is the structured form. `isAseError` also matches on `name`, so it survives two
 copies of the library in one graph.
 
@@ -516,6 +574,35 @@ wrong is a finite, enumerable, typed value**, so a caller or an agent can read
 a structured payload (`{ kind: 'numeric', field, value, min, max }` and friends) so
 a handler can branch on the value rather than parse the message.
 
+**Every code is classified by blame, and the classification is also a mapped type.**
+`ERROR_BLAME: { [C in AseErrorCode]: ErrorBlame }`, over
+`'library' | 'caller' | 'environment'`. The distribution is one `library`,
+37 `caller`, 4 `environment` — and the distinction is a separate value rather than
+an implication of the code so a handler can branch on it without a 42-entry switch.
+It exists because `INTERNAL_INVARIANT` reads "this always indicates a bug in apse",
+and the most-raised code is the one whose guidance says the fault was not yours: a
+previous audit counted 55 of 140 `fail()` call sites, and re-counted against the
+source today it is **71 of 203** (sites outside `error-catalog.ts` itself, counted
+as `fail('` occurrences). `blame` makes the claim checkable at the point of the
+throw instead of a convention.
+
+**Two codes were deleted for being unreachable, and the count did not change.** A
+previous audit found 42 codes of which 2 could never fire. `VARYING_MISMATCH` is
+*structurally* unrepresentable — one `varyings` declaration generates the
+`Varyings` struct for both stages, so the two halves cannot disagree — and
+`SHADER_NO_ENTRYPOINT` is not a failure mode, because the scaffold always emits
+`vs` and `fs`. Both are gone, and two lifecycle codes were added in their place:
+`RESOURCE_DISPOSED` for taking a reference on something already released, and
+`INVALID_USAGE`. **A code nobody can reach is a lie in a public API**, and the
+guarantee belongs in the type system, which is a stronger place for it.
+
+The classification is only as good as the code paths feeding it, and one gap is
+still open: `Material` and `GpuMesh` both call `super()` with no disposed code, so a
+released one raises the `INTERNAL_INVARIANT` default — a `library`-blamed code for
+a `caller` mistake — and `GpuMesh` does not call `assertLive` at all. The mechanism
+(`Resource.assertLive(what, code)`, with a test asserting that a material and a mesh
+report different codes) exists; the two `super()` arguments do not.
+
 **Programmer error throws; capability failure returns.** *A wrong argument throws, a
 missing capability returns.* `requestDevice` rejecting because the adapter lacks a
 limit you asked for is a bug in your code. A loader failing to find a file, or a
@@ -526,7 +613,8 @@ tell a typo from a missing file. So they are different types and the compiler sa
 which before anything runs. `isOk`/`isErr` narrow, `unwrap`/`unwrapOr` are the
 deliberate escape hatches, and `attempt` turns a throwing callback into a `Result`
 for the places where an error must become a value — a loop over many assets where
-one failure should not abandon the rest.
+one failure should not abandon the rest. A device without `timestamp-query` follows
+this rule: it is an `Err` the constructor unwraps into "no timer", not a throw.
 
 `validateBodyIdentifiers` and `validateGeneratedWGSL` are the agent-facing half of
 this contract. Between them, the class of failure an agent is most likely to
@@ -593,7 +681,12 @@ breaks it.
 
 Optional features are **detected, never required**: `timestamp-query` is on roughly
 44% of devices and quantised to 100 µs, `subgroups` is Chromium-only, and requiring
-either would make device creation fail on exactly the devices that lack them.
+either would make device creation fail on exactly the devices that lack them. The
+`GpuTimer` is the worked example of the rule — `GpuTimer.create` returns an `Err` on
+a device without the feature, the constructor takes `isErr` and keeps a `null` timer,
+and every downstream consequence is expressed as a `null` measurement rather than an
+exception. `requireFeature` / `hasFeature` / `readCapabilities` are the same probe
+exposed to callers.
 
 ---
 
@@ -602,22 +695,54 @@ either would make device creation fail on exactly the devices that lack them.
 Everything here is absent, not merely rough. This is the section that stops someone
 building on a capability that does not exist.
 
-**No instancing, so every object is a draw call.** `DrawableGeometry` carries
-`instanceCount` and `firstInstance`, `GpuMesh` accepts them, and `renderer.ts` passes
-them to `draw`/`drawIndexed` — but nothing constructs an instanced draw and no
-material reads a per-instance attribute. A 5,000-object scene is 5,000 draw calls.
-`ObjectData` has an `instanceId` field and `firstInstance` is threaded through the
-whole pipeline; what is missing is the vertex-side buffer and a `stepMode:
-'instance'` layout.
+**Instancing works, and it is one `MeshNode`.** `InstanceData` → `uploadInstances`
+→ a `GpuInstances` bound to vertex slot 1 with `stepMode: 'instance'` → one
+`drawIndexed` with the count in it. `test/render.test.ts` asserts the observable
+claim directly: 1,000 instances produce `drawCalls === 1` and a `drawIndexed` whose
+instance count is 1,000. The per-instance stream is a **vertex buffer, not a storage
+buffer**, precisely because compatibility mode zeroes
+`maxStorageBuffersInVertexStage` — the alternative compiles on a laptop and fails on
+a phone. One object-uniform slot covers the whole draw; the renderer packs the model
+matrix **once per draw item, never once per instance**, because looping there would
+write the same 256 bytes N times into N slots and N−1 of them would be read by
+nobody.
 
-**No batching or merging.** No atlas, no draw-call merging, no sorting beyond the
-material grouping in step 3. Draw count equals visible object count.
+The guard in the encode loop is `instanceBuffer !== null`, and it must stay that
+way. `instanceCount > 1` skips the slot on a mesh that was uploaded with a thousand
+instances and asked to draw one of them — an ordinary call, and the pipeline still
+declares slot 1, so the vertex stage reads whatever happens to be bound there: a
+wrong image and no error. `instanceCount > 0` is worse; it is a scene-level test
+that says nothing about what the layout declares.
 
-**No post-processing.** No tone map, no bloom, no FXAA, no grading. `frame.exposure`
-is in the block and the PBR material deliberately does *not* apply it, assuming a
-present pass will — and that pass does not exist. Building one means rendering to a
-`createColorTarget`, writing a material that samples it, and presenting it;
-`createColorTarget` exists to make that possible.
+What is still missing: `MeshNode.boundingRadius` is the caller's, so an instanced
+draw is culled by the one node's sphere and a grid wider than that sphere culls
+itself. `firstInstance` and `instanceCount` narrow a range but the bounds do not
+follow.
+
+**Batching exists: `mergeMeshes` → `uploadBatch`.** One vertex buffer, one index
+buffer, many index ranges — the opposite trade from instancing, for static geometry
+that differs per piece rather than repeating. Vertex count, index count, layout,
+topology and index width are all *derived* from the inputs, so the merged
+`MeshData` is constructed rather than accumulated and the two buffers cannot
+disagree. A non-indexed source is given a generated `[0, 1, 2, …]` run, so a batch
+is always drawn with `drawIndexed`. **Baked normals are renormalised**, and that is
+not redundant: baking under a non-uniform scale leaves a normal at the wrong length,
+which is equivalent to nothing except for a rigid transform — the case you will not
+test. There is no atlas, no texture array, and no LOD selection.
+
+**There is a present pass, and there is no post-processing chain.** `PresentPass`
+renders the HDR intermediate through an ACES curve to the canvas, by default, on
+every frame. It is also where MSAA lives: `createCanvasTarget` refuses
+`sampleCount: 4` because `getCurrentTexture()` is never multisampled, so 4× is
+built by hand in the intermediate and resolved by the same fullscreen pass. That
+mechanism is shared, which is why `hdr` and `sampleCount` are one code path.
+
+What does not exist is a *chain*. There is one pass, always the last one, sampling
+exactly one texture, and the scaffold rejects more than one `targets` entry because
+the generated fragment entry point returns a single `@location(0) vec4f`. No bloom,
+no FXAA, no grading, no user-insertable pass. `frame.exposure` is in the uniform
+block and the present pass applies it; the PBR material deliberately does not,
+which is why a material rendering into the scene target stays linear.
 
 **Shadows are not wired up in the default PBR path.** `pbrMaterial({ shadows: true
 })` is real — it declares a `depth-2d` slot with a comparison sampler, adds a 3×3
@@ -645,22 +770,58 @@ compatibility *profile* is supported; a compatibility *fallback to WebGL* is not
 never will be — the scaffold generates WGSL, and the alternative would be a second
 shader language.
 
-**GPU timing requires `timestamp-query`, feature-detected and often absent.**
-`AseDevice.hasTimestampQuery` reports it. `FrameStats.gpu` is `0` on every frame
-regardless: the query buffers are not implemented and `averageGpu` is the mean of
-zeros. Treat the GPU column as unimplemented, not as a measurement of zero.
+**GPU timing works, and it is `number | null`.** `GpuTimer` is created only when the
+device has `timestamp-query`, which is on roughly 44% of devices — a device without
+it is a fact about the machine, not a caller error, so it is `isErr` and not a
+throw. `stats.gpu` is `null` on such a device and `stats.gpuTimingAvailable` is
+`false`, and the `gpu` field of `RenderBudget` is checked only when a measurement
+exists. This is a **breaking change** from a hardcoded `0`, and the reason is that
+`0` reads to every consumer as "the GPU was idle". `null` (no measurement) and `0`
+(a measurement of nothing) are different facts. Two further limits: the reading is
+1–2 frames late by construction, and `timestamp-query` quantises to 100 µs, so it is
+coarse even where it works.
+
+**`MATERIAL_DISPOSED` and `MESH_DISPOSED` are catalogued and not raised.**
+`Resource.assertLive` takes the code as a parameter and `Resource.ref()` raises
+`RESOURCE_DISPOSED` itself, both tested. But `Material` and `GpuMesh` both call
+`super()` with no code, so they inherit the `INTERNAL_INVARIANT` default — a
+`library`-blamed code for a `caller` mistake, which is the exact failure the
+`blame` field exists to end. `GpuMesh` does not call `assertLive` at all. The fix
+is one argument in each of the two constructors.
+
+**The compiler's real diagnostic, and what replaced it.** `SHADER_COMPILE_FAILED`
+used to quote WebGPU's error-scope text, which is a wrapper: it names a stage and a
+validation rule, its stage attribution is frequently wrong — a fragment-body typo
+reported as a vertex-stage error — and it carries no line or column, while the
+`fix` asserted that the offending line was named. `getCompilationInfo()` has the
+real thing and it is now called. Three properties it has to keep: the stage is
+**derived from the line** by `stageAtLine`, never assumed; the *whole* diagnostic
+list goes into `why` with `lineNum`, `linePos`, the message, and an excerpt of the
+offending source line, because a line number in a 3 KB program that is mostly
+generated is not actionable on its own; and it **degrades rather than throws** —
+no `getCompilationInfo`, a rejected promise, or a message list with no `messages`
+all fall back to the scope text *and say so*. The earlier bug was truncating to
+fit a headline and losing the rest.
+
+**Two of the nine diagnostic scenarios have since been fixed and nobody has
+re-measured.** The scorecard in `bench/diag/README.md` reads better 5 · worse 2 ·
+equal 2. The two "worse" rows were the WGSL-syntax-error stage attribution above
+and `RENDERER_ALREADY_DISPOSED` being unreachable (a disposed renderer raised
+`DEVICE_LOST` with a `fix` telling you to ignore your own teardown; it now checks
+`#disposed` first). Both are fixed in `src/`; re-running `bench/diag/run.ts` is
+what would let the published number move.
 `timestamp-query` values quantise to 100 µs, so it is coarse even where it works.
 
-**MSAA needs an offscreen target, because a canvas texture cannot be multisampled.**
-`getCurrentTexture()` always returns a single-sample attachment, so
-`createCanvasTarget` refuses `sampleCount: 4` rather than ignoring it. A 4× path
-allocates two colour textures — the multisampled one you render into, and the
-single-sample one the resolve writes into — and only the second is sampleable by a
-later pass, because binding a multisampled texture as a sampled texture is a
-validation error, not a blurry result. `createCanvasTarget` hard-codes `sampleCount:
-1` and `render()`'s default target is the canvas, so **MSAA is unreachable from the
-default path**; the plumbing is in `#encode` (it reads `target.sampleCount` and sets
-`resolveTarget`), but you must pass an offscreen target and present it yourself.
+**MSAA is reachable from the default path, and the depth attachment is not optional.**
+`createCanvasTarget` refuses `sampleCount: 4` because `getCurrentTexture()` is never
+multisampled, so 4× lives in the present pass's intermediate: two colour textures,
+the multisampled one you render into and the single-sample one the resolve writes
+into, and only the second is sampleable by a later pass — binding a multisampled
+texture as a sampled texture is a validation error, not a blurry result. The
+intermediate always carries **depth**, even though the present pass never reads it,
+because the scene's pipelines declare `depthStencil` and a render pass that omits a
+depth attachment against such a pipeline is a validation error that discards the
+pass including its clear: the symptom is a uniformly black frame with no error.
 
 **One colour attachment.** The scaffold rejects more than one `targets` entry,
 because the generated fragment entry point returns a single `@location(0) vec4f`. A
@@ -670,15 +831,92 @@ second channel goes in a second pass that reads the first target as a texture.
 a complete statement of apse's floor, not because anything uses them. There is no
 compute pipeline, no storage buffer, no workgroup API.
 
-**Format portability is not automatic.** `depth24plus` is the default because it is
-renderable as a depth-stencil attachment everywhere; `depth32float` gives full range
-but is not universally renderable. A material's colour format is baked into its
-pipeline at creation, so it is permanently bound to that format — and the canvas
-format is `bgra8unorm` on desktop, `rgba8unorm` on Android, so a hardcoded default is
-wrong on one of them. Pass `targetFormat` explicitly for an offscreen target.
+**Format portability is not automatic — and the default now depends on it.**
+`depth24plus` is the default because it is renderable as a depth-stencil attachment
+everywhere; `depth32float` gives full range but is not universally renderable. A
+material's colour format is baked into its pipeline at creation, so it is
+permanently bound to that format. Because the present pass is on by default, the
+scene target is `rgba16float` and **every material must be built with
+`{ targetFormat: renderer.sceneFormat }`** — one built for
+`getPreferredCanvasFormat()` fails through `assertDrawable` naming both formats,
+which is the intended trade against a command buffer invalidated whole. The canvas
+format is `bgra8unorm` on desktop and `rgba8unorm` on Android, so a hardcoded
+default is wrong on one of them even in the direct path.
 
 **Draw items need a real material.** `collectDrawItems` reads `node.material.phase`
 and `node.material.renderPipeline`, so a test double must supply those fields.
+
+---
+
+## Invariants learned the hard way
+
+Every item here is a bug that shipped, was found, and now has a test that fails on
+the old code. They are listed because each one failed *silently* — a valid pipeline,
+a legal draw, no validation error, and a passing test.
+
+**`vec4f(in.position, 1.0)` is the fullscreen triangle's clip position, and the
+`1.0` is `w`.** `in.position` is a `vec3f`, so the fourth component appended here
+becomes the clip-space `w` — the divisor of the perspective divide. With `w = 0`,
+every vertex of the triangle lands on the same point, nothing rasterises, and the
+present pass shows the destination untouched: a black screen, forever, with a valid
+pipeline and a legal draw and the fragment stage never entered. It shipped as
+`vec4f(in.position, 0.0)`, and **the unit test asserted the literal**, so the test
+recorded the implementation rather than the intent and passed for as long as the bug
+existed. `z` comes from the mesh and is 0, the near plane in apse's `[0, 1]` clip
+space, so the triangle still passes a `less` depth test against a cleared
+attachment — which is why depth was never the clue.
+
+**A test that asserts a bug will keep the bug.** The generalisation, and the reason
+the case above is worth more than the fix. When a test's expectation is copied from
+the code, it is a description of the present, not a claim about the right answer, and
+it converts a silent defect into a *pinned* silent defect. A regression test should
+be written from the property the code is supposed to have — "the tone map changes
+the image" — and not from the expression it happens to use. A test that fails when
+the output goes black would have caught this one.
+
+**The instancing guard is `instanceBuffer !== null`, never `instanceCount > 1`.** The
+count is not a substitute in either direction. A mesh uploaded with a thousand
+instances and asked to draw one of them has `instanceCount === 1` and a non-null
+buffer; test the count and slot 1 is never bound, the pipeline still declares it, and
+the vertex stage reads whatever happens to be there — a wrong image and no error.
+`instanceCount > 0` is a scene-level test that says nothing about what the layout
+declares.
+
+**A `mat3x3f` in a uniform block is three 16-byte-aligned columns of four floats.**
+`ObjectUniforms.pack` reads column *j* at `j * 4`, so a producer writing a tightly
+packed 9-float matrix makes the consumer read indices 9 and 10 past the end of the
+array, which arrive as `NaN`. The result was `obj.normalMatrix` =
+`(1,0,0), (1,0,0), (1,NaN,NaN)` for an identity transform, which saturates every
+lit surface. `normalMatrixOf` writes a padded **12**-float scratch for this reason,
+with indices 3, 7 and 11 left at zero, and `IDENTITY_NORMAL` is in the same padded
+layout. Take offsets from `buildUniformBlock` / `OBJECT_BLOCK`; never hand-compute
+one.
+
+**A bounds computation needs a finiteness check, not just a comparison.** A `NaN`
+vertex propagating through the AABB produces a *finite* bound that does not contain
+the mesh, and the frustum then rejects it — silently dropping a visible object at
+cull time, with a draw list that looks right and a hole in the scene. `MeshData`
+rejects a non-finite position with the vertex index named, and the same check runs
+on the per-attribute source arrays.
+
+**Merged normals are renormalised, and that is not redundant.** Baking a normal
+through a transform leaves it at the transform's length, which is correct only for
+a rigid one — precisely the case a test uses. Under a 2:1:1 scale a normal came out
+at length 0.5, and a normal of length 0.5 still renders a plausible image.
+
+**Winding order has no validator.** `capsule()` shipped with all 168 triangles wound
+inside-out: invisible from outside and inside, with a valid index buffer and a valid
+pipeline. A mesh that faces the wrong way is not a validation error in WebGPU, it is
+a culled draw.
+
+**A timestamp write index may be written once per submission.** Opening a pair in
+one pass and closing it in the next is a validation error, and a validation error on
+a render pass discards the pass. Three pairs, one per pass a frame can open, and
+pairs past the ones actually stamped are skipped rather than summed.
+
+**`resolveQuerySet` and `copyBufferToBuffer` are encoded, never awaited**, and into
+the same command buffer as the passes they measure. `mapAsync` is polled after
+submit and never awaited, so the reading is 1–2 frames late by construction.
 
 ---
 
@@ -701,55 +939,70 @@ validation error invalidates a pass without throwing), reads the framebuffer bac
 
 ### The numbers
 
-Apple M-series GPU, headless Chrome 153, 1280×720, CPU milliseconds per frame, median
-of 60 samples, same process and device. Objects are laid out in a grid, not at the
-origin, so nothing is trivially culled.
+Apple M3, `compatibility`, headless Chrome, 1280x720, p50 of 120 samples x 3 trials,
+three.js r186 on WebGL2 in the same process. `bun run bench:perf`.
 
-| scene | apse | three.js | ratio |
-|---|---:|---:|---:|
-| 1000 cubes | 0.70 | 1.00 | 1.4× |
-| 2000 cubes | 1.30 | 2.00 | 1.4× |
-| 4000 cubes | 2.60 | 3.90 | 1.5× |
-| 5000 cubes | 3.90 | 4.70 | 1.2× |
-| 1000 spheres (720k tris) | 0.70 | 1.30 | 1.9× |
+| scene | apse/draw | apse/instanced | three.js/draw | draws saved |
+|---|---:|---:|---:|---:|
+| 1,000 objects | 0.740 ms | **0.012 ms** | 0.675 ms | 1,000 -> 1 |
+| 10,000 objects | 7.250 ms | **0.013 ms** | 5.750 ms | 10,000 -> 1 |
+| 100,000 objects | 86.675 ms | **0.012 ms** | 65.725 ms | 100,000 -> 1 |
 
-JS heap: apse 10.4–42.5 MB against three.js 42.0–61.3 MB for the same scenes.
+The architecture-relevant number is that **instanced CPU cost is flat in instance
+count.** One draw costs the same whether it carries 1,000 instances or 100,000, so
+the per-draw cost that dominates every other frame in this table is absent rather
+than amortised. Per-instance transforms arrive as vertex attributes at slot 1 and
+are transformed in the vertex stage, not read from a per-object uniform slot, so
+there is nothing per-instance to serialise on the CPU side.
 
-**What these numbers do and do not show.** They are 1.1–1.9×, not 5×, and the reason
-is in the draw counts: every scene above is one draw call per object, 1,000 to 5,000
-of them. At that scale both libraries are bottlenecked by per-draw WebGPU/WebGL API
-cost, not by scene-graph or cache overhead, so the savings from a static transform
-pass or a shared uniform buffer are a small fraction of the frame. The 1,000-sphere
-row is the most favourable because per-draw cost is spread over 720 triangles each.
-Do not extrapolate this table to a scene apse is structurally better at, and do not
-quote it as 5×.
+The per-draw marginal cost — 0.87 us against three.js's 0.66 us — is the number
+apse still loses on, and it is stable from 1,000 to 100,000 draws. Frame time is
+85-100% per-draw encode; the scene-graph walk, sort and uniform pack together are
+under 15%. `setBindGroup` fires once per object, which is the specific call to
+attack if the per-draw path is ever optimised.
 
-The honest summary: **apse wins on bundle size and memory by a wide margin, wins
-modestly on CPU frame time, and its advantage should grow where the per-draw cost is
-amortised — which is instancing and batching, neither implemented.**
+**There is no GPU-side millisecond here.** This device exposes no
+`timestamp-query`, so `stats.gpu` is `null` and every end-to-end figure is a
+CPU-side wait. The 100,000-object row is measured once, not established:
+`bun run bench:perf` has crashed at the top of that sweep. Full caveats, including
+that the instanced rows use static transforms and a moving scene re-uploads
+32.8 MB/frame at 5,000 objects, are in `bench/diag/perf/README.md`.
 
 ### Bundle size
 
-This is the wide-margin result, and it is enforced rather than asserted.
+This is the wide-margin result, and it is enforced rather than asserted. `bun run
+build` on an Apple M3, 2026-09-28, gated by `scripts/size-gate.ts`.
 
-| entry | gzip | budget |
-|---|---:|---:|
-| `index` (all of it, incl. every chunk) | 55.3 KB | 60 |
-| tree-shaken app | 43.5 KB | 48 |
-| `render` | 38.9 KB | 40 |
-| `material` | 21.6 KB | 24 |
-| `scene` | 10.4 KB | 13 |
-| `geometry` | 9.7 KB | 12 |
-| `core` | 7.7 KB | 10 |
-| `math` | 6.6 KB | 8 |
+| entry | raw | gzip | brotli | ceiling |
+|---|---:|---:|---:|---:|
+| `index` (all of it, incl. every chunk) | 284.21 KB | 95.87 KB | 78.87 KB | 110.3 |
+| `render` | 206.18 KB | 69.95 KB | 58.14 KB | 80.4 |
+| `material` | 165.01 KB | 56.04 KB | 47.29 KB | 64.4 |
+| `geometry` | 92.62 KB | 32.64 KB | 27.51 KB | 37.5 |
+| `scene` | 43.88 KB | 16.34 KB | 13.71 KB | 18.8 |
+| `math` | 30.66 KB | 11.66 KB | 9.52 KB | 13.4 |
+| `core` | 22.37 KB | 8.74 KB | 7.42 KB | 10.1 |
+| **tree-shaken app** | 205.91 KB | **71.23 KB** | 59.24 KB | 81.9 |
 
-Two measurement details make these honest. Sizes are for the **full reachable module
-graph** per entry, not the entry file: measuring `index.js` alone reports 2.5 KB for a
-complete renderer, because code splitting moved the substance into chunks and the
-entry became a re-export list — a consumer downloads the entry and everything it
-transitively imports. And compression is measured on the concatenation, because a
-bundler serving all chunks in one response gets one shared dictionary and per-file
-numbers overstate the cost.
+Every entry sits at 87% of its ceiling, and the gate prints that percentage on every
+run so a regression is visible as "now at 92%" long before it fails at 100%.
+
+**The headline moved, and the direction of the move is the point.** The tree-shaken
+app was 45.3 KB and a 2.9× win when the present pass and the timestamp layer did
+not exist. Together they cost 26 KB, so the number is 71.23 KB and the win is
+**1.87×**. That is the price of two fixes: a tone map that was collapsing the
+fullscreen triangle to a point and presenting a black screen, and a `stats.gpu` that
+reported a hardcoded `0` for a GPU nobody had measured. Reporting 1.87× with the
+reason attached is worth more than reporting 2.9×, because 2.9× stops being true
+the moment somebody runs the build.
+
+Two measurement details make the table honest. Sizes are for the **full reachable
+module graph** per entry, not the entry file: measuring `index.js` alone reports a
+few KB for a complete renderer, because code splitting moved the substance into
+chunks and the entry became a re-export list — a consumer downloads the entry and
+everything it transitively imports. And compression is measured on the
+concatenation, because a bundler serving all chunks in one response gets one shared
+dictionary and per-file numbers overstate the cost.
 
 The "tree-shaken app" row is the headline and the only measurement that tests the
 claim the library actually makes. `bench/tree-shake.ts` is a realistic minimal app —
@@ -760,30 +1013,37 @@ is a number in CI that fails when the claim stops being true.
 
 `scripts/size-gate.ts` is the second half of that defence, and it exists because the
 build can check its own arithmetic but not its own claims. It re-reads the report and
-fails if the tree-shaking claim is false — that the bundle actually dropped the unused
-primitives, checked by looking for their markers, with a positive control beside it
-because a check that cannot fail is not a check. It also verifies every `exports`
-subpath and every `typesVersions` target has a built file, which is otherwise
-invisible until somebody runs `npm install`.
+fails if the tree-shaking claim is false — that the bundle actually dropped the
+unused primitives, checked by looking for their markers, with a positive control
+beside it because a check that cannot fail is not a check. It also asserts the layer
+DAG and the per-entry module counts (so an entry that quietly absorbs a dependency
+trips nothing but is caught here), and verifies every `exports` subpath and every
+`typesVersions` target has a built file, which is otherwise invisible until somebody
+runs `npm install`. `checkBudgetAgrees` re-reads `scripts/build.ts` and fails if the
+two copies of the ceilings ever drift.
 
 For comparison, three.js at 0.186.1 tree-shaken for an equivalent PBR scene —
 `WebGLRenderer`, `MeshStandardMaterial`, `BoxGeometry`, `Scene`, `Mesh`,
 `PerspectiveCamera`, `AmbientLight`, `DirectionalLight` — measures **131.5 KB
 gzip** (524 KB raw) under the same bundler, recorded as the **133 KB** baseline
-constant in `scripts/size-gate.ts`, against apse's 43.5 KB for that scene plus a
-PBR material, a scene graph, and a frame loop.
+constant in `scripts/size-gate.ts`, against apse's 71.23 KB for that scene plus a
+PBR material, a scene graph, a present pass, a timer and a frame loop.
 
 ### What would move the numbers
 
-Roughly in order of leverage:
+Roughly in order of leverage. Instancing and batching have moved from this list —
+both ship, and the CPU comparison is being re-measured against them — so what is
+left is:
 
-1. **Instancing and batching.** The largest available win, and the reason the CPU gap
-   is only 1.4×. The plumbing is in place — `instanceCount`, `firstInstance`,
-   `obj.instanceId`, the pass-through to `drawIndexed` — so this is a vertex-side
-   buffer plus a `stepMode: 'instance'` layout, not a redesign.
-2. **Culling beyond the frustum.** The current pass is a sphere test against six
+1. **Culling beyond the frustum.** The current pass is a sphere test against six
    planes on every drawable node every frame. A BVH or a screen-space tile structure
-   would turn the sphere scene's 1000 tests into a few hundred.
+   would turn the sphere scene's 1000 tests into a few hundred. This is now the
+   largest remaining structural cost, because instancing removed the per-draw term
+   and left culling as the thing that scales with node count.
+2. **Bounds for instanced draws.** `MeshNode.boundingRadius` is the caller's, so a
+   100,000-instance grid is culled by one sphere. Deriving a bound from the instance
+   buffer — one pass over the transforms at upload — is the change that makes
+   instancing safe above the radius it happens to be given.
 3. **A cheaper sort.** `Array.sort` over 5,000 items every frame with a five-key
    comparator. A pre-sorted array plus a dirty range, or a counting sort on
    `(material, order)`, would help; the depth key has to be recomputed regardless,
@@ -791,9 +1051,18 @@ Roughly in order of leverage:
 4. **Pre-compiling pipelines.** `Material.create` is already async — compilation is
    two to five seconds cold and must not block the main thread — but nothing warms
    the cache ahead of time. Building the materials a scene will need before it is
-   first shown removes the hitch.
+   first shown removes the hitch. `Renderer.create` is the other place it matters:
+   it awaits the present pass for exactly this reason.
 5. **Nothing in the frame loop allocates**, and that is worth keeping. Scratch buffers
    in `renderer.ts`, `node.ts`, and `graph.ts` are module-level and reused, walk
    stacks are pooled and re-entrant, draw items are pooled by index. Any new per-frame
    allocation is a regression the young generation hides on average and punishes at
-   the worst moment.
+   the worst moment. The transform-only instance record is the same rule taken
+   further: with no per-instance colour, the bytes `writeBuffer` sends are the
+   caller's own array, with no copy — 320 KB a frame at 5,000 instances that a copy
+   would cost.
+6. **The present pass costs 26 KB of bundle for one fullscreen draw.** If the HDR
+   intermediate and the tone map are what stand between apse and its old 2.9×, that
+   is a decision worth revisiting deliberately rather than by accident — for
+   instance by making `hdr` the flag that actually buys something and `toneMapping`
+   the one that is cheap.

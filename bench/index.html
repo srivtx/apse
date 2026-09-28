@@ -260,9 +260,13 @@ async function measureThree(spec) {
 async function readback() {
   const { Scene, MeshNode, PerspectiveCamera, renderer, material, geometries } = apse;
   const { basicMaterial: mkBasic } = await import('/dist/index.js');
-  const basic = await mkBasic(renderer.device.device);
+  // The present pass makes the scene format rgba16float, so every material has
+  // to be compiled for it. Omitting this is a hard format mismatch, not a dark
+  // image — and it throws out of render() before the readback, which is how it
+  // was found.
+  const basic = await mkBasic(renderer.device.device, { targetFormat: renderer.sceneFormat });
   basic.setSlot('tint', [1, 0.35, 0.1]);
-  const floor = await mkBasic(renderer.device.device);
+  const floor = await mkBasic(renderer.device.device, { targetFormat: renderer.sceneFormat });
   floor.setSlot('tint', [0.09, 0.10, 0.13]);
   floor.setSlot('opacity', 1);
 
