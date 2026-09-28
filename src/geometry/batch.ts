@@ -203,8 +203,6 @@ export function mergeMeshes(sources: readonly BatchSource[], opts: BatchOptions 
 
   const merged = layout.allocate(totalVertices);
   const indices = allocateIndices(totalVertices, totalIndices);
-  const indexFloats = merged.length; // unused; kept for clarity of the two walks below
-  void indexFloats;
 
   const position = layout.attribute('position')!;
   const normal = layout.attribute('normal');
@@ -390,9 +388,18 @@ function asMatrix(m: ArrayLike<number>, meshName: string, batchName: string): Fl
  * The inverse transpose is not a nicety. Under a non-uniform scale, the upper
  * 3×3 maps a direction to a direction of the wrong *length and angle*, and
  * feeding that to a fragment shader changes the lighting: a sphere squashed to a
- * 2:1:1 ellipsoid shades like a sphere twice as long as it is wide. The
- * tangent goes through the plain 3×3 — it is a direction, not a covector — and
- * its handedness flips when the matrix mirrors, which is a negative determinant.
+ * 2:1:1 ellipsoid shades like a sphere twice as long as it is wide. The tangent
+ * goes through the plain 3×3 — it is a direction, not a covector — and its
+ * handedness flips when the matrix mirrors, which is a negative determinant.
+ *
+ * The result is then **renormalised**, and that is not redundant. The inverse
+ * transpose of a non-uniform scale is not an orthonormal matrix: it is a linear
+ * map, so a unit normal comes out the right *direction* at the wrong length —
+ * a +X normal under a 2:1:1 scale comes out with length 0.5. A shader that
+ * normalises it recovers the direction, but a shader that does not — and a
+ * half-written one does not — shades the surface with a short normal, which is a
+ * different amount of light rather than a different direction. The divide is
+ * three per vertex, once, at bake time.
  */
 function bake(
   out: Float32Array,
@@ -445,12 +452,17 @@ function bake(
     out[d + pos + 2] = m[2] * x + m[6] * y + m[10] * z + m[14];
     if (nrm >= 0) {
       const nx = source[s + nrm], ny = source[s + nrm + 1], nz = source[s + nrm + 2];
-      // Already unit for every primitive apse ships, and a unit vector
-      // transformed by a rotation stays unit, so this is the same as
-      // normalising and costs three divides instead of one.
-      out[d + nrm] = _n[0] * nx + _n[3] * ny + _n[6] * nz;
-      out[d + nrm + 1] = _n[1] * nx + _n[4] * ny + _n[7] * nz;
-      out[d + nrm + 2] = _n[2] * nx + _n[5] * ny + _n[8] * nz;
+      const rx = _n[0] * nx + _n[3] * ny + _n[6] * nz;
+      const ry = _n[1] * nx + _n[4] * ny + _n[7] * nz;
+      const rz = _n[2] * nx + _n[5] * ny + _n[8] * nz;
+      // A source normal of zero is already broken geometry; the guard keeps it
+      // zero rather than turning it into a NaN that would spread through every
+      // product the fragment stage does with it.
+      const len = Math.sqrt(rx * rx + ry * ry + rz * rz);
+      const k = len > 0 && Number.isFinite(len) ? 1 / len : 0;
+      out[d + nrm] = rx * k;
+      out[d + nrm + 1] = ry * k;
+      out[d + nrm + 2] = rz * k;
     }
     if (tan >= 0) {
       const tx = source[s + tan], ty = source[s + tan + 1], tz = source[s + tan + 2];

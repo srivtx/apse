@@ -26,7 +26,7 @@
  *      field will read it as one.
  */
 
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { isAseError } from '../src/core/error.ts';
 import type { AseErrorCode } from '../src/core/error.ts';
@@ -49,6 +49,8 @@ import { CanvasSizer } from '../src/render/context.ts';
 import { RenderTargetImpl, createCanvasTarget, createColorTarget } from '../src/render/target.ts';
 import { GpuTimer } from '../src/render/timing.ts';
 import { DEFAULT_TONE_MAPPING } from '../src/render/present.ts';
+import { Renderer } from '../src/render/renderer.ts';
+import type { RendererOptions } from '../src/render/renderer.ts';
 import {
   alignedBytesPerRow,
   assertBytesPerRowAligned,
@@ -58,11 +60,21 @@ import {
   unpadRows,
 } from '../src/render/readback.ts';
 import type { FrameTimingStats } from '../src/render/types.ts';
+import { Scene, MeshNode, PerspectiveCamera } from '../src/scene/index.ts';
+import { box } from '../src/geometry/primitives/box.ts';
+import { upload } from '../src/geometry/mesh.ts';
+import type { GpuMesh } from '../src/geometry/mesh.ts';
+import { InstanceData, TRANSFORM_STRIDE, uploadInstances } from '../src/geometry/instanced.ts';
+import { basicMaterial } from '../src/material/basic.ts';
+import { instancedMaterial } from '../src/material/instanced.ts';
 import { asCanvasTargetDevice, asTargetDevice, fakeAseDevice, fakeLimits, FAKE_TEXTURE_USAGE as USAGE } from './fake-device.ts';
 import {
   asTimingDevice,
+  FakeFrameDevice,
+  FakeFramePass,
   FakeTimingDevice,
   fakeWebGpuCanvas,
+  installWebGpuBitmaps,
   raiseUncapturedAs,
   withGpu,
 } from './render-fakes.ts';
@@ -1375,3 +1387,634 @@ describe('DeviceOptions — unknown values are still rejected before acquisition
   }
 });
 
+
+// ===========================================================================
+// 11. The frame loop
+//
+// Everything above tests one function. This tests the *order*, and the order is
+// the part that is not visible in any return value: a frame that packs nothing,
+// that binds the wrong slot, that presents in a second submit, or that reports a
+// GPU time it never measured, all return a `FrameStats` that looks fine.
+//
+// So the assertions here are on the sequence of API calls the encoder received.
+// `FakeFrameDevice` records them; nothing rasterises. A `drawIndexed` is a line
+// in an array, and that is enough, because "one draw for a thousand instances"
+// is a claim about the calls and not about the pixels.
+// ===========================================================================
+
+/** A renderer, a device that records its calls, and a scene to draw. */
+interface Frame {
+  readonly renderer: Renderer;
+  readonly device: FakeFrameDevice;
+  readonly scene: Scene;
+  readonly camera: PerspectiveCamera;
+  readonly gpu: GPUDevice;
+  /** The scene pass, i.e. every pass except the present pass. */
+  scenePasses(): readonly FakeFramePass[];
+  /** The present pass, or undefined when there is none. */
+  presentPass(): FakeFramePass | undefined;
+}
+
+let uninstallBitmaps: (() => void) | null = null;
+
+beforeAll(() => { uninstallBitmaps = installWebGpuBitmaps(); });
+afterAll(() => { uninstallBitmaps?.(); uninstallBitmaps = null; });
+
+/** The last encoder's passes that are not the present pass. */
+function scenePassesOf(device: FakeFrameDevice): readonly FakeFramePass[] {
+  return device.lastPasses.filter((pass) => !pass.label.startsWith('apse.present'));
+}
+
+interface FrameOptions {
+  readonly renderer?: RendererOptions;
+  readonly features?: readonly string[];
+  /** Nanoseconds the fake GPU stamps on the six query slots. */
+  readonly timestamps?: readonly bigint[];
+  readonly size?: [number, number];
+}
+
+/** Creates a renderer on a fake device, runs `fn`, and disposes both. */
+async function withFrame<T>(
+  opts: FrameOptions,
+  fn: (frame: Frame) => Promise<T> | T,
+): Promise<T> {
+  const device = new FakeFrameDevice({
+    limits: fakeLimits(),
+    features: [...(opts.features ?? ['timestamp-query'])],
+  });
+  if (opts.timestamps !== undefined) device.timestamps = [...opts.timestamps];
+  const [width, height] = opts.size ?? [320, 200];
+  const { canvas } = fakeWebGpuCanvas(width, height);
+  return withGpu({ device: device as unknown as GPUDevice, preferredFormat: 'bgra8unorm' }, async () => {
+    const renderer = await Renderer.create(canvas, opts.renderer ?? {});
+    const gpu = device as unknown as GPUDevice;
+    const camera = new PerspectiveCamera({ fov: 45, near: 0.1, far: 100, aspect: width / height });
+    camera.lookAt([0, 0, 30], [0, 0, 0], [0, 1, 0]);
+    const frame: Frame = {
+      renderer, device, gpu,
+      scene: new Scene('test'),
+      camera,
+      scenePasses: () => scenePassesOf(device),
+      presentPass: () => device.lastPasses.find((p) => p.label.startsWith('apse.present')),
+    };
+    try {
+      return await fn(frame);
+    } finally {
+      renderer.dispose();
+    }
+  });
+}
+
+/** A unit-scale translation for each of `count` instances, on a grid. */
+function gridMatrices(count: number, perRow = 32): Float32Array {
+  const out = new Float32Array(count * TRANSFORM_STRIDE);
+  for (let i = 0; i < count; i++) {
+    const at = i * TRANSFORM_STRIDE;
+    out[at] = 1; out[at + 5] = 1; out[at + 10] = 1; out[at + 15] = 1;
+    out[at + 12] = (i % perRow) - perRow / 2;
+    out[at + 13] = Math.floor(i / perRow) - perRow / 2;
+  }
+  return out;
+}
+
+/** `count` cubes on one node, as one instanced draw. */
+async function addInstancedCubes(
+  frame: Frame, count: number, opts: { width?: number; firstInstance?: number; instanceCount?: number } = {},
+): Promise<GpuMesh> {
+  const instances = uploadInstances(
+    frame.gpu,
+    InstanceData.fromMatrices(gridMatrices(count), { name: 'grid' }),
+  );
+  const material = await instancedMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+  const mesh = upload(frame.gpu, box({ width: opts.width ?? 0.6 }), {
+    instances,
+    ...(opts.firstInstance === undefined ? {} : { firstInstance: opts.firstInstance }),
+    ...(opts.instanceCount === undefined ? {} : { instanceCount: opts.instanceCount }),
+  });
+  frame.scene.add(new MeshNode({ name: 'grid', mesh, material }));
+  return mesh;
+}
+
+describe('the frame loop — instanced draws', () => {
+  test('a thousand instances cost one drawIndexed, with the count in the draw', async () => {
+    await withFrame({}, async (frame) => {
+      await addInstancedCubes(frame, 1000);
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+
+      // The claim, in the only place it is observable: the calls, not a value.
+      const [draw] = frame.scenePasses()[0]!.draws;
+      expect(draw).toBeDefined();
+      expect(draw!.kind).toBe('drawIndexed');
+      expect(draw!.instances).toBe(1000);
+      expect(stats.drawCalls).toBe(1);
+      // 36 indices per cube × 1000, which is the triangle count the naive
+      // version would have got right by accident and the broken one would not.
+      expect(stats.triangles).toBe(36 / 3 * 1000);
+    });
+  });
+
+  test('the instance stream is bound to slot 1, and it is the geometry\'s own buffer', async () => {
+    await withFrame({}, async (frame) => {
+      const mesh = await addInstancedCubes(frame, 8);
+      frame.renderer.render(frame.scene, frame.camera);
+      const slots = frame.scenePasses()[0]!.vertexBuffers.map((v) => v.slot);
+      expect(slots).toEqual([0, 1]);
+      const bound = frame.scenePasses()[0]!.vertexBuffers.find((v) => v.slot === 1);
+      expect(bound?.buffer).toBe(mesh.instanceBuffer ?? undefined);
+    });
+  });
+
+  test('a non-null buffer is the test, not a count: one instance still binds slot 1', async () => {
+    // `instanceCount: 1` on a buffer of a thousand is an ordinary call — draw one
+    // copy of a grid. A renderer that guarded on `instanceCount > 1` would skip
+    // slot 1, and the pipeline still declares it, so the vertex stage would read
+    // whatever happened to be in the slot: a wrong image, and no error. The
+    // pipeline has no idea how many copies were asked for.
+    await withFrame({}, async (frame) => {
+      await addInstancedCubes(frame, 1000, { instanceCount: 1 });
+      frame.renderer.render(frame.scene, frame.camera);
+      const pass = frame.scenePasses()[0]!;
+      expect(pass.vertexBuffers.map((v) => v.slot)).toEqual([0, 1]);
+      expect(pass.draws[0]!.instances).toBe(1);
+    });
+  });
+
+  test('firstInstance and a sub-range both reach the draw', async () => {
+    await withFrame({}, async (frame) => {
+      await addInstancedCubes(frame, 64, { firstInstance: 10, instanceCount: 5 });
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      const draw = frame.scenePasses()[0]!.draws[0]!;
+      expect(draw.firstInstance).toBe(10);
+      expect(draw.instances).toBe(5);
+      expect(stats.triangles).toBe(12 * 5);
+    });
+  });
+
+  test('a GpuInstances with no instances is a legal buffer, and a mesh refuses to carry it', async () => {
+    // The state that decides how the renderer must test for instancing: a
+    // non-null buffer with a count of zero. `uploadInstances` produces it — an
+    // empty transform list is legal, and allocates a 4-byte floor so
+    // `createBuffer` stays well defined — and `upload` then rejects it, because
+    // `drawIndexed(n, 0)` is a silent no-op and a node that can never be seen
+    // should not be in a draw list at all. So the renderer never receives one,
+    // and the guard it uses cannot be about the count: see the `instanceCount: 1`
+    // test above, which is the case a count-based guard actually breaks.
+    await withFrame({}, (frame) => {
+      const empty = uploadInstances(frame.gpu, InstanceData.fromMatrices(new Float32Array(0)));
+      expect(empty.count).toBe(0);
+      expect(empty.buffer).not.toBeNull();
+      const error = expectCode(
+        () => upload(frame.gpu, box(), { instances: empty }),
+        'INTERNAL_INVARIANT',
+      );
+      expect(error.message).toContain('instanceCount');
+    });
+  });
+
+  test('instancing costs one object-uniform slot, not one per instance', async () => {
+    await withFrame({}, async (frame) => {
+      await addInstancedCubes(frame, 1000);
+      frame.renderer.render(frame.scene, frame.camera);
+      // The per-instance transform arrives as a vertex attribute, so there is
+      // nothing per instance in the uniform block. 1000 slots would be 256 KB
+      // of upload for one draw.
+      const object = frame.device.writes.find((w) => w.label.includes('object'));
+      expect(object?.size).toBe(256);
+      const offsets = frame.scenePasses()[0]!.bindGroups
+        .filter((b) => b.group === 1)
+        .flatMap((b) => b.offsets ?? []);
+      expect(offsets).toEqual([0]);
+    });
+  });
+
+  test('a plain mesh never binds slot 1, and two items sharing a buffer bind it once', async () => {
+    await withFrame({}, async (frame) => {
+      const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      const mesh = upload(frame.gpu, box({ width: 0.6 }));
+      frame.scene.add(new MeshNode({ name: 'a', mesh, material }));
+      frame.scene.add(new MeshNode({ name: 'b', mesh, material, position: [2, 0, 0] }));
+      frame.renderer.render(frame.scene, frame.camera);
+      const pass = frame.scenePasses()[0]!;
+      expect(pass.draws).toHaveLength(2);
+      expect(pass.vertexBuffers.map((v) => v.slot)).toEqual([0]);
+      // The instance guard shares the suppression state of the vertex guard:
+      // two items, one mesh, one setVertexBuffer(0).
+      expect(pass.calls.filter((c) => c === 'setVertexBuffer:0')).toHaveLength(1);
+    });
+  });
+
+  test('two instanced items sharing one buffer bind slot 1 once', async () => {
+    await withFrame({}, async (frame) => {
+      const mesh = await addInstancedCubes(frame, 16);
+      const material = await instancedMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      frame.scene.add(new MeshNode({ name: 'second', mesh, material, position: [0, 4, 0] }));
+      frame.renderer.render(frame.scene, frame.camera);
+      const pass = frame.scenePasses()[0]!;
+      expect(pass.draws).toHaveLength(2);
+      expect(pass.calls.filter((c) => c === 'setVertexBuffer:1')).toHaveLength(1);
+    });
+  });
+});
+
+describe('the frame loop — GPU timestamps', () => {
+  /** Six slots: two stamped pairs at 1 ms and 4 ms, and two unstamped at 0. */
+  const TWO_PASS_FRAME = [1_000_000n, 2_000_000n, 5_000_000n, 9_000_000n, 0n, 0n];
+
+  test('no reading yet is null, and the capability is reported separately', async () => {
+    await withFrame({ timestamps: TWO_PASS_FRAME }, (frame) => {
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      expect(stats.gpu).toBeNull();
+      expect(stats.averageGpu).toBeNull();
+      // The capability is true on the very first frame even though there is no
+      // number, which is the whole reason it is a separate field.
+      expect(stats.gpuTimingAvailable).toBe(true);
+    });
+  });
+
+  test('the reading arrives a frame late, and is the sum of the passes that ran', async () => {
+    await withFrame({ timestamps: TWO_PASS_FRAME }, async (frame) => {
+      frame.renderer.render(frame.scene, frame.camera);
+      await flush();
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      // (2 − 1) ms for the scene pass plus (9 − 5) ms for the present pass. Not
+      // 4 ms, which is only the difference of one pair, and not the raw
+      // nanosecond epoch, which is 1e9.
+      expect(stats.gpu).toBeCloseTo(5, 6);
+    });
+  });
+
+  test('a measured zero is zero, and is not confused with a missing reading', async () => {
+    const idle = [7_000_000n, 7_000_000n, 7_000_000n, 7_000_000n, 0n, 0n];
+    await withFrame({ timestamps: idle }, async (frame) => {
+      frame.renderer.render(frame.scene, frame.camera);
+      await flush();
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      expect(stats.gpu).toBe(0);
+    });
+  });
+
+  test('every pass a frame opens gets its own write index, and none is reused', async () => {
+    await withFrame({ timestamps: TWO_PASS_FRAME }, async (frame) => {
+      const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      const mesh = upload(frame.gpu, box({ width: 0.6 }));
+      const glass = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat, transparent: true });
+      frame.scene.add(new MeshNode({ name: 'a', mesh, material }));
+      frame.scene.add(new MeshNode({ name: 'b', mesh, material: glass, position: [2, 0, 0] }));
+      frame.renderer.render(frame.scene, frame.camera);
+
+      // Three passes: opaque, transparent, present. Depth state is baked into the
+      // pipeline, so the transparent item genuinely cannot share the first pass.
+      expect(frame.device.lastPasses).toHaveLength(3);
+      const written = frame.device.lastPasses.map((p) => p.timestampWrites);
+      expect(written.every((w) => w !== undefined)).toBe(true);
+      const indices = written.map((w) => `${w!.beginningOfPassWriteIndex}:${w!.endOfPassWriteIndex}`);
+      // A write index written twice in one submission is a validation error, and
+      // a discarded pass is a black frame — so all three must be distinct.
+      expect(new Set(indices).size).toBe(3);
+      expect(indices).toEqual(['0:1', '2:3', '4:5']);
+    });
+  });
+
+  test('the readback is encoded after the passes and before the submit', async () => {
+    await withFrame({ timestamps: TWO_PASS_FRAME }, (frame) => {
+      frame.renderer.render(frame.scene, frame.camera);
+      const calls = frame.device.frameEncoders[0]!.calls;
+      const lastPass = calls.map((c, i) => (c.startsWith('beginRenderPass') ? i : -1)).filter((i) => i >= 0).pop()!;
+      const resolve = calls.findIndex((c) => c.startsWith('resolveQuerySet'));
+      // `resolveQuerySet` is a queue command: encoded after the passes it
+      // observes, and in the same command buffer as the copy, or the result has
+      // to travel through the CPU.
+      expect(resolve).toBeGreaterThan(lastPass);
+      expect(calls[resolve + 1]).toContain('copyBufferToBuffer');
+      expect(frame.device.submitted).toHaveLength(1);
+    });
+  });
+
+  test('a device without timestamp-query reports no timing and attaches no write index', async () => {
+    await withFrame({ features: [] }, (frame) => {
+      const material = basicMaterialSpecOnly(frame);
+      expect(material).toBeNull();
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      expect(stats.gpuTimingAvailable).toBe(false);
+      expect(stats.gpu).toBeNull();
+      expect(stats.averageGpu).toBeNull();
+      // Attaching a write index without the feature is a validation error, not
+      // a no-op, and it would invalidate every frame on half of all devices.
+      for (const pass of frame.device.allPasses) expect(pass.timestampWrites).toBeUndefined();
+      expect(frame.device.querySets).toHaveLength(0);
+    });
+  });
+
+  test('averageGpu divides by the readings, not by the frames', async () => {
+    // Frame 1's two passes are stamped 1 ms and 3 ms apart, so it reads 4 ms.
+    await withFrame({ timestamps: [0n, 1_000_000n, 0n, 3_000_000n, 0n, 0n] }, async (frame) => {
+      frame.renderer.render(frame.scene, frame.camera);
+      await flush();
+      // Frame 2 reads 3 ms and 7 ms, so 10 ms — and the window now holds two
+      // readings and two frames that could not be timed at all.
+      frame.device.timestamps = [0n, 3_000_000n, 0n, 7_000_000n, 0n, 0n];
+      frame.renderer.render(frame.scene, frame.camera);
+      await flush();
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      expect(stats.gpu).toBeCloseTo(10, 6);
+      // (4 + 10) / 2. Dividing by the four frames in the window — counting the
+      // unmeasured ones as zeros — would report 3.5, which is a number about
+      // nothing rather than a slightly pessimistic one.
+      expect(stats.averageGpu).toBeCloseTo(7, 6);
+    });
+  });
+
+  test('the gpu budget stays silent until there is a reading, and fires once there is', async () => {
+    await withFrame({ timestamps: TWO_PASS_FRAME, renderer: { budget: { gpu: 1 } } }, async (frame) => {
+      const breaches: string[] = [];
+      frame.renderer.onBudgetBreached((name) => { breaches.push(name); });
+      frame.renderer.render(frame.scene, frame.camera);
+      await flush();
+      frame.renderer.render(frame.scene, frame.camera);
+      // 5 ms against a 1 ms budget, measured. Before the reading arrived the
+      // budget had no number to compare and said nothing — a breach of a
+      // measurement nobody took is the one thing a budget must not report.
+      expect(breaches).toEqual(['gpu']);
+    });
+  });
+
+  test('dispose destroys the query set, the resolve buffer and every staging buffer', async () => {
+    const device = new FakeFrameDevice({ limits: fakeLimits(), features: ['timestamp-query'] });
+    const { canvas } = fakeWebGpuCanvas(64, 64);
+    await withGpu({ device: device as unknown as GPUDevice, preferredFormat: 'bgra8unorm' }, async () => {
+      const renderer = await Renderer.create(canvas, {});
+      const camera = new PerspectiveCamera({ fov: 45, near: 0.1, far: 10 });
+      camera.lookAt([0, 0, 3], [0, 0, 0], [0, 1, 0]);
+      renderer.render(new Scene('empty'), camera);
+      // 1 query set, 1 resolve, 2 staging — 48 bytes each of the last two.
+      expect(device.querySets).toHaveLength(1);
+      renderer.dispose();
+      expect(device.querySets[0]!.destroyed).toBe(true);
+      const timing = device.buffers.filter((b) => b.label.startsWith('apse.timing'));
+      expect(timing).toHaveLength(3);
+      expect(timing.every((b) => b.destroyed)).toBe(true);
+    });
+  });
+});
+
+/**
+ * Nothing: a material creation is a device round trip and this test is about the
+ * absence of a timer, so it needs no material. Named so the call site reads as
+ * the deliberate nothing it is.
+ */
+function basicMaterialSpecOnly(frame: Frame): null {
+  void frame;
+  return null;
+}
+
+describe('the frame loop — the present pass', () => {
+  test('the scene renders into an rgba16float intermediate, and the tone map presents it', async () => {
+    await withFrame({}, async (frame) => {
+      // The default, and the reason it is a default: a material writes linear
+      // values and a bgra8unorm canvas stores them verbatim.
+      expect(frame.renderer.sceneFormat).toBe('rgba16float');
+      expect(frame.renderer.sceneTarget.isCanvas).toBe(false);
+      expect(frame.renderer.sceneTarget.format).toBe('rgba16float');
+      // And the intermediate is a real allocation, not a description of one.
+      expect(frame.device.apseLive('apse.present:scene:color')).toHaveLength(1);
+    });
+  });
+
+  test('the present pass shares the frame\'s encoder, so the frame is one submit', async () => {
+    await withFrame({}, async (frame) => {
+      const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      frame.renderer.render(frame.scene, frame.camera);
+
+      // Two passes and one submit. Two submits would let the compositor present
+      // the scene target's own frame as a finished one — an untone-mapped image,
+      // with a compositor sync in the middle of the frame.
+      expect(frame.device.frameEncoders).toHaveLength(1);
+      expect(frame.device.submitted).toHaveLength(1);
+      expect(frame.scenePasses()).toHaveLength(1);
+      const present = frame.presentPass();
+      expect(present).toBeDefined();
+      // Three vertices, one copy, and no index buffer: a fullscreen triangle.
+      expect(present!.draws).toHaveLength(1);
+      expect(present!.draws[0]!.kind).toBe('draw');
+      expect(present!.draws[0]!.count).toBe(3);
+      expect(present!.draws[0]!.instances).toBe(1);
+      // The scene drew into the intermediate, and the pass has no depth
+      // attachment, which is the only reason its pipeline has no depth state.
+      expect(present!.depthStencilAttachment).toBeUndefined();
+    });
+  });
+
+  test('toneMapping: null is the direct path: one pass, the canvas format, no intermediate', async () => {
+    await withFrame({ renderer: { toneMapping: null } }, async (frame) => {
+      expect(frame.renderer.sceneFormat).toBe('bgra8unorm');
+      expect(frame.renderer.sceneTarget.isCanvas).toBe(true);
+      const material = await basicMaterial(frame.gpu, { targetFormat: 'bgra8unorm' });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      expect(frame.device.lastPasses).toHaveLength(1);
+      expect(stats.drawCalls).toBe(1);
+      // No pipeline, no mesh, no intermediate: the degenerate path has to stay
+      // free, because it is the only one that costs nothing at all.
+      expect(frame.device.apseLive('apse.present:scene:color')).toHaveLength(0);
+      expect(frame.device.pipelineDescs.filter((d) => d.label === 'apse.present:pipeline')).toHaveLength(0);
+    });
+  });
+
+  test('hdr: false keeps the tone map but renders into the destination format', async () => {
+    await withFrame({ renderer: { hdr: false } }, async (frame) => {
+      expect(frame.renderer.sceneFormat).toBe('bgra8unorm');
+      expect(frame.renderer.sceneTarget.isCanvas).toBe(false);
+      const material = await basicMaterial(frame.gpu, { targetFormat: 'bgra8unorm' });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      frame.renderer.render(frame.scene, frame.camera);
+      // Still an intermediate, and still a fullscreen pass: a curve applied to an
+      // already-clipped image, which is legal and occasionally what you want, and
+      // is the only way to keep a material written for the canvas format while
+      // still fixing the darkness.
+      expect(frame.presentPass()).toBeDefined();
+      expect(frame.device.apseLive('apse.present:scene:color')[0]!.format).toBe('bgra8unorm');
+    });
+  });
+
+  test('a material compiled for the canvas format now fails, naming both formats', async () => {
+    await withFrame({}, async (frame) => {
+      // The intended trade, and the reason it is the right one: the alternative
+      // is a command buffer invalidated whole, with no exception anywhere.
+      const material = await basicMaterial(frame.gpu, { targetFormat: 'bgra8unorm' });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      const error = expectCode(() => frame.renderer.render(frame.scene, frame.camera), 'RENDER_TARGET_FORMAT_MISMATCH');
+      expect(error.message).toContain('basic');
+      expect(error.message).toContain('rgba16float');
+      expect(error.message).toContain('bgra8unorm');
+      expect(error.fix).toContain('targetFormat');
+    });
+  });
+
+  test('exposure reaches the pass, and the renderer reports what the screen is using', async () => {
+    await withFrame({ renderer: { toneMapping: { operator: 'aces', exposure: 0.5 } } }, (frame) => {
+      // Adopted at construction, so the getter does not answer 1 while the
+      // screen is at half a stop.
+      expect(frame.renderer.exposure).toBe(0.5);
+      frame.renderer.exposure = 2;
+      expect(frame.renderer.exposure).toBe(2);
+    });
+  });
+
+  test('a resize reallocates the intermediate at the canvas\'s new size', async () => {
+    await withFrame({ size: [320, 200] }, async (frame) => {
+      const before = frame.device.apseLive('apse.present:scene:color');
+      expect(before).toHaveLength(1);
+      expect(before[0]!.width).toBe(320);
+
+      const canvas = frame.renderer.device.canvas as unknown as { clientWidth: number; clientHeight: number };
+      canvas.clientWidth = 640;
+      canvas.clientHeight = 480;
+      frame.renderer.render(frame.scene, frame.camera);
+
+      // Both, and in the same frame. The intermediate is the scene target now, so
+      // leaving it at the old extent would tone map a differently-sized image
+      // into the new one: a stretched frame, on the frame after every resize.
+      expect(frame.renderer.sceneTarget.width).toBe(640);
+      expect(frame.renderer.sceneTarget.height).toBe(480);
+      expect(frame.device.apseLive('apse.present:scene:color')).toHaveLength(1);
+      expect(frame.device.apseLive('apse.present:scene:color')[0]!.width).toBe(640);
+      // Freed before it was replaced, not after: the peak is one target.
+      expect(before[0]!.destroyed).toBe(true);
+    });
+  });
+
+  test('an empty scene still clears, so the tone map cannot present last frame', async () => {
+    await withFrame({}, async (frame) => {
+      const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      frame.renderer.render(frame.scene, frame.camera);
+      const first = frame.device.allPasses.length;
+
+      const empty = new Scene('empty');
+      const stats = frame.renderer.render(empty, frame.camera);
+      // A pass with no draws. Without it the intermediate keeps the last frame's
+      // pixels and the tone map presents them again, forever.
+      expect(frame.device.allPasses.length).toBe(first + 2);
+      const clear = frame.scenePasses();
+      expect(clear).toHaveLength(1);
+      expect(clear[0]!.draws).toHaveLength(0);
+      expect(clear[0]!.ended).toBe(true);
+      expect(stats.drawCalls).toBe(0);
+    });
+  });
+
+  test('capture goes through its own present pass, so it returns the presented image', async () => {
+    await withFrame({}, async (frame) => {
+      const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      // The point of the whole arrangement: a capture target is 8-bit and the
+      // materials are compiled for rgba16float, so rendering the scene straight
+      // into it is a hard format mismatch rather than a dark image.
+      const shot = await frame.renderer.capture(frame.scene, frame.camera);
+      expect(shot.format).toBe('bgra8unorm');
+      expect(shot.width).toBe(320);
+      // 4 bytes per pixel, padded to 256. Not 8: the tone map is what brought
+      // the HDR intermediate back to 8 bits.
+      expect(shot.bytesPerRow).toBe(Math.ceil(320 * 4 / 256) * 256);
+      expect(shot.data.byteLength).toBe(shot.bytesPerRow * shot.height);
+      // A second intermediate, built on the first capture and not before.
+      expect(frame.device.apseLive('apse.capture.present:scene:color')).toHaveLength(1);
+      // Three submits: the scene's, the capture pass's own, and the copy out.
+      // The in-frame present pass shares the frame's encoder instead, which is
+      // why this number is 3 rather than 1.
+      expect(frame.device.submitted.length).toBe(3);
+    });
+  });
+
+  test('capture with no present pass renders straight into the 8-bit target', async () => {
+    await withFrame({ renderer: { toneMapping: null } }, async (frame) => {
+      const material = await basicMaterial(frame.gpu, { targetFormat: 'bgra8unorm' });
+      frame.scene.add(new MeshNode({ name: 'a', mesh: upload(frame.gpu, box()), material }));
+      const shot = await frame.renderer.capture(frame.scene, frame.camera);
+      expect(shot.format).toBe('bgra8unorm');
+      // No second pass, so no second intermediate: two submits, the frame's and
+      // the copy out.
+      expect(frame.device.apseLive('apse.capture.present:scene:color')).toHaveLength(0);
+      expect(frame.device.submitted.length).toBe(2);
+    });
+  });
+
+  test('dispose releases the intermediate, the depth attachment and the pass pipeline', async () => {
+    const device = new FakeFrameDevice({ limits: fakeLimits(), features: ['timestamp-query'] });
+    const { canvas } = fakeWebGpuCanvas(64, 64);
+    await withGpu({ device: device as unknown as GPUDevice, preferredFormat: 'bgra8unorm' }, async () => {
+      const renderer = await Renderer.create(canvas, {});
+      expect(device.apseLive('apse.present:scene:color')).toHaveLength(1);
+      expect(device.apseLive('apse.present:scene:depth')).toHaveLength(1);
+      renderer.dispose();
+      expect(device.apseLive('apse.present:scene:color')).toHaveLength(0);
+      expect(device.apseLive('apse.present:scene:depth')).toHaveLength(0);
+      // Idempotent, and the second call must not reach a destroyed device.
+      renderer.dispose();
+    });
+  });
+});
+
+describe('the frame loop — the draw-list counters', () => {
+  /** One cube in front of the camera, one behind it, sharing a material. */
+  async function twoCubes(frame: Frame, behind: { visible: boolean } = { visible: true }): Promise<void> {
+    const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+    const mesh = upload(frame.gpu, box({ width: 1 }));
+    frame.scene.add(new MeshNode({ name: 'front', mesh, material }));
+    const back = new MeshNode({ name: 'back', mesh, material, position: [0, 0, 500] });
+    back.visible = behind.visible;
+    frame.scene.add(back);
+  }
+
+  test('candidates is what the walk saw and culled is the frustum\'s verdict', async () => {
+    await withFrame({}, async (frame) => {
+      await twoCubes(frame);
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      // Both cubes are candidates. One of them is behind the camera and the
+      // frustum rejected it. Deriving either number from the surviving draw list
+      // would report 1 and 0.
+      expect(stats.candidates).toBe(2);
+      expect(stats.culled).toBe(1);
+      expect(stats.drawCalls).toBe(1);
+    });
+  });
+
+  test('a node that was never submitted is not reported as culled', async () => {
+    await withFrame({}, async (frame) => {
+      await twoCubes(frame, { visible: false });
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      // A hidden node is not culled: the frustum never saw it, and a closer
+      // camera will not find it either. Counting it as a culling win credits
+      // the frustum with rejecting something that was never in front of it.
+      expect(stats.candidates).toBe(1);
+      expect(stats.culled).toBe(0);
+      expect(stats.drawCalls).toBe(1);
+    });
+  });
+
+  test('the three counters partition the walk exactly', async () => {
+    await withFrame({}, async (frame) => {
+      await twoCubes(frame);
+      // A node with no indices is a candidate that produces no draw item for a
+      // reason that is not culling — which is the third term of the identity.
+      const material = await basicMaterial(frame.gpu, { targetFormat: frame.renderer.sceneFormat });
+      const unindexed = {
+        layout: box().layout,
+        vertexBuffer: frame.device.createBuffer({ label: 'bare', size: 48, usage: 0x20 }) as unknown as GPUBuffer,
+        indexBuffer: null,
+        indexCount: 0,
+        instanceCount: 1,
+        firstInstance: 0,
+        instanceBuffer: null,
+      };
+      frame.scene.add(new MeshNode({ name: 'empty', mesh: unindexed, material }));
+      const stats = frame.renderer.render(frame.scene, frame.camera);
+      // graph.ts states this identity; the renderer is what turns it into
+      // numbers, so it is the renderer's numbers that have to satisfy it.
+      expect(stats.candidates).toBe(frame.scene.meshNodeCount);
+      expect(stats.culled).toBe(frame.scene.culledCount);
+      expect(stats.candidates).toBe(stats.drawCalls + stats.culled + frame.scene.emptyCount);
+    });
+  });
+});

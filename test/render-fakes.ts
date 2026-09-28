@@ -37,6 +37,15 @@ export interface FakeBufferDescriptor {
   label?: string;
   size: number;
   usage: number;
+  /**
+   * Hand the buffer over already mapped.
+   *
+   * `mappedAtCreation` is the only way to write a buffer without a staging copy,
+   * and `GpuMesh` uses it for every vertex and index upload. The fake honours
+   * it, because the alternative — a `getMappedRange()` that throws — would make
+   * every geometry test a test of the fake.
+   */
+  mappedAtCreation?: boolean;
 }
 
 export class FakeBuffer {
@@ -55,6 +64,7 @@ export class FakeBuffer {
     this.size = desc.size;
     this.usage = desc.usage;
     this.bytes = new Uint8Array(desc.size);
+    this.#mapped = desc.mappedAtCreation === true;
   }
 
   /**
@@ -215,11 +225,11 @@ export class FakeTimingDevice extends FakeGPUDevice {
     this.#uncaptured({ error: { message, constructor: { name: className } } });
   }
 
-  get queue(): { submit: (buffers: unknown[]) => void; writeBuffer: () => void } {
+  get queue(): GPUQueue {
     return {
       submit: (buffers: unknown[]) => { this.submitted.push(...buffers); },
       writeBuffer: () => { /* not used by the layer under test */ },
-    };
+    } as unknown as GPUQueue;
   }
 }
 
@@ -236,6 +246,281 @@ export function asTimingDevice(fake: FakeTimingDevice): { readonly device: GPUDe
  */
 export function raiseUncapturedAs(device: GPUDevice, className: string, message: string): void {
   (device as unknown as FakeTimingDevice).raiseUncapturedAs(className, message);
+}
+
+// ---------------------------------------------------------------------------
+// A frame: render passes, pipelines, and a queue that records writes
+//
+// The frame loop is the one layer with no fake anywhere in the repo, because
+// everything it does is an API call on a device — and the properties worth
+// testing are all *about* those calls. Whether N instances cost one
+// `drawIndexed` or N is not visible in a return value; it is visible in the
+// sequence of calls the encoder received, and nowhere else. Same for whether the
+// present pass shares the frame's encoder, whether the frame uniform was
+// actually marked dirty, and whether a timestamp write index is attached to a
+// pass that has already used it.
+//
+// So this models the calls, not the GPU. Nothing rasterises; `drawIndexed` is a
+// line in an array.
+// ---------------------------------------------------------------------------
+
+/** One `draw` or `drawIndexed`, with the arguments apse passed. */
+export interface RecordedDraw {
+  readonly kind: 'draw' | 'drawIndexed';
+  /** `vertexCount` for `draw`, `indexCount` for `drawIndexed`. */
+  readonly count: number;
+  /** The second argument either way: how many copies of the mesh. */
+  readonly instances: number;
+  /** `firstVertex` or `firstIndex`. */
+  readonly first: number;
+  /** `baseVertex` for `drawIndexed`, `0` for `draw`. */
+  readonly base: number;
+  /** `firstInstance`, the same for both. */
+  readonly firstInstance: number;
+}
+
+/** A `GPURenderPassEncoder`, recorded. */
+export class FakeFramePass {
+  readonly label: string;
+  readonly timestampWrites: GPURenderPassTimestampWrites | undefined;
+  readonly depthStencilAttachment: GPURenderPassDepthStencilAttachment | undefined;
+  readonly colorFormats: readonly GPUTextureFormat[] = [];
+  readonly calls: string[] = [];
+  readonly pipelines: GPURenderPipeline[] = [];
+  /** `[group, bindGroup, dynamic offsets]`, in call order. */
+  readonly bindGroups: { group: number; bindGroup: GPUBindGroup; offsets: number[] | null }[] = [];
+  /** `[slot, buffer]`, in call order. Slot 1 is the per-instance stream. */
+  readonly vertexBuffers: { slot: number; buffer: GPUBuffer }[] = [];
+  readonly indexBuffers: { buffer: GPUBuffer; format: GPUIndexFormat }[] = [];
+  readonly draws: RecordedDraw[] = [];
+  ended = false;
+
+  constructor(desc: GPURenderPassDescriptor) {
+    this.label = desc.label ?? '';
+    this.timestampWrites = desc.timestampWrites;
+    this.depthStencilAttachment = desc.depthStencilAttachment;
+    this.calls.push('beginRenderPass');
+  }
+
+  setPipeline(pipeline: GPURenderPipeline): void {
+    this.calls.push('setPipeline');
+    this.pipelines.push(pipeline);
+  }
+
+  setBindGroup(index: number, bindGroup: GPUBindGroup, dynamicOffsets?: Iterable<number>): void {
+    this.calls.push(`setBindGroup:${index}`);
+    this.bindGroups.push({
+      group: index,
+      bindGroup,
+      offsets: dynamicOffsets === undefined ? null : [...dynamicOffsets],
+    });
+  }
+
+  setVertexBuffer(slot: number, buffer: GPUBuffer, _offset?: number): void {
+    this.calls.push(`setVertexBuffer:${slot}`);
+    this.vertexBuffers.push({ slot, buffer });
+  }
+
+  setIndexBuffer(buffer: GPUBuffer, format: GPUIndexFormat, _offset?: number): void {
+    this.calls.push(`setIndexBuffer:${format}`);
+    this.indexBuffers.push({ buffer, format });
+  }
+
+  draw(vertexCount: number, instanceCount: number, firstVertex: number, firstInstance: number): void {
+    this.calls.push('draw');
+    this.draws.push({ kind: 'draw', count: vertexCount, instances: instanceCount, first: firstVertex, base: 0, firstInstance });
+  }
+
+  drawIndexed(
+    indexCount: number,
+    instanceCount: number,
+    firstIndex: number,
+    baseVertex: number,
+    firstInstance: number,
+  ): void {
+    this.calls.push('drawIndexed');
+    this.draws.push({ kind: 'drawIndexed', count: indexCount, instances: instanceCount, first: firstIndex, base: baseVertex, firstInstance });
+  }
+
+  end(): void {
+    this.ended = true;
+    this.calls.push('end');
+  }
+}
+
+/** A `GPUCommandEncoder` that can open a pass. */
+export class FakeFrameEncoder extends FakeEncoder {
+  readonly passes: FakeFramePass[] = [];
+
+  beginRenderPass(desc: GPURenderPassDescriptor): GPURenderPassEncoder {
+    const pass = new FakeFramePass(desc);
+    this.passes.push(pass);
+    this.calls.push(`beginRenderPass:${pass.label}`);
+    return pass as unknown as GPURenderPassEncoder;
+  }
+
+  copyTextureToBuffer(
+    source: { texture: GPUTexture },
+    destination: { buffer: GPUBuffer; bytesPerRow: number },
+    copySize: { width: number; height: number },
+  ): void {
+    const from = (source.texture as unknown as { label: string }).label ?? '';
+    this.calls.push(`copyTextureToBuffer:${from}:${copySize.width}x${copySize.height}`);
+    const buffer = destination.buffer as unknown as FakeBuffer;
+    buffer.bytes.fill(0, 0, destination.bytesPerRow * copySize.height);
+  }
+}
+
+/** One `queue.writeBuffer`, with the bytes copied out rather than retained. */
+export interface RecordedFrameWrite {
+  readonly label: string;
+  readonly bufferOffset: number;
+  readonly size: number;
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * A {@link FakeTimingDevice} that can encode a whole frame.
+ *
+ * The addition is a render pass, a pipeline, and a queue — nothing else. The
+ * shader module answers with whatever diagnostics the test asks for, because the
+ * fake must never compile WGSL: a second WGSL front end would only prove that it
+ * agrees with itself.
+ */
+export class FakeFrameDevice extends FakeTimingDevice {
+  readonly modules: { label: string; code: string }[] = [];
+  readonly pipelineDescs: GPURenderPipelineDescriptor[] = [];
+  readonly bindGroupLayouts: GPUBindGroupLayoutDescriptor[] = [];
+  readonly pipelineLayouts: GPUPipelineLayoutDescriptor[] = [];
+  readonly bindGroups: GPUBindGroupDescriptor[] = [];
+  readonly samplers: GPUSamplerDescriptor[] = [];
+  readonly writes: RecordedFrameWrite[] = [];
+  /** Every encoder handed out, so a test can see one submit and not two. */
+  readonly frameEncoders: FakeFrameEncoder[] = [];
+
+  override createCommandEncoder(desc?: GPUCommandEncoderDescriptor): FakeEncoderAsGpu {
+    const encoder = new FakeFrameEncoder();
+    encoder.timestamps = this.timestamps;
+    this.frameEncoders.push(encoder);
+    this.encoders.push(encoder);
+    void desc;
+    return encoder as unknown as FakeEncoderAsGpu;
+  }
+
+  createShaderModule(desc: GPUShaderModuleDescriptor): GPUShaderModule {
+    this.modules.push({ label: desc.label ?? '', code: desc.code });
+    return {
+      label: desc.label,
+      getCompilationInfo: () => Promise.resolve({ messages: [] } as unknown as GPUCompilationInfo),
+    } as unknown as GPUShaderModule;
+  }
+
+  createRenderPipelineAsync(desc: GPURenderPipelineDescriptor): Promise<GPURenderPipeline> {
+    this.pipelineDescs.push(desc);
+    return Promise.resolve({ label: desc.label } as unknown as GPURenderPipeline);
+  }
+
+  createBindGroupLayout(desc: GPUBindGroupLayoutDescriptor): GPUBindGroupLayout {
+    this.bindGroupLayouts.push(desc);
+    return { label: desc.label } as unknown as GPUBindGroupLayout;
+  }
+
+  createPipelineLayout(desc: GPUPipelineLayoutDescriptor): GPUPipelineLayout {
+    this.pipelineLayouts.push(desc);
+    return { label: desc.label } as unknown as GPUPipelineLayout;
+  }
+
+  createBindGroup(desc: GPUBindGroupDescriptor): GPUBindGroup {
+    this.bindGroups.push(desc);
+    return { label: desc.label } as unknown as GPUBindGroup;
+  }
+
+  createSampler(desc: GPUSamplerDescriptor): GPUSampler {
+    this.samplers.push(desc);
+    return { label: desc.label } as unknown as GPUSampler;
+  }
+
+  override get queue(): GPUQueue {
+    const device = this;
+    return {
+      writeBuffer(
+        buffer: GPUBuffer,
+        bufferOffset: number,
+        data: BufferSource,
+        dataOffset?: number,
+        size?: number,
+      ): void {
+        // Copied, because apse hands over a live CPU mirror and writes to it
+        // again next frame: a retained view would make every recorded frame read
+        // the last one's values.
+        const from = dataOffset ?? 0;
+        const bytes = ArrayBuffer.isView(data)
+          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice(from, from + (size ?? Infinity))
+          : new Uint8Array(data).slice(from, from + (size ?? Infinity));
+        device.writes.push({
+          label: (buffer as unknown as { label: string }).label ?? '',
+          bufferOffset,
+          size: bytes.byteLength,
+          bytes,
+        });
+      },
+      submit(buffers: Iterable<unknown>): void {
+        for (const buffer of buffers) device.submitted.push(buffer);
+      },
+    } as unknown as GPUQueue;
+  }
+
+  /** The passes of the most recent encoder, in order. */
+  get lastPasses(): readonly FakeFramePass[] {
+    return this.frameEncoders[this.frameEncoders.length - 1]?.passes ?? [];
+  }
+
+  /** Every pass opened by any encoder, flattened. */
+  get allPasses(): readonly FakeFramePass[] {
+    return this.frameEncoders.flatMap((encoder) => encoder.passes);
+  }
+
+  /** Every draw of the most recent encoder, across all of its passes. */
+  get lastDraws(): readonly RecordedDraw[] {
+    return this.lastPasses.flatMap((pass) => pass.draws);
+  }
+}
+
+/**
+ * The WebGPU bit-flag globals, which bun does not have.
+ *
+ * **`src` reads `GPUBufferUsage`, `GPUShaderStage` and `GPUTextureUsage` as
+ * globals** wherever the value is needed to build a descriptor, so a headless
+ * test that constructs a material, a mesh or a renderer has to install them —
+ * that is the only reason the frame loop had no test at all. The values are the
+ * spec's, written out rather than imported, so a wrong bit here shows up as a
+ * wrong `usage` in a recorded descriptor instead of being masked by a constant
+ * that happens to agree.
+ */
+export function installWebGpuBitmaps(): () => void {
+  const globals = globalThis as Record<string, unknown>;
+  const previous = new Map<string, unknown>();
+  const set = (name: string, value: unknown): void => {
+    previous.set(name, globals[name]);
+    globals[name] = value;
+  };
+  set('GPUBufferUsage', {
+    MAP_READ: 0x0001, MAP_WRITE: 0x0002, COPY_SRC: 0x0004, COPY_DST: 0x0008,
+    INDEX: 0x0010, VERTEX: 0x0020, UNIFORM: 0x0040, STORAGE: 0x0080,
+    INDIRECT: 0x0100, QUERY_RESOLVE: 0x0200,
+  });
+  set('GPUTextureUsage', {
+    COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04,
+    STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10,
+  });
+  set('GPUShaderStage', { VERTEX: 0x1, FRAGMENT: 0x2, COMPUTE: 0x4 });
+  set('GPUMapMode', { READ: 0x0001, WRITE: 0x0002 });
+  return () => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete globals[name];
+      else globals[name] = value;
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +541,18 @@ export interface FakeGpuOptions {
   readonly rejectDevice?: Error;
   /** Features the *device* is created with. Defaults to the adapter's. */
   readonly deviceFeatures?: string[];
+  /**
+   * Hand this device back from `requestDevice` instead of a fresh
+   * {@link FakeTimingDevice}.
+   *
+   * For a test that needs a fake with more surface than the timer does — a render
+   * pass, a pipeline, a queue that records writes — while still going through
+   * the real `createDevice`. Going through the real one is the point: the canvas
+   * configuration, the 1x1 validity probe, and the limits copy are three things
+   * only `createDevice` does, and a test that built an `AseDevice` by hand would
+   * bypass all three.
+   */
+  readonly device?: GPUDevice;
 }
 
 export class FakeAdapter {
@@ -276,6 +573,7 @@ export class FakeAdapter {
   async requestDevice(desc: GPUDeviceDescriptor = {}): Promise<GPUDevice> {
     this.requests.push(desc);
     if (this.#opts.rejectDevice !== undefined) throw this.#opts.rejectDevice;
+    if (this.#opts.device !== undefined) return this.#opts.device;
     return new FakeTimingDevice({
       limits: copyPrototypeLimits(this.limits),
       features: this.#opts.deviceFeatures ?? [...this.features],

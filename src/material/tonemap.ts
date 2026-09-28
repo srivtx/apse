@@ -473,9 +473,17 @@ const TONEMAP_VERTEX = `
 // whatever node it was attached to, and the symptom is a shifted screen with
 // no error anywhere.
 //
-// z = 0 is the near plane in apse's [0, 1] clip space, so this still passes a
-// 'less' depth test if a depth attachment is ever attached to the pass.
-out.clip = vec4f(in.position, 0.0);
+// **The 1.0 is w, not z, and it is load-bearing.** in.position is a vec3f, so
+// the fourth component this appends becomes the clip-space w — the divisor of
+// the perspective divide. With w = 0 every vertex of the triangle lands on the
+// same point, nothing rasterises, and the pass presents the destination
+// untouched. Nothing anywhere reports an error: the pipeline is valid, the draw
+// is issued, the fragment stage is never entered. The image is simply the clear
+// colour, forever.
+//
+// z comes from the mesh and is 0, the near plane in apse's [0, 1] clip space, so
+// the triangle still passes a 'less' depth test against a cleared attachment.
+out.clip = vec4f(in.position, 1.0);
 `;
 
 /**

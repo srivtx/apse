@@ -108,6 +108,7 @@ function computeBoundingSphere(
   vertexCount: number,
   floatsPerVertex: number,
   positionOffset: number,
+  name: string,
 ): Float32Array {
   if (vertexCount === 0) {
     out[0] = 0;
@@ -129,6 +130,18 @@ function computeBoundingSphere(
     const x = vertexData[base];
     const y = vertexData[base + 1];
     const z = vertexData[base + 2];
+    // NaN fails every `<` and every `>`, so a mesh with one NaN vertex produces a
+    // *finite* AABB that is missing it — and an under-estimated bound culls an
+    // object that is still on screen, with nothing reported. The finiteness test
+    // has to be explicit, which is why it is a separate branch and not a
+    // comparison.
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      fail('INVALID_USAGE',
+        `Mesh "${name}" has a non-finite position at vertex ${i}: (${x}, ${y}, ${z}).`, {
+        why: 'The bounding sphere is a min/max reduction over the positions, and a NaN compares false against everything, so it passes through the reduction without moving either end. The sphere that comes out is finite, looks right, and does not contain the mesh — which culls a visible object on every frame with no error anywhere.',
+        fix: `Find vertex ${i} and fix the number. \`Number.isFinite\` on the source array before constructing the MeshData is the cheap version of this check; apse raises it because the failure it prevents is a bound that silently drops geometry.`,
+      });
+    }
     if (x < minX) minX = x;
     if (x > maxX) maxX = x;
     if (y < minY) minY = y;
@@ -211,6 +224,17 @@ export class MeshData extends Resource {
         fix: 'Build the layout from `STANDARD_LAYOUT`, or declare at least `position: "float32x3"`.',
       });
     }
+    // The bounds pass below reads three consecutive floats at the position
+    // offset, and so does every primitive's writer. A two-component position
+    // does not fail loudly here — it makes z the *next* attribute's first
+    // component, so the bound describes a mesh that is not this one.
+    if (position.info.components < 3) {
+      fail('MESH_NO_POSITION',
+        `Mesh "${name}" declares "position" with ${position.info.components} components, and a position is at least 3.`, {
+        why: `Every consumer in apse reads a position as three floats at the offset the layout resolved: the bounding-sphere reduction here, and the primitives\' own scalar stores. "${position.format}" is ${position.info.components} wide, so the bounds pass would read the following attribute's first component as z and produce a finite, plausible, wrong bound.`,
+        fix: 'Declare `position: "float32x3"`. Every layout apse ships does, and a position is not optional: without a correct one there is nothing to bound and nothing to place.',
+      });
+    }
 
     const floatsPerVertex = layout.stride >> 2;
     const positionOffset = position.offset >> 2;
@@ -240,7 +264,7 @@ export class MeshData extends Resource {
 
     this.boundingSphere = override !== undefined
       ? copySphere(override, name)
-      : computeBoundingSphere(new Float32Array(4), vertexData, vertexCount, floatsPerVertex, positionOffset);
+      : computeBoundingSphere(new Float32Array(4), vertexData, vertexCount, floatsPerVertex, positionOffset, name);
   }
 
   /** Number of indices to draw, or the vertex count when the mesh is not indexed. */
@@ -267,10 +291,31 @@ export class MeshData extends Resource {
 
 function copySphere(source: ArrayLike<number>, name: string): Float32Array {
   if (source.length < 4) {
-    fail('INTERNAL_INVARIANT',
-      `Mesh "${name}" was given a ${source.length}-element bounding sphere; the invariant is 4 floats (x, y, z, r).`, {
+    fail('INVALID_USAGE',
+      `Mesh "${name}" was given a ${source.length}-element bounding sphere; it is [x, y, z, r], four numbers.`, {
       why: 'Every consumer in apse reads the bounds as a packed vec4, and a short array silently reads undefined for the missing components.',
       fix: 'Pass 4 numbers: [centreX, centreY, centreZ, radius]. Omit the option entirely to have apse compute it.',
+    });
+  }
+  // A bound is an over-estimate by contract, and an over-estimate is a number
+  // that has to be a number. A NaN radius fails the sphere test every time and
+  // a negative one fails it on the inside — neither culls the object, both leave
+  // the frustum test to compute with a bound it cannot reason about.
+  for (let k = 0; k < 4; k++) {
+    if (!Number.isFinite(source[k])) {
+      fail('INVALID_USAGE',
+        `Mesh "${name}" has a non-finite bounding sphere: (${source[0]}, ${source[1]}, ${source[2]}, ${source[3]}).`, {
+        why: 'The sphere is compared against a distance on every culled object of every frame. A non-finite component makes that comparison false, so the object is never culled and never reported wrong — it is simply outside the range where apse can reason about what it is doing.',
+        fix: `The override must be four finite numbers. Omit \`boundingSphere\` to have apse compute it from the vertices, which is right unless you know better than the vertex data.`,
+      });
+    }
+  }
+  if (source[3] < 0) {
+    fail('INVALID_USAGE',
+      `Mesh "${name}" has a negative bounding-sphere radius: ${source[3]}.`, {
+      why: 'The radius is a length. A negative one is not "a smaller bound", it is a bound that excludes the mesh\'s own vertices, and an under-estimated bound culls an object that is still on screen — the one failure mode of this value that is invisible.',
+      fix: `Pass the distance from the centre to the farthest vertex, which is never negative. A zero radius is legal and means every vertex sits exactly on the centre.`,
+      detail: { kind: 'numeric', field: 'boundingSphere.radius', value: source[3], min: 0 },
     });
   }
   return packSphere(set(create(), source[0], source[1], source[2], source[3]), new Float32Array(4));
@@ -320,6 +365,11 @@ function packAttributes(
         fix: `Give "${attr.name}" exactly ${expected} values, or correct the vertexCount. All attributes in a source must agree on the same count.`,
       });
     }
+    // Both of apse's writers emit 32-bit floats, so a normalised or integer
+    // format has no path to this buffer: the scalar store would write four f32
+    // bytes where the GPU reads one `unorm8` and three zero bytes, and 1.0 would
+    // arrive as 14/255. It compiles, it uploads, and it shades the wrong colour.
+    requireFloat32(attr.name, attr.format, `The "attributes" source for mesh "${name}"`);
   }
 
   const out = layout.allocate(vertexCount);
@@ -431,12 +481,12 @@ export class VertexWriter {
         fix: 'Use a layout that declares at least `position: "float32x3"`.',
       });
     }
-    requireFloat32(position.name, position.format);
+    requireFloat32(position.name, position.format, 'A primitive');
 
     const normal = layout.attribute('normal');
-    if (normal !== undefined) requireFloat32(normal.name, normal.format);
+    if (normal !== undefined) requireFloat32(normal.name, normal.format, 'A primitive');
     const uv = layout.attribute('uv');
-    if (uv !== undefined) requireFloat32(uv.name, uv.format);
+    if (uv !== undefined) requireFloat32(uv.name, uv.format, 'A primitive');
 
     this.count = count;
     this.floatsPerVertex = layout.stride >> 2;
@@ -449,12 +499,12 @@ export class VertexWriter {
   }
 }
 
-function requireFloat32(name: string, format: string): void {
+function requireFloat32(name: string, format: string, source: string): void {
   if (format === 'float32' || format === 'float32x2' || format === 'float32x3' || format === 'float32x4') return;
   fail('LAYOUT_MISMATCH',
-    `A primitive supplies "${name}" as 32-bit floats, but the layout declares "${format}".`, {
-    why: 'The primitive writers store their output straight into the interleaved buffer as f32. A normalised or packed format needs a per-component quantise step, which a scalar store cannot do.',
-    fix: `Declare "${name}" as float32x2/float32x3/float32x4, or build the attribute yourself through a MeshData \`attributes\` source, which packs any format.`,
+    `${source} supplies "${name}" as 32-bit floats, but the layout declares "${format}".`, {
+    why: 'Both of apse\'s CPU writers — VertexWriter and the `attributes` source — store their output straight into the interleaved buffer as f32. A normalised or packed format needs a per-component quantise step, which a scalar store cannot do, and there is no second path: the mismatched bytes still upload, the pipeline still validates, and the shader reads four f32 bytes as one byte and three zeroes.',
+    fix: `Declare "${name}" as float32x2/float32x3/float32x4, which is every format apse's own geometry uses. If you genuinely need a packed attribute, build the interleaved buffer yourself at the layout's stride and pass it as an \`interleaved\` source — that path takes the bytes as they are.`,
   });
 }
 
@@ -721,13 +771,21 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
   /**
    * Uploads the marked spans from `data`, and clears them. Returns true if it
    * wrote anything, so a caller can tell a frame that touched the mesh from one
-   * that did not without tracking it separately.
+   * that did not without tracking it separately. A mark on a buffer this mesh
+   * does not have — an index mark on a non-indexed mesh — is cleared and
+   * reported as *not* written, because that is what it is.
    *
    * `data` is the same {@link MeshData} the mesh was built from, passed back in
    * because the mesh does not retain it. A different one is refused by identity
    * on the layout plus a count check: re-uploading a *different* mesh's bytes
    * over this one produces a buffer that is internally consistent and visibly
    * wrong, which is the worst of both.
+   *
+   * The check is the layout's identity and the two counts, not the object's, and
+   * it cannot be more than that without retaining the `MeshData` — which is the
+   * CPU-side copy of the whole vertex buffer that {@link GpuMesh} exists to avoid.
+   * Two meshes that agree on all three are indistinguishable here and the write
+   * is structurally safe: the stride, the offsets, and the lengths are the same.
    */
   flush(data: MeshData): boolean {
     if (data.layout !== this.#sourceLayout
@@ -739,6 +797,8 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
         fix: `Keep the MeshData you passed to upload() and pass that same object to flush(): \`mesh.flush(theDataYouUploaded)\`.`,
       });
     }
+
+    let wrote = false;
 
     const vertices = this.vertexDirtyRange;
     if (vertices !== null) {
@@ -755,32 +815,35 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
       );
       this.#vLo = 0;
       this.#vHi = 0;
+      wrote = true;
     }
 
     const indices = this.indexDirtyRange;
     const source = data.indexData;
-    if (indices !== null && source !== null) {
-      // `writeBuffer` requires a whole number of 4-byte units, and a Uint16
-      // index is 2 bytes: an odd-length span is a validation error. Widening the
-      // span by one element is free — the extra index is a value the caller
-      // already had in the array and the draw never reaches it.
-      const odd = this.indexFormat === 'uint16' ? indices[1] & 1 : 0;
-      const count = Math.min(indices[1] + odd, source.length);
-      this.#queue.writeBuffer(
-        this.indexBuffer!,
-        indices[0] * source.BYTES_PER_ELEMENT,
-        source as Uint16Array<ArrayBuffer>,
-        indices[0],
-        count,
-      );
-      this.#iLo = 0;
-      this.#iHi = 0;
-    } else if (indices !== null) {
+    if (indices !== null) {
+      if (source !== null) {
+        // `writeBuffer` requires a whole number of 4-byte units, and a Uint16
+        // index is 2 bytes: an odd-length span is a validation error. Widening
+        // the span by one element is free — the extra index is a value the
+        // caller already had in the array and the draw never reaches it.
+        const odd = this.indexFormat === 'uint16' ? indices[1] & 1 : 0;
+        const count = Math.min(indices[1] + odd, source.length);
+        this.#queue.writeBuffer(
+          this.indexBuffer!,
+          indices[0] * source.BYTES_PER_ELEMENT,
+          source as Uint16Array<ArrayBuffer>,
+          indices[0],
+          count,
+        );
+        wrote = true;
+      }
+      // Cleared either way: a mark on a buffer that does not exist must not
+      // survive to be reported again on the next frame.
       this.#iLo = 0;
       this.#iHi = 0;
     }
 
-    return vertices !== null || indices !== null;
+    return wrote;
   }
 
   protected onDispose(): void {

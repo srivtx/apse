@@ -182,14 +182,20 @@ export function capsule(opts: CapsuleOptions = {}): MeshData {
     }
   }
 
-  // cross(∂u, ∂v) points inward for this parameterisation, so the quads step
-  // down the column first, exactly as `sphere()` does — and the pole fans
-  // inherit the same winding, which is why the north fan is (pole, a, a+1).
+  // The ring columns run the *opposite* rotational sense to `sphere()`'s: this
+  // profile puts column k at (r·cos φ, y, r·sin φ) with φ = 2πu, where the
+  // sphere puts it at (−r·cos φ, y, r·sin φ). The rows run north to south in
+  // both, so the same quad order that faces outward on the sphere faces inward
+  // here — the whole surface came out inside-out, which is invisible until a
+  // back-face-culled pipeline draws nothing. Stepping *up* the column first is
+  // the winding that matches this parameterisation, and the pole fans are its
+  // two degenerate cases: the north fan is (pole, a+1, a) and the south fan is
+  // (a+1, pole, a) around rings traversed the same way.
   let ii = 0;
   for (let k = 0; k < rs; k++) {
     indices[ii++] = 0;
-    indices[ii++] = ringAt(0) + k;
     indices[ii++] = ringAt(0) + k + 1;
+    indices[ii++] = ringAt(0) + k;
   }
   for (let i = 0; i < ringRows - 1; i++) {
     const row = ringAt(i);
@@ -198,15 +204,15 @@ export function capsule(opts: CapsuleOptions = {}): MeshData {
       const b = a + rowStride;
       const c = b + 1;
       const e = a + 1;
-      indices[ii++] = a; indices[ii++] = b; indices[ii++] = c;
-      indices[ii++] = a; indices[ii++] = c; indices[ii++] = e;
+      indices[ii++] = a; indices[ii++] = c; indices[ii++] = b;
+      indices[ii++] = a; indices[ii++] = e; indices[ii++] = c;
     }
   }
   const last = ringAt(ringRows - 1);
   for (let k = 0; k < rs; k++) {
-    indices[ii++] = last + k;
-    indices[ii++] = southPole;
     indices[ii++] = last + k + 1;
+    indices[ii++] = southPole;
+    indices[ii++] = last + k;
   }
 
   if (ii !== indexCount) {

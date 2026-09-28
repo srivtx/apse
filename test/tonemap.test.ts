@@ -551,7 +551,11 @@ describe('the generated tone map WGSL', () => {
     expect(vertexBody).not.toContain('frame.viewProj');
     expect(vertexBody).not.toContain('obj.');
     expect(vertexBody).not.toContain('frame.');
-    expect(vertexBody.trim()).toBe('out.clip = vec4f(in.position, 0.0);');
+    // The appended component is w, the divisor of the perspective divide. This
+    // exact literal is the whole assertion: it was `0.0`, which collapsed all
+    // three vertices onto one point, and the pass then presented its
+    // destination's clear colour forever with no validation error anywhere.
+    expect(vertexBody.trim()).toBe('out.clip = vec4f(in.position, 1.0);');
   });
 
   test('does not cull, because a fullscreen triangle has nothing to cull', () => {

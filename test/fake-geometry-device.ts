@@ -85,8 +85,23 @@ export class RecordingBuffer {
       throw new Error(`RecordingBuffer "${this.label}".getMappedRange() — the buffer is not mapped`);
     }
     const byteOffset = offset ?? 0;
-    const end = size === undefined ? this.contents.byteLength : byteOffset + size;
-    return this.contents.buffer.slice(byteOffset, end) as ArrayBuffer;
+    const length = size === undefined ? this.contents.byteLength - byteOffset : size;
+    if (byteOffset === 0 && length === this.contents.byteLength) {
+      // The buffer's **own** storage, not a copy of it. A real mapped range is a
+      // view onto the mapped memory: `new Float32Array(range).set(data)` writes
+      // into the buffer. Handing back a copy here silently discards every byte
+      // uploaded at `mappedAtCreation` — the upload "succeeds", the recorder
+      // writes nothing, and every read-back sees zeroes. The cast is sound: the
+      // buffer came from `new Uint8Array(size)`, so its ArrayBuffer is exclusive.
+      return this.contents.buffer as ArrayBuffer;
+    }
+    // A partial range cannot be an `ArrayBuffer` view, because the platform type
+    // is an `ArrayBuffer` and there is no such thing as a sub-array one. No apse
+    // upload path asks for one, so this is here to fail loudly rather than
+    // quietly wrong.
+    throw new Error(
+      `RecordingBuffer "${this.label}".getMappedRange(${byteOffset}, ${length}) — the fake only models a full-buffer mapping`,
+    );
   }
 
   unmap(): void {

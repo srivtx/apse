@@ -5,15 +5,24 @@
  * is written so that the order is the whole story:
  *
  * ```txt
- *   1. size     — did the backing store change? recreate targets if so.
+ *   1. size     — did the backing store change? recreate targets if so
  *   2. cull     — scene.collectDrawItems  (pruned transform walk + sphere tests)
  *   3. sort     — opaque front-to-back, transparent back-to-front, both grouped
  *   4. pack     — world matrices into the object uniform buffer, one write each
  *   5. upload   — frame uniform (1 write) + object uniform (1 write)
  *   6. encode   — one command encoder, one render pass, N draws
+ *   6b. present — one more pass on the same encoder: the fullscreen tone map
  *   7. submit   — one queue.submit
  *   8. stats    — timings, on a frame budget the caller can declare
  * ```
+ *
+ * Step 6b is the present pass, and it is on by default. `renderer.sceneTarget`
+ * is therefore an `rgba16float` intermediate rather than the canvas, and every
+ * material in the scene has to be compiled for `renderer.sceneFormat` — a
+ * material built for `getPreferredCanvasFormat()` fails through
+ * `assertDrawable`, naming both formats, instead of invalidating the whole
+ * command buffer with no exception. `toneMapping: null` and `hdr: false` are the
+ * two ways out, and both are slower.
  *
  * The budget is what makes this a renderer rather than a demo. Steps 2 through 5
  * are CPU time inside a 16.67 ms budget that is already shared with the browser's
@@ -34,6 +43,7 @@
  */
 
 import { fail } from '../core/error.ts';
+import { isErr } from '../core/result.ts';
 import { BIND_GROUP, FRAME_BLOCK, OBJECT_BLOCK } from '../core/slot.ts';
 import type { AseDevice, DeviceOptions } from './device.ts';
 import { createDevice, isDevelopmentMode } from './device.ts';
@@ -50,31 +60,48 @@ import {
 import { OBJECT_UNIFORM_STRIDE } from '../scene/graph.ts';
 import type { Scene } from '../scene/graph.ts';
 import type { Camera } from '../scene/camera.ts';
-import type { DrawItem } from './types.ts';
+import type { DrawItem, FrameTimingStats, RenderTarget } from './types.ts';
 import { sortDrawItems } from './sort.ts';
+import { GpuTimer } from './timing.ts';
+import { DEFAULT_TONE_MAPPING, PresentPass } from './present.ts';
+import type { TonemapOptions } from '../material/tonemap.ts';
 import type { Material } from '../material/material.ts';
+
+/**
+ * `(beginning, end)` query pairs one frame can carry.
+ *
+ * Three, because three is every pass a frame can open: opaque, transparent, and
+ * the present. A pair may be written **once per submission**, so a pair cannot
+ * be opened on one pass and closed on the next — reusing a write index is a
+ * validation error, and validation errors on a render pass discard the pass.
+ * One pair would time whichever single pass happened to be stamped, which on a
+ * transparent-heavy frame is the wrong one.
+ */
+const TIMESTAMP_PAIRS = 3;
 
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
-/** What one frame cost. All times in milliseconds. */
-export interface FrameStats {
+/**
+ * What one frame cost. All times in milliseconds.
+ *
+ * The three GPU fields come from {@link FrameTimingStats} rather than being
+ * declared here, so there is one definition of "a missing measurement is
+ * `null`" and not two that can drift.
+ */
+export interface FrameStats extends FrameTimingStats {
   /** Wall-clock time inside `render()`. The number that must stay under budget. */
   readonly cpu: number;
-  /** GPU time, or 0 when `timestamp-query` is unavailable. 1–2 frames late. */
-  readonly gpu: number;
   /** Measured ms/frame over the last `sampleSize` frames. */
   readonly averageCpu: number;
-  /** Measured ms/frame over the last `sampleSize` frames. */
-  readonly averageGpu: number;
   /** Draw calls encoded this frame. */
   readonly drawCalls: number;
-  /** Triangles submitted this frame. */
+  /** Triangles submitted this frame, counting every instance. */
   readonly triangles: number;
-  /** Draw items the scene produced before frustum culling. */
+  /** Mesh nodes the scene walk found, before frustum culling. */
   readonly candidates: number;
-  /** Draw items culled by the frustum. */
+  /** Mesh nodes the frustum rejected. Never counts a node that was not tested. */
   readonly culled: number;
   /** Bytes written by `queue.writeBuffer` this frame. */
   readonly uniformBytes: number;
@@ -98,10 +125,17 @@ export interface FrameStats {
 export interface RenderBudget {
   /** Maximum ms/frame of CPU time inside `render()`. */
   readonly cpu?: number;
-  /** Maximum ms/frame of GPU time. */
-  readonly gpu?: number;
-  /** Maximum draw calls per frame. */
+  /** Maximum ms/frame of draw calls. */
   readonly drawCalls?: number;
+  /**
+   * Maximum ms/frame of GPU time.
+   *
+   * Checked only when the device can be timed — see
+   * {@link FrameTimingStats.gpuTimingAvailable}. A budget against a number the
+   * renderer never measured has nothing to compare, and reporting a breach of it
+   * would send the reader to the GPU for a problem the CPU has.
+   */
+  readonly gpu?: number;
   /** Maximum ms/frame from a 1-object scene. Measures per-frame fixed cost. */
   readonly idle?: number;
   /** Samples averaged before a breach is reported. */
@@ -126,6 +160,39 @@ export interface CapturedFrame {
 export interface RendererOptions extends DeviceOptions {
   /** Depth attachment on the canvas target. Default true. */
   readonly depth?: boolean;
+  /**
+   * The tone map, or `null` for no present pass at all. Default
+   * {@link DEFAULT_TONE_MAPPING}.
+   *
+   * **On by default, and that is the point.** A material writes linear values
+   * and a canvas in `bgra8unorm` stores them verbatim, so a straight-to-canvas
+   * frame is a linear image displayed as if it were sRGB: too dark, with a lit
+   * surface reading as unlit and nothing reporting an error. That is why apse
+   * rendered darker than three.js out of the box.
+   *
+   * `null` restores the direct path — no intermediate, no fullscreen pass, no
+   * pipeline. It is a real cost, not a free setting: see `hdr`.
+   */
+  readonly toneMapping?: TonemapOptions | null;
+  /**
+   * Render the scene into an `rgba16float` intermediate and tone map that.
+   * Default true.
+   *
+   * **A tone map fed already-clipped LDR is nearly a no-op.** Without this, the
+   * intermediate carries the destination's own 8-bit format, the highlights were
+   * discarded before the curve saw them, and what is left is a full-screen pass
+   * to apply a curve to a clamped image.
+   *
+   * The consequence is that the scene renders into `rgba16float` instead of the
+   * canvas format, so **every material must be built for
+   * {@link Renderer.sceneFormat}**. One built for `getPreferredCanvasFormat()`
+   * now fails loudly, through `assertDrawable`, naming both formats — which is
+   * the intended trade: the alternative is a command buffer invalidated whole,
+   * with no exception. `toneMapping: null` and `hdr: false` are the two escape
+   * hatches, and they are the only way to keep a material written for the
+   * canvas format.
+   */
+  readonly hdr?: boolean;
   /** Declarative performance limits, checked every frame. */
   readonly budget?: RenderBudget;
   /** Frames of samples retained for averaging. Default 120. */
@@ -167,6 +234,10 @@ export class Renderer {
   readonly objectUniforms: ObjectUniforms;
 
   #canvas: RenderTargetImpl;
+  /** Null when `toneMapping: null`, in which case the scene draws to the canvas. */
+  #present: PresentPass | null = null;
+  /** Null when the device has no `timestamp-query`. Not an error: see FrameTimingStats. */
+  #timer: GpuTimer | null = null;
   #sizer: CanvasSizer;
   #items: DrawItem[] = EMPTY_ITEMS;
   #sorted: DrawItem[] = [];
@@ -220,6 +291,14 @@ export class Renderer {
     this.#cpuSamples = new Float64Array(this.#sampleSize);
     this.#gpuSamples = new Float64Array(this.#sampleSize);
     this.#lastStats = emptyStats();
+
+    // Three pairs, because a frame can open an opaque pass, a transparent pass
+    // and the present pass, and one write index may only be written once per
+    // submission. `isErr`, not a throw: a device without `timestamp-query` is a
+    // fact about the machine, and it is roughly half of them. Carrying on with
+    // `stats.gpu === null` is the whole contract.
+    const timing = GpuTimer.create(device, { pairs: TIMESTAMP_PAIRS });
+    this.#timer = isErr(timing) ? null : timing.value;
   }
 
   /**
@@ -229,16 +308,59 @@ export class Renderer {
    * both return promises, and shader compilation on first draw is asynchronous.
    * A synchronous constructor is not possible here, and a lazily-initialised
    * one hides the cost until the first frame instead of at setup.
+   *
+   * It is also where the present pass is built, which is the second reason to
+   * await: a tone map is a compiled pipeline, and compiling one on the first
+   * frame is a two-to-five second stall on a cold shader cache.
    */
   static async create(canvas: HTMLCanvasElement, opts: RendererOptions = {}): Promise<Renderer> {
     const device = await createDevice(canvas, opts);
     try {
-      return new Renderer(device, opts);
+      const renderer = new Renderer(device, opts);
+      renderer.#present = await renderer.#createPresentPass(opts);
+      // The pass may have been built with an exposure of its own, and this is the
+      // only object that reports one. Adopting it here is what keeps
+      // `renderer.exposure` from answering 1 while the screen is at 0.5.
+      if (renderer.#present !== null) renderer.#exposure = renderer.#present.exposure;
+      return renderer;
     } catch (err) {
+      // Destroying the device frees every resource derived from it, so this is
+      // the whole teardown even though the partially built renderer's own
+      // objects are left to the collector.
       device.destroy();
       throw err;
     }
   }
+
+  /**
+   * The present pass, or `null` when the caller asked for the direct path.
+   *
+   * Built after the canvas target because the pass's destination *is* that
+   * target, and its intermediate is sized from it. The resolved options are kept
+   * because {@link Renderer.capture} builds a second, identical pass over its own
+   * target, and a capture that tone mapped differently from the screen would be
+   * worse than no capture at all.
+   */
+  async #createPresentPass(opts: RendererOptions): Promise<PresentPass | null> {
+    this.#toneOptions = opts.toneMapping === undefined ? DEFAULT_TONE_MAPPING : opts.toneMapping;
+    this.#hdr = opts.hdr ?? true;
+    if (this.#toneOptions === null) return null;
+    return PresentPass.create(this.device, {
+      target: this.#canvas,
+      toneMapping: this.#toneOptions,
+      hdr: this.#hdr,
+      // Forwarded so `sampleCount: 4` is real MSAA rather than an option that
+      // quietly does nothing — a canvas texture is never multisampled, so the
+      // intermediate is the only place 4x can live. Ignored by the direct path,
+      // where nothing is multisampled at all.
+      sampleCount: this.device.sampleCount,
+      label: 'apse.present',
+    });
+  }
+
+  /** Resolved once, so `capture()`'s pass cannot differ from the screen's. */
+  #toneOptions: TonemapOptions | null = null;
+  #hdr = true;
 
   /** One line about the machine, for bug reports and for the demo header. */
   describeGpu(): string {
@@ -254,6 +376,33 @@ export class Renderer {
   get stats(): FrameStats { return this.#lastStats; }
 
   get drawItemCount(): number { return this.#items.length; }
+
+  /**
+   * Where the scene is drawn: the present pass's intermediate, or the canvas.
+   *
+   * This is the target a material's `targetFormat` has to match, and
+   * {@link Renderer.sceneFormat} is the number to read rather than guessing.
+   */
+  get sceneTarget(): RenderTargetImpl {
+    return this.#resolveSceneTarget();
+  }
+
+  /**
+   * The colour format the scene is rendered into, which is what every material
+   * in the scene has to be compiled for.
+   *
+   * `rgba16float` by default, because the present pass tone maps an HDR
+   * intermediate. It is the canvas's preferred format only in the direct path.
+   */
+  get sceneFormat(): GPUTextureFormat {
+    return this.#resolveSceneTarget().format;
+  }
+
+  #resolveSceneTarget(): RenderTargetImpl {
+    const pass = this.#present;
+    if (pass === null) return this.#canvas;
+    return asImpl(pass.sceneTarget);
+  }
 
   /** Called when a budget is exceeded, once per breach. */
   onBudgetBreached(fn: ((budget: string, actual: number, limit: number) => void) | null): void {
@@ -272,10 +421,21 @@ export class Renderer {
    * have to reason about a requestAnimationFrame callback that may not fire for
    * another 16 ms, or at all if the tab is hidden.
    *
-   * `target` defaults to the canvas. Passing an offscreen target is how you
-   * render to a texture for a post-processing pass, an export, or a readback.
+   * `target` defaults to the **scene** target: the present pass's intermediate
+   * when there is one, the canvas when there is not. That is the only correct
+   * default, because the present pass is built around sampling an intermediate —
+   * a canvas texture has no `TEXTURE_BINDING`, so there is nothing for it to
+   * read. Passing the canvas explicitly would draw into a texture the tone map
+   * never sees, and the user would get a black frame from a renderer that
+   * reports no error.
+   *
+   * Passing an offscreen target is how you render to a texture for a later
+   * post-processing pass, an export, or a readback. **The present pass still
+   * presents into the canvas**, from its own intermediate, so a custom target
+   * receives the scene and not the tone-mapped image. See {@link Renderer.capture}
+   * for what that means for screenshots.
    */
-  render(scene: Scene, camera?: Camera, target: RenderTargetImpl = this.#canvas): FrameStats {
+  render(scene: Scene, camera?: Camera, target: RenderTargetImpl = this.#resolveSceneTarget()): FrameStats {
     this.#assertLive();
     if (this.#disposed) {
       fail('RENDERER_ALREADY_DISPOSED', 'This Renderer was disposed.', {
@@ -306,7 +466,6 @@ export class Renderer {
 
     // --- 2. cull ------------------------------------------------------------
     const sceneItems = scene.collectDrawItems(this.#items, cam, OBJECT_UNIFORM_STRIDE);
-    const candidateTotal = sceneItems.length;
 
     // --- 3. sort ------------------------------------------------------------
     // The sorted array is what gets drawn. Sorting a copy and then encoding the
@@ -330,9 +489,12 @@ export class Renderer {
     this.#encode(drawList, packed, target);
 
     const cpu = now() - cpuStart;
-    // From the walk, not derived here: `drawList` only holds survivors, so
-    // subtracting its length from itself would read zero in every scene.
-    this.#record(cpu, uniformBytes, candidateTotal, scene.meshNodeCount - candidateTotal);
+    // Both counters come from the walk, not from `drawList` and not from
+    // arithmetic on it: `drawList` only holds survivors, so subtracting its
+    // length from itself would read zero in every scene, and
+    // `meshNodeCount - candidates` is only equal to the culled count until the
+    // walk starts dropping a node for a reason that is not culling.
+    this.#record(cpu, uniformBytes, scene.meshNodeCount, scene.culledCount);
 
     this.#frameIndex++;
     this.#lastStats = this.#current;
@@ -389,6 +551,11 @@ export class Renderer {
     if (v !== this.#exposure) {
       this.#exposure = v;
       this.#exposureDirty = true;
+      // Forwarded, because the frame block's copy is not what the image comes
+      // from: the tone map re-asserts its own value every render, so setting it
+      // on the renderer alone would leave the screen at the old exposure.
+      this.#present?.setExposure(v);
+      this.#capturePass?.setExposure(v);
     }
   }
   get exposure(): number { return this.#exposure; }
@@ -410,11 +577,44 @@ export class Renderer {
    * `bytesPerRow` is padded to the 256-byte alignment `copyTextureToBuffer`
    * requires, so `data` is `bytesPerRow * height` long and rows must be read at
    * that stride rather than `width * 4`.
+   *
+   * **With the present pass on, the scene is not rendered into that target.** It
+   * cannot be: a material's pipeline is compiled for the scene format, which is
+   * `rgba16float`, and an 8-bit capture target is a different format — so the
+   * mismatch is a hard error rather than a dark image. The capture therefore goes
+   * through a second present pass whose *destination* is the capture target: the
+   * scene renders into an intermediate of the format it was compiled for, the
+   * tone map runs, and the result lands in the 8-bit target. Those are the same
+   * pixels that are on screen, which is the whole point of a screenshot — and
+   * copying the pre-tone-map intermediate instead would hand back linear values
+   * that look far too dark for exactly the reason the un-tone-mapped canvas did.
+   *
+   * The cost is one extra pipeline, one fullscreen mesh and one intermediate,
+   * built on the first `capture()` and never again. The pipeline is compiled
+   * rather than shared because {@link PresentPass} owns its own; the layout it
+   * compiles against is the shared per-device one, so the driver reuses the
+   * compiled program rather than building a second one.
    */
   async capture(scene: Scene, camera?: Camera): Promise<CapturedFrame> {
     this.#assertLive();
     const target = this.#acquireCaptureTarget();
-    this.render(scene, camera, target);
+    if (this.#present === null) {
+      // No tone map anywhere, so the scene's own output *is* the image and the
+      // capture target is simply a second canvas.
+      this.render(scene, camera, target);
+    } else {
+      const pass = await this.#capturePresentPass(target);
+      this.render(scene, camera, asImpl(pass.sceneTarget));
+      // Its own encoder and its own submit. A screenshot is worth a second
+      // submit; the frame loop is not, which is why the present pass inside
+      // `render()` shares the frame's encoder instead.
+      //
+      // The screen's own present pass still runs inside that `render()` call —
+      // one wasted fullscreen pass, on a path that already awaits a buffer map.
+      // Suppressing it would mean threading a "do not present" flag through
+      // `render()` for the sake of one draw a screenshot performs.
+      pass.render();
+    }
 
     const width = target.width;
     const height = target.height;
@@ -450,6 +650,9 @@ export class Renderer {
 
   /** Lazily allocated, resized with the canvas, disposed with the renderer. */
   #captureTarget: RenderTargetImpl | null = null;
+  #capturePass: PresentPass | null = null;
+  /** In-flight build, so two concurrent `capture()` calls share one pass. */
+  #capturePassPending: Promise<PresentPass> | null = null;
 
   #acquireCaptureTarget(): RenderTargetImpl {
     if (this.#captureTarget !== null && !this.#captureTarget.disposed) return this.#captureTarget;
@@ -475,10 +678,50 @@ export class Renderer {
     return t;
   }
 
+  /**
+   * The present pass that presents into the capture target. Built once.
+   *
+   * Same tone map and same intermediate format as the screen's pass, so the
+   * captured pixels are the displayed pixels rather than a second opinion about
+   * them. The tone map's own sRGB decision comes from the destination it is given
+   * — the capture target's format, which is the canvas's — so the two passes
+   * cannot disagree about it.
+   */
+  async #capturePresentPass(target: RenderTargetImpl): Promise<PresentPass> {
+    if (this.#capturePass !== null) return this.#capturePass;
+    this.#capturePassPending ??= PresentPass.create(this.device, {
+      target,
+      toneMapping: this.#toneOptions,
+      hdr: this.#hdr,
+      sampleCount: 1,
+      label: 'apse.capture.present',
+    });
+    try {
+      const pass = await this.#capturePassPending;
+      pass.setExposure(this.#exposure);
+      this.#capturePass = pass;
+      return pass;
+    } finally {
+      this.#capturePassPending = null;
+    }
+  }
+
   dispose(): void {
     if (this.#disposed) return;
     this.stop();
     this.#disposed = true;
+    // The present pass owns the scene target, its fullscreen mesh, and the tone
+    // map material, and it disposes them itself. The order matters only in that
+    // the pass must go before the canvas it presents into.
+    this.#present?.dispose();
+    this.#present = null;
+    // Before the capture target it presents into, same as the canvas above.
+    this.#capturePass?.dispose();
+    this.#capturePass = null;
+    // A pending timestamp map rejects on destroy; GpuTimer absorbs it. Nothing
+    // here is awaited, because teardown does not block.
+    this.#timer?.dispose();
+    this.#timer = null;
     this.#captureTarget?.dispose();
     this.#canvas.dispose();
     this.#sizer.dispose();
@@ -497,10 +740,24 @@ export class Renderer {
    * Resizing invalidates the swapchain texture, and WebGPU has no depth buffer,
    * so the depth attachment has to be rebuilt too. Doing this only on an actual
    * change matters: a naive `resize()` on every frame reallocates every frame.
+   *
+   * The present pass's intermediate is resized in the same step, and it is not
+   * optional. It is the scene target now, so leaving it at the old extent would
+   * render this frame at one size and tone map it at another — a stretched
+   * image with no error anywhere, on the one frame after every window resize.
    */
   #syncSize(): void {
     if (!this.#sizer.update()) return;
     this.#canvas.resize(this.#sizer.width, this.#sizer.height);
+    this.#present?.resize(this.#sizer.width, this.#sizer.height);
+    // The capture target and its pass are resized together, and only if they
+    // exist. `capture()` reads the canvas's size when it first runs, so without
+    // this a screenshot taken after a window resize would be the old size — and
+    // the pass's intermediate would not match the target it presents into.
+    if (this.#captureTarget !== null) {
+      this.#captureTarget.resize(this.#sizer.width, this.#sizer.height);
+      this.#capturePass?.resize(this.#sizer.width, this.#sizer.height);
+    }
   }
 
   /**
@@ -595,6 +852,14 @@ export class Renderer {
       // Packed at `slot`, not at the loop index: the dynamic offset a draw binds
       // is derived from `objectId`, so packing by position would put each
       // transform in the slot of whatever object sorts into that position.
+      //
+      // **Once per draw item, never once per instance.** An instanced draw
+      // binds a single object slot and reads each instance's transform from
+      // `instanceBuffer` as a vertex attribute at `@location(3..6)` — which is
+      // a vertex buffer rather than a storage buffer precisely so this works in
+      // compatibility mode. Looping over instances here would write the same
+      // 256 bytes N times into N slots, and N − 1 of them would be read by
+      // nobody.
       u.pack(slot, item.model, _normal, slot, item.firstInstance, 1);
 
       this.#packedModel[slot] = item.model;
@@ -671,6 +936,11 @@ export class Renderer {
    * with a different depth-write mode — because depth state is baked into the
    * pipeline, not settable mid-pass, so the two phases genuinely cannot share a
    * pass.
+   *
+   * The present pass is step 6b, recorded into the *same* encoder just before
+   * the submit. One submit rather than two: two submits would let the browser
+   * present the scene target's frame as its own, which is a frame with no tone
+   * map on screen and a compositor sync in the middle of it.
    */
   #encode(items: DrawItem[], objectCount: number, target: RenderTargetImpl): void {
     const device = this.device.device;
@@ -691,6 +961,10 @@ export class Renderer {
     this.#encPipelineCalls = 0;
     this.#encBindGroupCalls = 0;
     this.#encBufferCalls = 0;
+    // Reset per frame, and read by #record after the submit. It is a field
+    // rather than a local because the reading is taken after this method has
+    // returned, from the pairs the readback in this frame will resolve.
+    this.#passCount = 0;
 
     // Redundant-call suppression.
     //
@@ -709,6 +983,22 @@ export class Renderer {
     let lastIB: GPUBuffer | null = null;
     let lastInstanceIB: GPUBuffer | null = null;
 
+    /**
+     * The `timestampWrites` for the next pass, or `undefined` for none.
+     *
+     * Each pass takes the next pair, and a pass past the last pair gets none
+     * rather than a shared one: a `(beginning, end)` write index may be written
+     * **once per submission**, and writing it twice is a validation error that
+     * discards the pass. Four passes cannot be timed with three pairs, and
+     * timing three of them honestly beats invalidating the frame.
+     */
+    const nextStamp = (): GPURenderPassTimestampWrites | undefined => {
+      const timer = this.#timer;
+      const pair = this.#passCount++;
+      if (timer === null || pair >= TIMESTAMP_PAIRS) return undefined;
+      return timer.writes(pair);
+    };
+
     const begin = (): GPURenderPassEncoder => {
       const p = encoder.beginRenderPass({
         label: msaa ? 'apse:msaa' : 'apse:pass',
@@ -725,6 +1015,11 @@ export class Renderer {
           depthLoadOp: 'clear',
           depthStoreOp: 'store',
         },
+        // Only ever present when a timer exists. Attaching a write index on a
+        // device without `timestamp-query` is a validation error, not a no-op,
+        // and it would invalidate every frame on exactly the devices that
+        // cannot report their GPU time.
+        timestampWrites: nextStamp(),
       });
       lastPipeline = null;
       // A pass has its own attachments, so nothing bound in the previous pass
@@ -757,22 +1052,12 @@ export class Renderer {
 
       if (lastPipeline !== material.renderPipeline) {
         this.#encPipelineCalls++;
-        // A pipeline is bound to its attachment formats at creation, and Dawn
-        // reports a mismatch at `setPipeline` as a validation error naming two
-        // format enums. That is a technically accurate description of a mistake
-        // that is almost always "you forgot to pass the format", so it is
-        // checked here instead, where the fix can be stated.
-        if (material.targetFormats[0] !== target.format) {
-          fail('RENDER_TARGET_FORMAT_MISMATCH',
-            `Material "${material.name}" was compiled for colour format ` +
-            `"${material.targetFormats[0] ?? 'unknown'}" but is being drawn into a target of ` +
-            `format "${target.format}".`, {
-            why: 'WebGPU bakes the colour attachment format into a render pipeline. A pipeline cannot be used with a pass whose colour format differs, and the mismatch invalidates the whole command buffer — not just this draw — so nothing appears on screen and no exception is thrown.',
-            fix: material.targetFormats[0] === 'rgba8unorm' || material.targetFormats[0] === 'bgra8unorm'
-              ? `Pass the target's format when creating the material: pbrMaterial(device, { targetFormat: "${target.format}" }). The canvas default is navigator.gpu.getPreferredCanvasFormat(), which is bgra8unorm on desktop.`
-              : `Recreate the material with \`targetFormat: "${target.format}"\`, or draw it into a target of format "${material.targetFormats[0]}".`,
-          });
-        }
+        // A pipeline is bound to its attachment formats at creation, and using
+        // it with a pass whose colour format differs invalidates the whole
+        // command buffer with no exception anywhere. `assertDrawable` is the one
+        // place that already knows how to say that in terms of the mistake, and
+        // it costs one array length and one string identity per pipeline change.
+        target.assertDrawable(material);
         enc.setPipeline(material.renderPipeline);
         lastPipeline = material.renderPipeline;
       }
@@ -823,25 +1108,32 @@ export class Renderer {
           enc.setVertexBuffer(0, geometry.vertexBuffer);
           lastVB = geometry.vertexBuffer;
         }
-        triangles += (geometry.indexCount / 3) * instances;
-      } else {
-        if (lastVB !== geometry.vertexBuffer) {
-          enc.setVertexBuffer(0, geometry.vertexBuffer);
-          lastVB = geometry.vertexBuffer;
-        }
-        triangles += (geometry.indexCount / 3) * instances;
+      } else if (lastVB !== geometry.vertexBuffer) {
+        this.#encBufferCalls++;
+        enc.setVertexBuffer(0, geometry.vertexBuffer);
+        lastVB = geometry.vertexBuffer;
       }
+      // Counted once, after the branch: an unindexed mesh's `indexCount` is its
+      // vertex count, so both forms submit the same number of triangles.
+      triangles += (geometry.indexCount / 3) * instances;
 
-      // Slot 1 carries per-instance transforms. An instanced layout always has
-      // two slots; a non-instanced one has one, and the buffer is absent, so the
-      // slot is skipped rather than bound to null.
-      const instBuf = instanceBufferOf(geometry);
-      if (instBuf !== null) {
-        if (lastInstanceIB !== instBuf) {
-          this.#encBufferCalls++;
-          enc.setVertexBuffer(1, instBuf);
-          lastInstanceIB = instBuf;
-        }
+      // Slot 1 carries the per-instance transforms, `stepMode: 'instance'`.
+      //
+      // **Non-null is the only correct test for "this is instanced".** The count
+      // is not a substitute in either direction. `instanceCount > 1` skips the
+      // slot on a mesh that was uploaded with a thousand instances and asked to
+      // draw one of them — an ordinary call, and the pipeline still declares
+      // slot 1, so the vertex stage reads whatever happens to be bound there: a
+      // wrong image and no error. `instanceCount > 0` is a scene-level test and
+      // says nothing about what the layout declares.
+      //
+      // The whole of instancing is this one call plus the count in the draw
+      // below: N copies, one `drawIndexed`, one object-uniform slot.
+      const instBuf = item.geometry.instanceBuffer;
+      if (instBuf !== null && lastInstanceIB !== instBuf) {
+        this.#encBufferCalls++;
+        enc.setVertexBuffer(1, instBuf);
+        lastInstanceIB = instBuf;
       }
 
       if (geometry.indexBuffer !== null) {
@@ -855,7 +1147,33 @@ export class Renderer {
     }
 
     if (pass !== null) pass.end();
+
+    // A frame with nothing in it still has to clear. With the present pass on,
+    // the scene target is an intermediate that outlives the frame, and the tone
+    // map samples whatever is in it — so without this an empty scene would
+    // present the *previous* frame's pixels indefinitely. One pass, no draws,
+    // and only on frames that would otherwise have encoded nothing at all.
+    if (items.length === 0) begin().end();
+
+    const present = this.#present;
+    if (present !== null) {
+      const pair = this.#passCount++;
+      // Same rule as `nextStamp`: a pair past the end is skipped rather than
+      // shared, because a write index may only be written once per submission.
+      const stamp = this.#timer === null || pair >= TIMESTAMP_PAIRS ? undefined : this.#timer.writes(pair);
+      present.render(encoder, stamp);
+    }
+
+    // After every stamped pass has ended, before `finish()`. `resolveQuerySet` is
+    // a queue command: encoded after the passes, it observes their timestamps,
+    // and encoded into the same command buffer, the result never travels through
+    // the CPU on its way to the readback.
+    if (this.#timer !== null && this.#passCount > 0) this.#timer.encodeReadback(encoder);
     device.queue.submit([encoder.finish()]);
+    // Never awaited. The reading lands a frame or two later, which is what
+    // `#measureGpu` reports; blocking here would stall every frame for a number
+    // the caller cannot act on until the frame after anyway.
+    this.#timer?.poll();
     this.#encoder = null;
     this.#pendingDrawCalls = drawCalls;
     this.#pendingTriangles = triangles;
@@ -867,6 +1185,30 @@ export class Renderer {
   #encPipelineCalls = 0;
   #encBindGroupCalls = 0;
   #encBufferCalls = 0;
+  /** Render passes opened by the frame being encoded. See `nextStamp`. */
+  #passCount = 0;
+
+  /**
+   * Milliseconds of GPU time for the frame just encoded, or `null`.
+   *
+   * Read from the timer *after* the submit, so it is a reading from an earlier
+   * frame: the timestamp for this frame's work has been encoded but the copy
+   * that brings it to the CPU has not been mapped yet. That one-to-two-frame lag
+   * is why this is a trend and not a verdict — and it is also why the previous
+   * behaviour of reporting a hardcoded `0` was not a simplification but a lie
+   * on every frame.
+   */
+  #measureGpu(): number | null {
+    const timer = this.#timer;
+    if (timer === null) return null;
+    // No pass carried a timestamp, so nothing was measured. A 0 here would say
+    // the GPU was idle, which is a different fact about a different machine.
+    if (this.#passCount === 0) return null;
+    // Pairs past the ones this frame stamped are excluded rather than summed:
+    // a frame that opened one pass cannot have a present pass in it, and
+    // including a stale pair would attribute another frame's time to this one.
+    return timer.sumMs(Math.min(this.#passCount, TIMESTAMP_PAIRS));
+  }
 
   /**
    * Step 8: statistics and budget enforcement.
@@ -875,20 +1217,32 @@ export class Renderer {
    * frame is a GC pause and not a regression. The window length is the
    * difference between a budget that reports a problem and a budget that fires
    * every time a shader finishes compiling.
+   *
+   * `candidates` is the pre-cull count the walk saw and `culled` is what the
+   * frustum rejected. Both are passed in rather than derived: the draw list holds
+   * only survivors, so anything computed from it reads zero in every scene, and
+   * `meshNodeCount - survivors` silently counts a node that was not submitted for
+   * a non-cull reason — a hidden layer, an empty geometry — as though the
+   * frustum had thrown it away.
    */
   #record(cpu: number, uniformBytes: number, candidates: number, culled: number): void {
     const s = this.#current;
-    const gpu = 0;
+    const gpu = this.#measureGpu();
     const drawCalls = this.#pendingDrawCalls;
     const triangles = this.#pendingTriangles;
 
     this.#cpuSamples[this.#sampleCursor] = cpu;
-    this.#gpuSamples[this.#sampleCursor] = gpu;
+    // NaN rather than 0 for "not measured", because the ring cannot shrink. A
+    // zero here would be averaged in as though the GPU had been timed at zero,
+    // and the mean of nine measured frames and one unmeasured frame is not a
+    // tenth of anything.
+    this.#gpuSamples[this.#sampleCursor] = gpu ?? Number.NaN;
     this.#sampleCursor = (this.#sampleCursor + 1) % this.#sampleSize;
     if (this.#sampleCount < this.#sampleSize) this.#sampleCount++;
 
     s.cpu = cpu;
     s.gpu = gpu;
+    s.gpuTimingAvailable = this.#timer !== null;
     s.drawCalls = drawCalls;
     s.triangles = triangles;
     s.candidates = candidates;
@@ -902,7 +1256,7 @@ export class Renderer {
     s.packedObjects = this.#packedCount;
     s.skippedObjects = this.#lastDrawn - this.#packedCount;
     s.averageCpu = average(this.#cpuSamples, this.#sampleCount);
-    s.averageGpu = average(this.#gpuSamples, this.#sampleCount);
+    s.averageGpu = averageMeasured(this.#gpuSamples, this.#sampleCount);
 
     this.#checkBudget(s);
   }
@@ -916,7 +1270,11 @@ export class Renderer {
       }
     };
     if (b.cpu !== undefined) breach('cpu', s.averageCpu, b.cpu);
-    if (b.gpu !== undefined) breach('gpu', s.averageGpu, b.gpu);
+    // Only with a number to compare. A `gpu` budget on a device that cannot be
+    // timed has to stay silent: reporting a breach of a measurement that was
+    // never taken is the one thing a budget must not do, because it sends the
+    // reader to the GPU for a problem the CPU has.
+    if (b.gpu !== undefined && s.averageGpu !== null) breach('gpu', s.averageGpu, b.gpu);
     if (b.drawCalls !== undefined) breach('drawCalls', s.drawCalls, b.drawCalls);
     if (b.idle !== undefined && s.drawCalls <= 1) breach('idle', s.averageCpu, b.idle);
   }
@@ -939,7 +1297,7 @@ function now(): number {
 
 function emptyStats(): MutableStats {
   return {
-    cpu: 0, gpu: 0, averageCpu: 0, averageGpu: 0,
+    cpu: 0, gpu: null, averageCpu: 0, averageGpu: null, gpuTimingAvailable: false,
     drawCalls: 0, triangles: 0, candidates: 0, culled: 0,
     uniformBytes: 0, cpuPerDraw: 0,
     bindGroupCalls: 0, pipelineCalls: 0, bufferCalls: 0, naiveCalls: 0,
@@ -952,6 +1310,28 @@ function average(samples: Float64Array, count: number): number {
   let sum = 0;
   for (let i = 0; i < count; i++) sum += samples[i]!;
   return sum / count;
+}
+
+/**
+ * Mean of the samples that are numbers, or `null` when none of them are.
+ *
+ * Separate from {@link average} because the two windows hold different things.
+ * The CPU sample is always a number; a GPU sample is `NaN` on every frame the
+ * device could not be timed, and dividing by the full window would report an
+ * average of a measurement that was partly fabricated. Skipping the gaps and
+ * dividing by the readings that exist is the honest mean, and returning `null`
+ * for "none yet" is what keeps `averageGpu: 0` from reading as an idle GPU.
+ */
+function averageMeasured(samples: Float64Array, count: number): number | null {
+  let sum = 0;
+  let readings = 0;
+  for (let i = 0; i < count; i++) {
+    const value = samples[i]!;
+    if (!Number.isFinite(value)) continue;
+    sum += value;
+    readings++;
+  }
+  return readings === 0 ? null : sum / readings;
 }
 
 /**
@@ -984,14 +1364,31 @@ function nextPowerOfTwo(n: number): number {
   return p;
 }
 
-function instanceBufferOf(geometry: DrawItem['geometry']): GPUBuffer | null {
-  const b = (geometry as { instanceBuffer?: GPUBuffer | null }).instanceBuffer;
-  return b ?? null;
-}
-
 function indexFormatOf(geometry: DrawItem['geometry']): GPUIndexFormat {
   const fmt = (geometry as { indexFormat?: GPUIndexFormat | null }).indexFormat;
   return fmt ?? 'uint16';
+}
+
+/**
+ * Narrows a present pass's intermediate to its concrete class.
+ *
+ * `PresentPass.sceneTarget` is typed as the `RenderTarget` interface, and its own
+ * comment argues for that: a renderer's `target` parameter should be the
+ * interface too. The renderer cannot take it, because `#encode` calls
+ * `assertDrawable`, which the interface does not declare — and a check that only
+ * some targets get is the exact failure this class of mistake produces.
+ *
+ * Narrowed rather than cast, so that if a future pass ever hands back something
+ * else this says so at the point of use instead of skipping a format check on
+ * every draw of every frame.
+ */
+function asImpl(target: RenderTarget): RenderTargetImpl {
+  if (target instanceof RenderTargetImpl) return target;
+  fail('INTERNAL_INVARIANT',
+    `A present pass handed back a scene target of type ${target.constructor.name}.`, {
+    why: 'PresentPass builds its intermediate with createColorTarget, so it is always a RenderTargetImpl. The renderer needs assertDrawable from it, and a target that is not one would silently skip the colour-format check that stands between a user and an invalidated command buffer.',
+    fix: 'This is a bug in apse. Please report it with your RendererOptions.',
+  });
 }
 
 /**

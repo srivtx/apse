@@ -1191,19 +1191,20 @@ describe('roundedBox', () => {
     expect(maxX).toBeCloseTo(0.5, 6);
     expect(maxY).toBeCloseTo(0.5, 6);
     expect(maxZ).toBeCloseTo(0.5, 6);
-    // And the middle of the +Y face is exactly on the plane, with the face
-    // normal: the projection is the identity where the fillet is not.
-    const centres = pos(m, 0).map((_, i) => i);
-    expect(centres.length).toBe(3);
+    // And the flat middle of the +Y face is exactly on the plane, with the face
+    // normal: the projection is the identity where the fillet is not. There is
+    // no vertex at the face's centre and there cannot be one — the grid spends
+    // `segments` intervals on each rounded band and exactly one on the flat
+    // middle, because a plane is a quad. So the flat middle is the four vertices
+    // of that quad, and the centre of the face is interior to a triangle.
     let onTopFace = 0;
     for (let i = 0; i < m.vertexCount; i++) {
       const p = pos(m, i);
-      if (p[1] === 0.5 && p[0] === 0 && p[2] === 0) {
-        expect(nrm(m, i).join(','), 'the face centre is planar and outward').toBe('0,1,0');
-        onTopFace++;
-      }
+      if (p[1] !== 0.5) continue;
+      expect(nrm(m, i).join(','), `vertex ${i} on the +Y plane is planar and outward`).toBe('0,1,0');
+      onTopFace++;
     }
-    expect(onTopFace, 'the +Y face has a vertex at its centre').toBeGreaterThan(0);
+    expect(onTopFace, 'the +Y face has one quad of flat middle').toBe(4);
   });
 
   test('every triangle winds CCW as seen from outside', () => {
@@ -1217,16 +1218,51 @@ describe('roundedBox', () => {
   });
 
   test('honours non-uniform extents and a POSITION_LAYOUT', () => {
-    const m = roundedBox({ width: 4, height: 2, depth: 1, radius: 0.2, segments: 2 });
+    const radius = 0.2;
+    const m = roundedBox({ width: 4, height: 2, depth: 1, radius, segments: 2 });
+    const reached = [0, 0, 0];
+    let far = 0;
     for (let i = 0; i < m.vertexCount; i++) {
       const p = pos(m, i);
-      expect(Math.abs(p[0])).toBeLessThanOrEqual(2 + 1e-6);
-      expect(Math.abs(p[1])).toBeLessThanOrEqual(1 + 1e-6);
-      expect(Math.abs(p[2])).toBeLessThanOrEqual(0.5 + 1e-6);
+      for (let a = 0; a < 3; a++) reached[a] = Math.max(reached[a], Math.abs(p[a]));
+      far = Math.max(far, length(p));
     }
-    expect(m.boundingSphere[3]).toBeCloseTo(cornerDistance(0.2, 0.5), 4);
+    // Every axis reaches its own half extent — the silhouette of the sharp box,
+    // which is the whole claim of a fillet over a chamfer.
+    expect(reached[0]).toBeCloseTo(2, 6);
+    expect(reached[1]).toBeCloseTo(1, 6);
+    expect(reached[2]).toBeCloseTo(0.5, 6);
+    // The bound is the farthest vertex. It is *not* the unit box's corner
+    // distance: for a non-cube the farthest point of a filleted box is where the
+    // direction from the origin leaves the corner sphere, which is not on the
+    // body diagonal, and a polyhedral approximation stops just short of it even
+    // on a cube. So the two things that have to hold are asserted instead — the
+    // bound is tight (not an under-estimate) and it has not forgotten the fillet.
+    expect(m.boundingSphere[3], 'the bound is the farthest vertex, not an under-estimate').toBeCloseTo(far, 5);
+    expect(m.boundingSphere[3], 'and it includes the fillet on every axis')
+      .toBeGreaterThan(Math.hypot(2 - radius, 1 - radius, 0.5 - radius));
     const flat = roundedBox({ layout: POSITION_LAYOUT, segments: 2 });
     expect(flat.vertexData.length).toBe(flat.vertexCount * 3);
+  });
+
+  test('the sampling puts a vertex exactly on the fillet boundary on every axis', () => {
+    // The property the remap exists for, and the one a single shared radius
+    // fraction broke on a non-cube: the middle sample lands exactly on `±(h − r)`,
+    // which is where the projection is the identity and the fillet meets the flat
+    // face tangentially. With one fraction for the whole box, a 4 × 2 × 1 box put
+    // its long axes' samples out in the flat middle instead and left the 4-unit
+    // edges with a single facet each, while the 1-unit edges got `segments`.
+    const radius = 0.2;
+    const m = roundedBox({ width: 4, height: 2, depth: 1, radius, segments: 3 });
+    const half = [2, 1, 0.5];
+    for (let a = 0; a < 3; a++) {
+      const boundary = half[a] - radius;
+      let onBoundary = 0;
+      for (let i = 0; i < m.vertexCount; i++) {
+        if (Math.abs(Math.abs(pos(m, i)[a]) - boundary) < 1e-6) onBoundary++;
+      }
+      expect(onBoundary, `axis ${a} has vertices on its ${boundary} fillet boundary`).toBeGreaterThan(0);
+    }
   });
 
   test('a radius at or past half the smallest extent is refused, with the number', () => {
@@ -1249,12 +1285,16 @@ describe('bounds: the audit', () => {
     // one NaN vertex produces a *finite* AABB that is missing it — a bound that
     // does not contain the mesh, which culls a visible object with no error.
     const floats = new Float32Array(9);
-    floats.set([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    floats.set([0, 0, 0, 1, 0, 0, NaN, 1, 0]);
     const e = err(() => new MeshData({
       layout: POSITION_LAYOUT,
       vertices: { interleaved: floats, vertexCount: 3 },
     }));
-    expect(e.code).toBe('INTERNAL_INVARIANT');
+    // `INVALID_USAGE` and not `INTERNAL_INVARIANT`: the NaN is in the caller's
+    // array, so this is blame `caller`. `INTERNAL_INVARIANT` is the one code
+    // classified `library`, and filing a user's NaN under it says apse is broken
+    // when it is not.
+    expect(e.code).toBe('INVALID_USAGE');
     expect(e.message).toContain('non-finite');
     expect(e.message).toContain('vertex 2');
   });
@@ -1262,10 +1302,12 @@ describe('bounds: the audit', () => {
   test('an Infinity position is caught the same way', () => {
     const floats = new Float32Array(9);
     floats.set([0, 0, 0, Infinity, 0, 0, 0, 1, 0]);
-    expect(err(() => new MeshData({
+    const e = err(() => new MeshData({
       layout: POSITION_LAYOUT,
       vertices: { interleaved: floats, vertexCount: 3 },
-    })).code).toBe('INTERNAL_INVARIANT');
+    }));
+    expect(e.code).toBe('INVALID_USAGE');
+    expect(e.message).toContain('vertex 1');
   });
 
   test('a two-component position is refused, because the bounds pass would read the wrong floats', () => {
@@ -1278,16 +1320,18 @@ describe('bounds: the audit', () => {
   });
 
   test('a bounding-sphere override has to be finite and non-negative', () => {
+    // A caller-supplied value, so `INVALID_USAGE`: a negative or non-finite
+    // radius is a wrong argument, not a disagreement between apse's own tables.
     const base = { layout: POSITION_LAYOUT, vertices: { interleaved: new Float32Array(9), vertexCount: 3 } };
     const negative = err(() => new MeshData({ ...base, boundingSphere: [0, 0, 0, -1] }));
-    expect(negative.code).toBe('INTERNAL_INVARIANT');
+    expect(negative.code).toBe('INVALID_USAGE');
     expect(negative.message).toContain('-1');
     expect(err(() => new MeshData({ ...base, boundingSphere: [0, 0, 0, NaN] })).code)
-      .toBe('INTERNAL_INVARIANT');
+      .toBe('INVALID_USAGE');
     expect(err(() => new MeshData({ ...base, boundingSphere: [Infinity, 0, 0, 1] })).code)
-      .toBe('INTERNAL_INVARIANT');
+      .toBe('INVALID_USAGE');
     expect(err(() => new MeshData({ ...base, boundingSphere: [0, 0, 1] })).code)
-      .toBe('INTERNAL_INVARIANT');
+      .toBe('INVALID_USAGE');
   });
 
   test('every primitive\'s bound contains every one of its own vertices', () => {
@@ -1382,21 +1426,43 @@ describe('computeTangents', () => {
   test('a sphere\'s tangent is the direction of increasing longitude', () => {
     // Analytic, and the reason this test exists: a wrong tangent direction is
     // invisible until a normal map is on it.
+    //
+    // The analytic answer is the direction of increasing u, which for `sphere()`'s
+    // own parameterisation — column k at `(−cos φ, ·, sin φ)` with `φ = 2πu` — is
+    // `(sin φ, 0, cos φ)`. The sign of the x component is the whole content of
+    // the test: a negated tangent still satisfies "unit, orthogonal to the
+    // normal, handedness ±1" and still passes every other test in this file, and
+    // lights a normal map onto the wrong axis.
     const r = withTangents(sphere({ layout: TANGENT_LAYOUT, widthSegments: 24, heightSegments: 12 }));
     // The seam and the poles are the vertices where "the direction of
     // increasing u" is a matter of convention; every other vertex has an exact
-    // answer, (-sin phi, 0, cos phi) for the sphere's own parameterisation.
+    // answer. The seam is *both* of its columns: u = 0 and u = 1 are the same
+    // point, and the second one is as contaminated by the pole's u = 0.5 as the
+    // first.
     let checked = 0;
     for (let i = 0; i < r.mesh.vertexCount; i++) {
       const p = pos(r.mesh, i);
       if (Math.abs(p[1]) > 0.999) continue; // poles
       const uvHere = uv(r.mesh, i);
-      if (uvHere[0] === 0) continue; // the seam column
+      if (uvHere[0] === 0 || uvHere[0] === 1) continue; // the seam columns
       const phi = uvHere[0] * Math.PI * 2;
       const t = tangent(r.mesh, i);
-      expect(t[0], `vertex ${i} x`).toBeCloseTo(-Math.sin(phi), 4);
-      expect(t[1], `vertex ${i} y`).toBeCloseTo(0, 4);
-      expect(t[2], `vertex ${i} z`).toBeCloseTo(Math.cos(phi), 4);
+      const want = [Math.sin(phi), 0, Math.cos(phi)];
+      // Component-exact only on the equator. The polar rows cannot be: a pole is
+      // one vertex whose `u` is 0.5 by convention, so the fan triangle's uv
+      // deltas are not the row's own and the accumulated tangent leans a few
+      // degrees. That is a property of a single-pole uv sphere, not of the
+      // solver, and it decays toward the equator — so it is a direction
+      // assertion everywhere and a component assertion where the direction is
+      // exact.
+      if (Math.abs(p[1]) < 1e-6) {
+        expect(t[0], `vertex ${i} x`).toBeCloseTo(want[0], 6);
+        expect(t[1], `vertex ${i} y`).toBeCloseTo(0, 6);
+        expect(t[2], `vertex ${i} z`).toBeCloseTo(want[2], 6);
+      }
+      const alignment = dot(t, want);
+      expect(alignment, `vertex ${i} points the right way, not the wrong way`)
+        .toBeGreaterThan(0.999);
       checked++;
     }
     expect(checked, 'a real number of vertices were checked').toBeGreaterThan(100);
@@ -1450,6 +1516,11 @@ describe('computeTangents', () => {
     // A uv that varies along the normal direction: the solver's tangent is
     // parallel to the normal, so Gram-Schmidt produces the zero vector and
     // normalising it would be 0/0.
+    //
+    // The triangle has to be a right triangle in uv — `[[0,0],[1,0],[0,1]]` has
+    // det 1. Three collinear uvs are a *singular* uv triangle, which is the case
+    // above this one and is counted as degenerate; a uv that is merely
+    // pathological in 3D is not.
     const flat = layout({ position: 'float32x3', normal: 'float32x3', uv: 'float32x2' });
     const m = new MeshData({
       layout: flat,
@@ -1457,7 +1528,7 @@ describe('computeTangents', () => {
         attributes: {
           position: [0, 0, 0, 0, 1, 0, 0, 2, 0],
           normal: [0, 1, 0, 0, 1, 0, 0, 1, 0],
-          uv: [0, 0, 1, 1, 2, 2],
+          uv: [0, 0, 1, 0, 0, 1],
         },
         vertexCount: 3,
       },
@@ -1539,7 +1610,10 @@ describe('withTangents', () => {
     const e = err(() => withTangents(box()));
     expect(e.code).toBe('ATTRIBUTE_MISSING');
     expect(e.message).toContain('tangent');
-    expect(e.message).toContain('TANGENT_LAYOUT');
+    // The layout constant is the *fix*, not the diagnosis, so it is asserted on
+    // the field whose job is the corrective action — the same split every other
+    // apse test makes.
+    expect(e.fix).toContain('TANGENT_LAYOUT');
   });
 
   test('a vec3 tangent is refused: there is nowhere to put the handedness', () => {
@@ -1580,9 +1654,14 @@ describe('withTangents', () => {
     expect(differing, 'and the tangents are actually written').toBe(m.vertexCount);
   });
 
-  test('the layout is the single source: 48 bytes a vertex, tangent at 36', () => {
+  test('the layout is the single source: 48 bytes a vertex, tangent at 32', () => {
+    // 12 + 12 + 8 + 16, in declaration order. The tangent is the last attribute
+    // and `float32x4`, so it starts where the uv ends — 32, not 36. WebGPU
+    // requires a vertex offset to be a multiple of 4, not of 16, so a `vec3` uv
+    // would not buy alignment here; the packed bandwidth it would save is 4 bytes
+    // against the 4 bytes of quantisation the whole attribute source refuses.
     expect(TANGENT_LAYOUT.stride).toBe(48);
-    expect(TANGENT_LAYOUT.attribute('tangent')?.offset).toBe(36);
+    expect(TANGENT_LAYOUT.attribute('tangent')?.offset).toBe(32);
     expect(TANGENT_LAYOUT.wgslStruct()).toContain('@location(3) tangent : vec4<f32>,');
     const r = withTangents(box({ layout: TANGENT_LAYOUT }));
     expect(r.mesh.vertexData.length).toBe(r.mesh.vertexCount * 12);
@@ -1605,10 +1684,12 @@ describe('mergeMeshes', () => {
     expect(batch.mesh.layout).toBe(a.layout);
     const idx = indicesOf(batch.mesh);
     expect(Math.max(...idx), 'no index runs past the merged vertex count').toBe(batch.mesh.vertexCount - 1);
-    // Source 1's first three indices are source 0's, shifted by 24.
-    expect(idx.slice(0, 6)).toEqual(Array.from(a.indexData!));
-    expect(idx.slice(a.indexCount, a.indexCount + 6))
-      .toEqual(Array.from(b.indexData!).map((v) => v + a.vertexCount));
+    // Source 0's first two triangles are its own, unshifted, and source 1's are
+    // the same two shifted by source 0's vertex count.
+    const head = 6;
+    expect(idx.slice(0, head)).toEqual(Array.from(a.indexData!).slice(0, head));
+    expect(idx.slice(a.indexCount, a.indexCount + head))
+      .toEqual(Array.from(b.indexData!).slice(0, head).map((v) => v + a.vertexCount));
   });
 
   test('keeps one range per source, in order, with the draw arguments in it', () => {
@@ -1660,29 +1741,59 @@ describe('mergeMeshes', () => {
     // the wrong length and the wrong angle, which is a shading bug that no
     // geometry test can see.
     const squash = new Float32Array([2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-    const baked = mergeMeshes([{ mesh: box(), matrix: squash }]);
-    for (let i = 0; i < baked.mesh.vertexCount; i++) {
-      const n = nrm(baked.mesh, i);
-      const p = pos(baked.mesh, i);
-      // An axis normal survives a non-uniform scale in *direction* but not in
-      // length, so the inverse transpose is only right if the result is still
-      // unit. A plain 3x3 would leave these at 1.0 anyway, so the check that
-      // matters is the non-axis case below.
-      expect(length(n), `normal ${i} unit`).toBeCloseTo(1, 5);
-      if (p[0] > 0.9) expect(Math.abs(n[0]), `+X face ${i}`).toBeCloseTo(1, 5);
-      if (p[1] > 0.9) expect(Math.abs(n[1]), `+Y face ${i}`).toBeCloseTo(1, 5);
+    const source = box();
+    const baked = mergeMeshes([{ mesh: source, matrix: squash }]);
+    for (let i = 0; i < source.vertexCount; i++) {
+      // Compared against the *source* mesh's normal rather than against the baked
+      // position: a 2:1:1 scale puts the +Y face's outer column at x = 1, exactly
+      // where the +X face is, so a position test cannot say which face a vertex is
+      // on. A box's normals are all axis vectors, and a diagonal scale's inverse
+      // transpose maps an axis vector to the same axis — so the baked normal has to
+      // come back as the source's, and unit. The renormalisation is the point: the
+      // raw product of invTranspose · (1,0,0) is (0.5, 0, 0), and a stored
+      // 0.5-length normal is a mesh that shades with the wrong amount of light.
+      const before = nrm(source, i);
+      const after = nrm(baked.mesh, i);
+      expect(length(after), `normal ${i} unit`).toBeCloseTo(1, 5);
+      expect(after[0], `normal ${i} x`).toBeCloseTo(before[0], 5);
+      expect(after[1], `normal ${i} y`).toBeCloseTo(before[1], 5);
+      expect(after[2], `normal ${i} z`).toBeCloseTo(before[2], 5);
     }
-    // And the one that a 2:1:1 scale actually changes: a normal that is neither
-    // axis-aligned nor unit after the plain product.
-    const skew = new Float32Array([2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-    const spun = mergeMeshes([{ mesh: box({ segments: 1 }), matrix: skew }]);
-    let sawSkew = false;
-    for (let i = 0; i < spun.mesh.vertexCount; i++) {
-      const n = nrm(spun.mesh, i);
-      if (Math.abs(n[0]) > 1e-6 && Math.abs(n[0]) < 0.999) sawSkew = true;
-      expect(length(n)).toBeCloseTo(1, 5);
+    // A box's own normals are all axis-aligned, so a box cannot distinguish the
+    // inverse transpose from the plain 3x3 by direction — only by length, which
+    // the renormalisation above undoes. The source that *does* distinguish them is
+    // a sphere: its normals run through every direction, so a 2:1:1 scale moves
+    // them all, and only the inverse transpose moves them the right way.
+    const ball = sphere({ widthSegments: 16, heightSegments: 8 });
+    const spun = mergeMeshes([{ mesh: ball, matrix: squash }]);
+    // invTranspose of diag(2,1,1) is diag(1/2,1,1): scaling a direction by a matrix
+    // divides it by the scale squared, and the transpose undoes the exchange of
+    // axes.
+    const invTranspose = (n: number[]): number[] => {
+      const raw = [0.5 * n[0], n[1], n[2]];
+      const len = Math.hypot(raw[0], raw[1], raw[2]);
+      return [raw[0] / len, raw[1] / len, raw[2] / len];
+    };
+    const plain3x3 = (n: number[]): number[] => {
+      const raw = [2 * n[0], n[1], n[2]];
+      const len = Math.hypot(raw[0], raw[1], raw[2]);
+      return [raw[0] / len, raw[1] / len, raw[2] / len];
+    };
+    let plain3x3WouldMatch = 0;
+    for (let i = 0; i < ball.vertexCount; i++) {
+      const before = nrm(ball, i);
+      const after = nrm(spun.mesh, i);
+      const want = invTranspose(before);
+      expect(after[0], `sphere normal ${i} x is the inverse transpose's`).toBeCloseTo(want[0], 5);
+      expect(after[1], `sphere normal ${i} y is the inverse transpose's`).toBeCloseTo(want[1], 5);
+      expect(after[2], `sphere normal ${i} z is the inverse transpose's`).toBeCloseTo(want[2], 5);
+      // Counted rather than claimed: the plain 3x3 leaves a sphere's normal
+      // pointing along the unscaled sphere, which is a different direction
+      // wherever the normal has an x or a z component.
+      if (dot(after, plain3x3(before)) > 0.9999) plain3x3WouldMatch++;
     }
-    expect(sawSkew, 'a face normal was re-scaled by the inverse transpose').toBe(true);
+    expect(plain3x3WouldMatch, 'a plain 3x3 would have disagreed somewhere')
+      .toBeLessThan(ball.vertexCount);
   });
 
   test('a mirroring matrix flips the tangent handedness', () => {
@@ -1714,7 +1825,9 @@ describe('mergeMeshes', () => {
     });
     const batch = mergeMeshes([{ mesh: box() }, { mesh: flat }]);
     expect(batch.mesh.indexed).toBe(true);
-    expect(indicesOf(batch.mesh).slice(24, 27)).toEqual([24, 25, 26]);
+    // The generated run starts where the box's 36 indices end, and carries the
+    // box's 24 vertices as its base: source 1's vertex `k` is vertex `24 + k`.
+    expect(indicesOf(batch.mesh).slice(36, 39)).toEqual([24, 25, 26]);
   });
 
   test('refuses mismatched layouts, topologies and a singular matrix, by name', () => {
@@ -1740,9 +1853,19 @@ describe('mergeMeshes', () => {
   });
 
   test('more than 65535 vertices is refused, with the number', () => {
-    const e = err(() => mergeMeshes(Array.from({ length: 3000 }, () => ({ mesh: plane({ widthSegments: 3, depthSegments: 3 }) }))));
+    // A `plane({ 3, 3 })` is 16 vertices, so the count has to be well past
+    // 65535/16 for the check to be reached at all — 3000 of them is 48000 and
+    // merges happily, which is the point of the threshold rather than a smaller
+    // number.
+    const one = plane({ widthSegments: 3, depthSegments: 3 });
+    const over = Array.from({ length: 4200 }, () => ({ mesh: one }));
+    const e = err(() => mergeMeshes(over));
     expect(e.code).toBe('MESH_DATA_TOO_LARGE');
     expect(e.message).toContain('65535');
+    expect(e.message).toContain(String(one.vertexCount * 4200));
+    // One fewer is fine, which is what makes 65535 the threshold and not 65536:
+    // index 65535 itself is a valid vertex reference.
+    expect(mergeMeshes(over.slice(0, 4095)).mesh.vertexCount).toBe(4095 * one.vertexCount);
   });
 
   test('an out-of-range range names the count', () => {
@@ -1750,7 +1873,8 @@ describe('mergeMeshes', () => {
     const e = err(() => batch.range(1));
     expect(e.code).toBe('INTERNAL_INVARIANT');
     expect(e.message).toContain('1 range');
-    expect(e.message).toContain('0..0');
+    // The valid range is the corrective action, so it is asserted on `fix`.
+    expect(e.fix).toContain('0..0');
   });
 });
 
@@ -1936,11 +2060,31 @@ describe('GpuMesh draw contract', () => {
     const fake = recordingDevice();
     const data = box();
     const m = upload(fake.device, data);
-    const other = box({ width: 2 });
+
+    // The check has two discriminators, and both are exercised: the layout's
+    // identity, and the two counts. Note what is *not* here — `box({ width: 2 })`.
+    // It is a different mesh by every measure a person would use, and it is
+    // indistinguishable to `flush`, which compares the layout and the counts and
+    // deliberately does not retain the `MeshData` to compare object identity.
+    // Asserting that a rejection happens for an indistinguishable mesh would be
+    // asserting a check the class does not make and cannot make without the copy
+    // it exists to avoid.
+    const otherLayout = box({ layout: POSITION_LAYOUT });
     m.markVertexDirty(0, 1);
-    const e = err(() => m.flush(other));
-    expect(e.code).toBe('INTERNAL_INVARIANT');
-    expect(e.message).toContain('upload()');
+    const byLayout = err(() => m.flush(otherLayout));
+    expect(byLayout.code).toBe('INTERNAL_INVARIANT');
+    expect(byLayout.fix).toContain('upload()');
+
+    // Same layout, more vertices: the counts are the only thing left.
+    const otherCounts = box({ segments: 2 });
+    m.markVertexDirty(0, 1);
+    const byCount = err(() => m.flush(otherCounts));
+    expect(byCount.code).toBe('INTERNAL_INVARIANT');
+    expect(byCount.fix).toContain('upload()');
+
+    // And the data it *was* uploaded from is still accepted, so the marks above
+    // did not leave the mesh in a state that rejects its own data.
+    expect(m.flush(data)).toBe(true);
   });
 
   test('a layout override must still describe the data that was packed', () => {

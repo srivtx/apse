@@ -119,7 +119,7 @@ export function roundedBox(opts: RoundedBoxOptions = {}): MeshData {
 
   if (!Number.isFinite(radius) || radius <= 0) {
     fail('OPTION_UNKNOWN',
-      `roundedBox() received radius: ${radius}.`, {
+      `roundedBox() received radius: ${radius}, which must be positive.`, {
       why: 'The corner radius is the distance from the inner box to the surface, and the projection is `inner + radius · normalize(p − inner)`. A zero radius makes every vertex on a flat face collapse onto the inner box, so the solid shrinks to its inner face and the caller gets a smaller box than they asked for.',
       fix: 'Pass a positive radius, or use `box()` for sharp edges. A radius of half the smallest extent is the largest that still leaves a flat face.',
     });
@@ -134,9 +134,12 @@ export function roundedBox(opts: RoundedBoxOptions = {}): MeshData {
     });
   }
 
-  // The unit radius, so the remap is a pure function of the parameter and the
-  // extents enter only where they belong: in the final projection.
-  const ru = radius / smallest;
+  // The radius as a fraction of the axis it is applied to — **per axis**, not
+  // once for the box. The grid is parameterised -1..1 and scaled by the half
+  // extent, so the sample that has to land on the fillet boundary of an axis is
+  // at `1 − radius/half` of *that* axis. One shared fraction is only correct when
+  // all three extents are equal: on a 4 × 2 × 1 box it put the X band's samples
+  // out in the flat middle and left the long edges with a single facet each.
   const side = 2 * seg + 2;
   const perFace = side * side;
   const vertexCount = perFace * BOX_FACES.length;
@@ -163,9 +166,13 @@ export function roundedBox(opts: RoundedBoxOptions = {}): MeshData {
     const ox = nx0 * hx, oy = ny0 * hy, oz = nz0 * hz;
     const ux = face.u[0] * hx, uy = face.u[1] * hy, uz = face.u[2] * hz;
     const vx = face.v[0] * hx, vy = face.v[1] * hy, vz = face.v[2] * hz;
+    // One radius fraction per in-plane axis, so both remaps put their middle
+    // sample on their own axis' fillet boundary.
+    const ru = radius / (Math.abs(face.u[0]) * hx + Math.abs(face.u[1]) * hy + Math.abs(face.u[2]) * hz);
+    const rv = radius / (Math.abs(face.v[0]) * hx + Math.abs(face.v[1]) * hy + Math.abs(face.v[2]) * hz);
 
     for (let j = 0; j < side; j++) {
-      const tv = axisUnit(j, seg, ru);
+      const tv = axisUnit(j, seg, rv);
       for (let i = 0; i < side; i++) {
         const tu = axisUnit(i, seg, ru);
         // The pre-projection point: the face plane at the remapped parameter.

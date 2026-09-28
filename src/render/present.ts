@@ -468,11 +468,19 @@ export class PresentPass extends Resource {
    * renderer should do. Called with no argument it opens and submits its own,
    * which is correct and costs a submit.
    *
+   * `stamp` is a `timestampWrites` value for this pass, or nothing. The
+   * renderer needs one because a `(beginning, end)` write index may only be
+   * written once per submission, so the present pass cannot share a pair with
+   * the scene passes that precede it — a frame that opens an opaque pass, a
+   * transparent pass and this one takes three pairs. It is a parameter rather
+   * than something the pass owns because the query set is the renderer's, and
+   * the two are disposed independently.
+   *
    * A no-op in the direct-to-target path, where the scene already drew the final
    * image. It is a no-op *by design* and not by accident: that path exists to cost
    * nothing.
    */
-  render(encoder?: GPUCommandEncoder): void {
+  render(encoder?: GPUCommandEncoder, stamp?: GPURenderPassTimestampWrites): void {
     this.assertLive('PresentPass');
     const scene = this.#owned;
     const mesh = this.#mesh;
@@ -502,6 +510,11 @@ export class PresentPass extends Resource {
     ATTACHMENT.loadOp = 'load';
     ATTACHMENT.storeOp = 'store';
     PASS_DESC.label = `${this.#label}:pass`;
+    // Assigned unconditionally, including to `undefined`. The descriptor is
+    // module scratch, so a pass that did not get a stamp has to clear the last
+    // one's — otherwise a timestamp is attributed to whichever pass the previous
+    // caller happened to be timing.
+    PASS_DESC.timestampWrites = stamp;
 
     let enc: GPUCommandEncoder;
     let own: GPUCommandEncoder | null = null;
