@@ -26,7 +26,7 @@ import {
 export async function start(canvas: HTMLCanvasElement): Promise<() => void> {
   const renderer = await Renderer.create(canvas, { budget: { cpu: 2 } });
   const mesh = upload(renderer.device.device, box({ width: 1.2 }));
-  const material = await pbrMaterial(renderer.device.device);
+  const material = await pbrMaterial(renderer.device.device, { targetFormat: renderer.sceneFormat });
   const scene = new Scene('spin');
   const camera = new PerspectiveCamera({ fov: 45, near: 0.1, far: 100, aspect: 1 });
 

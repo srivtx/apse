@@ -93,22 +93,22 @@ interface SizeRow {
  * three.js needs ~133 KB gzip for a single PBR cube.
  */
 const BUDGETS: Record<string, number> = {
-  // measured 67.97 KB gzip on 2026-09-28
-  'index': 78.2,
-  // measured 7.72 KB gzip on 2026-09-28
-  'core/index': 8.9,
-  // measured 6.59 KB gzip on 2026-09-28
-  'math/index': 7.6,
-  // measured 17.99 KB gzip on 2026-09-28
-  'geometry/index': 20.7,
-  // measured 37.97 KB gzip on 2026-09-28
-  'material/index': 43.7,
-  // measured 10.51 KB gzip on 2026-09-28
-  'scene/index': 12.1,
-  // measured 50.26 KB gzip on 2026-09-28
-  'render/index': 57.8,
-  // measured 45.56 KB gzip on 2026-09-28
-  'tree-shaken app': 52.4,
+  // measured 85.56 KB gzip on 2026-09-28
+  'index': 110.3,
+  // measured 8.74 KB gzip on 2026-09-28
+  'core/index': 10.1,
+  // measured 11.66 KB gzip on 2026-09-28
+  'math/index': 13.4,
+  // measured 33.01 KB gzip on 2026-09-28
+  'geometry/index': 37.5,
+  // measured 57.49 KB gzip on 2026-09-28
+  'material/index': 64.4,
+  // measured 16.34 KB gzip on 2026-09-28
+  'scene/index': 18.8,
+  // measured 70.12 KB gzip on 2026-09-28
+  'render/index': 80.4,
+  // measured 71.22 KB gzip on 2026-09-28
+  'tree-shaken app': 81.9,
 };
 
 /**

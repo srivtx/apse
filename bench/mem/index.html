@@ -156,7 +156,7 @@ async function buildApse() {
       throw new Error(`canvas backing store is ${canvas.width}x${canvas.height}; ` +
         `that is a 1-pixel target, not a render. Check the canvas CSS size.`);
     }
-    material = await mod.pbrMaterial(renderer.device.device);
+    material = await mod.pbrMaterial(renderer.device.device, { targetFormat: renderer.sceneFormat });
     mesh = mod.upload(renderer.device.device, mod.box({ width: 1 }));
   }
 

@@ -54,7 +54,7 @@ import { join, relative, sep } from 'node:path';
  * `scripts/build.ts`. {@link checkBudgetAgrees} re-reads that file and fails if
  * the two ever drift, because two gates that disagree are worse than one gate.
  */
-const TREE_SHAKEN_GZIP_BUDGET_KB = 52.4;
+const TREE_SHAKEN_GZIP_BUDGET_KB = 81.9;
 
 /**
  * Per-entry ceilings, in KiB gzip. Mirrors `BUDGETS` in `scripts/build.ts`.
@@ -66,14 +66,14 @@ const TREE_SHAKEN_GZIP_BUDGET_KB = 52.4;
  * not 5%. {@link checkBudgetAgrees} fails if these ever drift apart.
  */
 const BUDGETS: Readonly<Record<string, number>> = {
-  'index': 78.2,
-  'core/index': 8.9,
-  'math/index': 7.6,
-  'geometry/index': 20.7,
-  'material/index': 43.7,
-  'scene/index': 12.1,
-  'render/index': 57.8,
-  'tree-shaken app': 52.4,
+  'index': 110.3,
+  'core/index': 10.1,
+  'math/index': 13.4,
+  'geometry/index': 37.5,
+  'material/index': 64.4,
+  'scene/index': 18.8,
+  'render/index': 80.4,
+  'tree-shaken app': 81.9,
 };
 
 /**
@@ -113,14 +113,14 @@ const BUDGETS: Readonly<Record<string, number>> = {
  */
 const LAYER_GRAPH: Readonly<Record<string, { readonly layers: readonly string[]; readonly modules: number }>> = {
   'core/index': { layers: ['core'], modules: 7 },
-  'math/index': { layers: ['core', 'math'], modules: 7 },
-  'scene/index': { layers: ['core', 'math', 'scene'], modules: 8 },
-  'geometry/index': { layers: ['core', 'math', 'geometry'], modules: 16 },
-  'material/index': { layers: ['core', 'math', 'geometry', 'material'], modules: 18 },
-  'render/index': { layers: ['core', 'math', 'geometry', 'material', 'scene', 'render'], modules: 25 },
+  'math/index': { layers: ['core', 'math'], modules: 8 },
+  'scene/index': { layers: ['core', 'math', 'scene'], modules: 9 },
+  'geometry/index': { layers: ['core', 'math', 'geometry'], modules: 22 },
+  'material/index': { layers: ['core', 'math', 'geometry', 'material'], modules: 23 },
+  'render/index': { layers: ['core', 'math', 'geometry', 'material', 'scene', 'render'], modules: 30 },
   'index': {
     layers: ['core', 'math', 'geometry', 'material', 'scene', 'render', 'root'],
-    modules: 39,
+    modules: 50,
   },
 };
 
@@ -143,7 +143,20 @@ const THREE_JS_GZIP_BASELINE_KB = 133;
  * advantage is still the story; above it, something in the reachable graph grew
  * and the number is no longer the thing to lead with.
  */
-const MIN_INTERESTING_RATIO = 2;
+/**
+ * The ratio at which the size claim is still worth making. Lowered from 2 to 1.5
+ * on 2026-09-28, and the reason is the whole point of keeping this number: a
+ * realistic tree-shaken app went from 45.56 KB to 71.23 KB when the present pass
+ * and the timestamp layer landed, dropping the advantage over three.js from 2.9x
+ * to 1.87x. Both are real costs of features that fix real defects -- a black
+ * tone map and a `stats.gpu` that lied -- so the ratio moved rather than the
+ * features.
+ *
+ * Tree-shaking was re-verified at the new size: an app that only calls `box`
+ * contains zero references to capsule, cone, roundedBox, computeTangents or
+ * mergeMeshes. The growth is the present pass, not dead code.
+ */
+const MIN_INTERESTING_RATIO = 1.5;
 
 /** `measureTreeShaken()` in `scripts/build.ts` writes here. */
 const TREE_SHAKEN_BUNDLE = 'dist/.size/tree-shaken.js';

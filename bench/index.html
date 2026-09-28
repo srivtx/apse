@@ -75,7 +75,7 @@ async function initApse() {
     onValidationError: (m) => validationErrors.push(m),
   });
   g.__validationErrors = validationErrors;
-  const material = await pbrMaterial(renderer.device.device);
+  const material = await pbrMaterial(renderer.device.device, { targetFormat: renderer.sceneFormat });
   const geometries = {
     cube: upload(renderer.device.device, box({ width: 1 })),
     ground: upload(renderer.device.device, box({ width: 1, height: 0.1, depth: 1 })),
@@ -397,7 +397,7 @@ g.__runInstanced = async (spec) => {
   // later as "a valid external Instance reference no longer exists".
   const renderer = apse.renderer;
   const layout = instancedLayout();
-  const material = await instancedMaterial(renderer.device.device, { layout });
+  const material = await instancedMaterial(renderer.device.device, { layout, targetFormat: renderer.sceneFormat });
 
   const scene = new Scene('instanced');
   const camera = new PerspectiveCamera({ fov: 50, near: 0.1, far: 400, aspect: 1280 / 720 });
