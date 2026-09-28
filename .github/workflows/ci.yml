@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run for the same ref. Benchmarks and build
+# jobs are minutes long and a force-push mid-run should not waste the minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: typecheck, tests, build, size gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `bun run verify` is typecheck + tests + build + size gate. The size gate
+      # is part of the build rather than a separate job because a bundle-size
+      # regression has to fail the same check that produced the bundle.
+      - name: verify
+        run: bun run verify
+
+      - name: bundle sizes
+        run: cat dist/size-report.json
+
+  bench:
+    name: benchmark (headless Chrome, real GPU where available)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Benchmarks on a shared runner are not comparable to the numbers in the
+    # README, which come from an Apple M-series GPU. This job exists to catch
+    # large regressions, not to publish figures.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install browser
+        run: npx puppeteer browsers install chrome
+
+      - name: bench
+        run: bun run bench

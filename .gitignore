@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+
+# Benchmark artefacts. The harness writes a screenshot and a JSON report; they
+# are results of a local run on someone else's hardware, not source.
+bench/results/
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp

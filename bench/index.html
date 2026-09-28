@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>apse bench</title>
+<style>
+body{margin:0;background:#000;color:#888;font:12px ui-monospace,Menlo,monospace}
+canvas{position:fixed;top:0;left:-99999px}
+</style>
+</head>
+<body>
+<canvas id="gpu"></canvas>
+<script type="module">
+// Benchmark harness. Runs in the page because WebGPU, the canvas, and the
+// compositor are all page-scoped, and because the only honest way to compare two
+// renderers is to put them in the same process on the same device.
+
+const g = globalThis;
+const results = { apse: [], three: [] };
+
+function percentile(sorted, p) {
+  if (sorted.length === 0) return 0;
+  const i = Math.min(sorted.length - 1, Math.max(0, Math.round((p / 100) * (sorted.length - 1))));
+  return sorted[i];
+}
+
+function summarise(engine, scene, samples, extra) {
+  const sorted = samples.slice().sort((a, b) => a - b);
+  const mean = samples.reduce((a, b) => a + b, 0) / Math.max(1, samples.length);
+  return {
+    engine, scene,
+    samples: samples.map((cpuMs) => ({ cpuMs, ...extra.samples[0] })),
+    meanCpuMs: mean,
+    p50CpuMs: percentile(sorted, 50),
+    p95CpuMs: percentile(sorted, 95),
+    drawCalls: extra.drawCalls,
+    triangles: extra.triangles,
+    uniformBytes: extra.uniformBytes,
+    heapBytes: performance.memory?.usedJSHeapSize ?? 0,
+    setupMs: extra.setupMs,
+    error: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// apse
+// ---------------------------------------------------------------------------
+
+let apse = null;
+
+async function initApse() {
+  const { Renderer, Scene, MeshNode, PerspectiveCamera, box, sphere, torus, upload, pbrMaterial } =
+    await import('/dist/index.js');
+
+  const canvas = document.createElement('canvas');
+  // The CSS size has to be right, not just the attribute. CanvasSizer derives
+  // the backing store from the element's layout box, so a canvas left at the
+  // default 300x150 — or shrunk to hide it — renders into a 1x1 target and the
+  // GPU is never exercised at all, while every CPU measurement still looks
+  // perfectly healthy. That is the exact failure this benchmark exists to catch.
+  canvas.style.width = '1280px';
+  canvas.style.height = '720px';
+  document.body.appendChild(canvas);
+  Object.defineProperty(canvas, 'clientWidth', { value: 1280, configurable: true });
+  Object.defineProperty(canvas, 'clientHeight', { value: 720, configurable: true });
+
+  // Every WebGPU validation error is collected and surfaced. A validation error
+  // does not throw — it invalidates the object it relates to, silently, and the
+  // visible result is a blank frame. A benchmark that measures a renderer
+  // quietly drawing nothing would report excellent numbers, which is worse than
+  // having no benchmark at all.
+  const validationErrors = [];
+  const renderer = await Renderer.create(canvas, {
+    sampleCount: 1,
+    onValidationError: (m) => validationErrors.push(m),
+  });
+  g.__validationErrors = validationErrors;
+  const material = await pbrMaterial(renderer.device.device);
+  const geometries = {
+    cube: upload(renderer.device.device, box({ width: 1 })),
+    ground: upload(renderer.device.device, box({ width: 1, height: 0.1, depth: 1 })),
+    sphere: upload(renderer.device.device, sphere({ radius: 0.6, widthSegments: 24, heightSegments: 16 })),
+    torus: upload(renderer.device.device, torus({ radius: 0.5, tube: 0.18, radialSegments: 24, tubularSegments: 16 })),
+  };
+  apse = { Renderer, Scene, MeshNode, PerspectiveCamera, renderer, material, geometries };
+  const backing = { w: canvas.width, h: canvas.height };
+  if (backing.w < 640 || backing.h < 360) {
+    throw new Error(`canvas backing store is ${backing.w}x${backing.h}; the benchmark ` +
+      `would measure a 1-pixel target. Check the canvas CSS size.`);
+  }
+  return { adapter: renderer.describeGpu(), featureLevel: renderer.featureLevel,
+           backing, software: /swiftshader|llvmpipe|software|lavapipe/i.test(renderer.describeGpu()) };
+}
+
+const built = new Map();
+
+/** Construct a scene once and keep it, so measurement never includes setup. */
+async function buildApse(spec) {
+  const { Scene, MeshNode, PerspectiveCamera, renderer, material, geometries } = apse;
+  const setupStart = performance.now();
+  const mesh = geometries[spec.geometry];
+
+  const scene = new Scene({ name: spec.scene });
+  const camera = new PerspectiveCamera({ fov: 50, near: 0.1, far: 400, aspect: 1280 / 720 });
+  camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+
+  // A grid, not a line: a scene of 5000 objects all at the origin would be
+  // trivially culled and would measure nothing but the cull.
+  const side = Math.ceil(Math.sqrt(spec.objects));
+  const step = side > 1 ? 90 / (side - 1) : 0;
+  for (let i = 0; i < spec.objects; i++) {
+    const n = new MeshNode({ name: `n${i}`, mesh, material });
+    const x = (i % side) * step - 45;
+    const z = Math.floor(i / side) * step - 45;
+    n.setPosition(x, 0, z);
+    n.setScale(0.55);
+    scene.add(n);
+  }
+  const entry = { spec, scene, camera, setupMs: performance.now() - setupStart };
+  built.set(`apse:${spec.name}`, entry);
+  return entry;
+}
+
+async function measureApse(spec) {
+  const { renderer } = apse;
+  const { scene, camera } = built.get(`apse:${spec.name}`);
+  const setupMs = 0;
+
+  // Warm up: pipeline compilation, first-use buffer allocation, and the
+  // browser's own first-frame costs are not what we are measuring.
+  for (let i = 0; i < 12; i++) {
+    camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+    renderer.render(scene, camera);
+  }
+  await renderer.device.device.queue.onSubmittedWorkDone();
+
+  const samples = [];
+  const perSample = [];
+  for (let i = 0; i < 60; i++) {
+    camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+    const t0 = performance.now();
+    renderer.render(scene, camera);
+    const wall = performance.now() - t0;
+    samples.push(wall);
+    const s = renderer.stats;
+    perSample.push({ cpuMs: wall, drawCalls: s.drawCalls, triangles: s.triangles, uniformBytes: s.uniformBytes });
+  }
+  await renderer.device.device.queue.onSubmittedWorkDone();
+
+  const cap = renderer.objectUniforms.capacity;
+  return { ...summarise('apse', spec.name, samples, {
+    drawCalls: perSample[perSample.length - 1].drawCalls,
+    calls: `BG ${renderer.stats.bindGroupCalls} | pipe ${renderer.stats.pipelineCalls} | buf ${renderer.stats.bufferCalls} | naive ${renderer.stats.naiveCalls}`,
+    triangles: perSample[perSample.length - 1].triangles,
+    uniformBytes: perSample[perSample.length - 1].uniformBytes,
+    samples: perSample,
+    setupMs,
+  }), capacity: cap, items: perSample[perSample.length - 1]?.drawCalls, objs: spec.objects };
+}
+
+// ---------------------------------------------------------------------------
+// three.js baseline
+// ---------------------------------------------------------------------------
+
+let three = null;
+
+async function initThree() {
+  const THREE = await import('/node_modules/three/build/three.module.js');
+  const canvas = document.createElement('canvas');
+  canvas.width = 1280; canvas.height = 720;
+  canvas.style.width = '1280px';
+  canvas.style.height = '720px';
+  document.body.appendChild(canvas);
+
+  // WebGL2, not WebGPU. three.js's own documentation says WebGLRenderer remains
+  // the recommended path for WebGL2 applications, and its WebGPURenderer is
+  // still labelled WIP upstream. Comparing against a path its authors describe as
+  // unreleased would be a straw man; this is the baseline three.js is best at.
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(1);
+  renderer.setSize(1280, 720, false);
+
+  const material = new THREE.MeshStandardMaterial({ roughness: 0.4, metalness: 0 });
+  const geometries = {
+    cube: new THREE.BoxGeometry(1, 1, 1),
+    sphere: new THREE.SphereGeometry(0.6, 24, 16),
+    torus: new THREE.TorusGeometry(0.5, 0.18, 16, 24),
+  };
+  three = { THREE, renderer, material, geometries };
+  return { adapter: 'webgl2', featureLevel: 'n/a', software: false };
+}
+
+async function buildThree(spec) {
+  const { THREE, renderer, material, geometries } = three;
+  const setupStart = performance.now();
+
+  const scene = new THREE.Scene();
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.4);
+  key.position.set(30, 60, 40);
+  scene.add(key);
+
+  const camera = new THREE.PerspectiveCamera(50, 1280 / 720, 0.1, 400);
+  camera.position.set(0, 0, 120);
+  camera.lookAt(0, 0, 0);
+  camera.updateMatrixWorld();
+
+  const mesh = new THREE.Mesh(geometries[spec.geometry], material);
+  const side = Math.ceil(Math.sqrt(spec.objects));
+  const step = side > 1 ? 90 / (side - 1) : 0;
+  for (let i = 0; i < spec.objects; i++) {
+    const m = i === 0 ? mesh : new THREE.Mesh(geometries[spec.geometry], material);
+    m.position.set((i % side) * step - 45, 0, Math.floor(i / side) * step - 45);
+    m.scale.setScalar(0.55);
+    m.updateMatrix();
+    m.updateMatrixWorld(true);
+    scene.add(m);
+  }
+  const entry = { spec, scene, camera, setupMs: performance.now() - setupStart };
+  built.set(`three:${spec.name}`, entry);
+  return entry;
+}
+
+async function measureThree(spec) {
+  const { renderer } = three;
+  const { scene, camera } = built.get(`three:${spec.name}`);
+  const setupMs = 0;
+
+  for (let i = 0; i < 12; i++) {
+    camera.updateMatrixWorld();
+    renderer.render(scene, camera);
+  }
+  await new Promise((r) => requestAnimationFrame(r));
+
+  const samples = [];
+  const perSample = [];
+  let drawCalls = 0;
+  let triangles = 0;
+  for (let i = 0; i < 60; i++) {
+    camera.updateMatrixWorld();
+    const t0 = performance.now();
+    renderer.render(scene, camera);
+    const wall = performance.now() - t0;
+    samples.push(wall);
+    drawCalls = renderer.info.render.calls;
+    triangles = renderer.info.render.triangles;
+    perSample.push({ cpuMs: wall, drawCalls, triangles, uniformBytes: 0 });
+  }
+  await new Promise((r) => requestAnimationFrame(r));
+
+  return summarise('three', spec.name, samples, {
+    drawCalls, triangles, uniformBytes: 0, samples: perSample, setupMs,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pixel readback
+// ---------------------------------------------------------------------------
+
+async function readback() {
+  const { Scene, MeshNode, PerspectiveCamera, renderer, material, geometries } = apse;
+  const { basicMaterial: mkBasic } = await import('/dist/index.js');
+  const basic = await mkBasic(renderer.device.device);
+  basic.setSlot('tint', [1, 0.35, 0.1]);
+  const floor = await mkBasic(renderer.device.device);
+  floor.setSlot('tint', [0.09, 0.10, 0.13]);
+  floor.setSlot('opacity', 1);
+
+  const scene = new Scene('readback');
+  const camera = new PerspectiveCamera({ fov: 45, near: 0.1, far: 100, aspect: 16 / 9 });
+  camera.lookAt([2.6, 1.7, 4.2], [0, -0.2, 0], [0, 1, 0]);
+  // Two cubes at different scales and materials, plus a ground plane. A single
+  // object that overflows the viewport cannot tell "nothing drew" from "drew
+  // correctly", and a single material cannot tell "the pipeline works" from "the
+  // lighting model is broken". This scene distinguishes all four.
+  const lit = new MeshNode({ name: 'lit', mesh: geometries.cube, material });
+  lit.setPosition(-0.85, 0, 0);
+  scene.add(lit);
+
+  const unlit = new MeshNode({ name: 'unlit', mesh: geometries.cube, material: basic });
+  unlit.setPosition(0.85, 0, 0);
+  unlit.setScale(0.7);
+  scene.add(unlit);
+
+  const ground = new MeshNode({ name: 'ground', mesh: geometries.ground, material: floor });
+  ground.setPosition(0, -1.1, 0);
+  ground.setScale(6, 1, 6);
+  scene.add(ground);
+
+  const g = geometries.cube;
+
+  // Through the renderer's own readback path, which copies out of an offscreen
+  // COPY_SRC target. Reading the canvas directly does not work: a WebGPU canvas
+  // has no preserveDrawingBuffer, so it is empty by the time anything can sample
+  // it. Renderer.capture() exists for exactly this reason.
+  const frame = await renderer.capture(scene, camera);
+  const { data, width, height, bytesPerRow, format } = frame;
+
+  const c = document.createElement('canvas');
+  c.width = width; c.height = height;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(width, height);
+  // Row stride is bytesPerRow, not width * 4 — copyTextureToBuffer requires
+  // 256-byte alignment, so the right-hand padding has to be skipped per row.
+  const bgra = format.startsWith('bgra');
+  for (let y = 0; y < height; y++) {
+    const src = y * bytesPerRow;
+    const dst = y * width * 4;
+    if (bgra) {
+      // getPreferredCanvasFormat() is bgra8unorm on desktop and ImageData is
+      // RGBA. Skipping this swaps red and blue, which looks like a lighting bug.
+      for (let x = 0; x < width; x++) {
+        img.data[dst + x * 4 + 0] = data[src + x * 4 + 2];
+        img.data[dst + x * 4 + 1] = data[src + x * 4 + 1];
+        img.data[dst + x * 4 + 2] = data[src + x * 4 + 0];
+        img.data[dst + x * 4 + 3] = data[src + x * 4 + 3];
+      }
+    } else {
+      img.data.set(data.subarray(src, src + width * 4), dst);
+    }
+  }
+  // Force opaque. The capture's alpha comes from the render target, and a PNG
+  // with a zero alpha renders as white in every viewer, which makes a correct
+  // dark frame look like a blown-out one. The coverage check below reads
+  // `img.data` directly and is unaffected either way.
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+  ctx.putImageData(img, 0, 0);
+
+  // The clear colour is #050508, i.e. (5,5,8). "Did anything draw" has to be
+  // asked as "does any pixel differ from the clear", not "is any pixel bright" —
+  // a material that renders black is a real and common bug, and a brightness
+  // threshold reports it as success.
+  const CLEAR = [5, 5, 8];
+  let differs = 0;
+  let maxLuma = 0;
+  let sum = 0;
+  for (let i = 0; i < img.data.length; i += 4) {
+    const r = img.data[i], gg = img.data[i + 1], b = img.data[i + 2];
+    const luma = r + gg + b;
+    if (luma > maxLuma) maxLuma = luma;
+    sum += luma;
+    if (Math.abs(r - CLEAR[0]) + Math.abs(gg - CLEAR[1]) + Math.abs(b - CLEAR[2]) > 6) differs++;
+  }
+  const n = img.data.length / 4;
+  scene.clear();
+  return {
+    nonBackground: differs,
+    total: n,
+    coverage: +(differs / n).toFixed(4),
+    maxLuma,
+    mean: [Math.round(sum / n / 3), 0, 0],
+    format,
+    draws: renderer.stats.drawCalls,
+    mesh: { verts: g.vertexCount, idx: g.indexCount, fmt: g.indexFormat, vbuf: !!g.vertexBuffer, ibuf: !!g.indexBuffer },
+    tint: [basic.slotTypes.tint ?? '?'],
+    wgslLen: basic.wgsl.length,
+    png: c.toDataURL('image/png').split(',')[1],
+  };
+}
+
+// ---------------------------------------------------------------------------
+
+g.__probe = async () => {
+  const a = await initApse();
+  await initThree();
+  return a;
+};
+
+g.__build = async (engine, spec) => {
+  if (engine === 'apse') return void (await buildApse(spec));
+  return void (await buildThree(spec));
+};
+g.__run = async (spec) => {
+  try { return await measureApse(spec); }
+  catch (e) { return { engine: 'apse', scene: spec.name, samples: [], meanCpuMs: 0, p50CpuMs: 0, p95CpuMs: 0, drawCalls: 0, triangles: 0, heapBytes: 0, setupMs: 0, error: String(e?.stack ?? e) }; }
+};
+
+g.__runThree = async (spec) => {
+  try { return await measureThree(spec); }
+  catch (e) { return { engine: 'three', scene: spec.name, samples: [], meanCpuMs: 0, p50CpuMs: 0, p95CpuMs: 0, drawCalls: 0, triangles: 0, heapBytes: 0, setupMs: 0, error: String(e?.stack ?? e) }; }
+};
+
+/**
+ * The same 5000 cubes, as one instanced draw.
+ *
+ * This is the comparison that matters. At one draw per object, apse issues two
+ * WebGPU calls per object (a dynamic-offset bind group plus the draw) against
+ * three.js's one, so the per-call cost being lower does not win the frame. With
+ * instancing it is one draw total, and the comparison stops being about
+ * submission overhead at all.
+ */
+g.__runInstanced = async (spec) => {
+  const { Renderer, Scene, MeshNode, PerspectiveCamera, box, upload, InstanceData, uploadInstances, instancedLayout, instancedMaterial } =
+    await import('/dist/index.js');
+  // The same renderer, not a second one. Chrome drops the first WebGPU instance
+  // when a second device is created in the same page, and the failure surfaces
+  // later as "a valid external Instance reference no longer exists".
+  const renderer = apse.renderer;
+  const layout = instancedLayout();
+  const material = await instancedMaterial(renderer.device.device, { layout });
+
+  const scene = new Scene('instanced');
+  const camera = new PerspectiveCamera({ fov: 50, near: 0.1, far: 400, aspect: 1280 / 720 });
+  const side = Math.ceil(Math.sqrt(spec.objects));
+  const step = side > 1 ? 90 / (side - 1) : 0;
+  const transforms = new Float32Array(spec.objects * 16);
+  const m = new Float32Array(16);
+  for (let i = 0; i < spec.objects; i++) {
+    const x = (i % side) * step - 45, z = Math.floor(i / side) * step - 45;
+    m.fill(0); m[0] = m[5] = m[10] = 0.55; m[15] = 1;
+    m[12] = x; m[13] = 0; m[14] = z;
+    transforms.set(m, i * 16);
+  }
+  const data = InstanceData.fromMatrices(transforms);
+  const inst = uploadInstances(renderer.device.device, data);
+  // The mesh must be uploaded with both the instanced layout and the instance
+  // buffer: the pipeline's slot 1 declaration comes from the layout, and the
+  // buffer bound to it is a property of the mesh.
+  const instMesh = upload(renderer.device.device, box({ width: 1 }), { layout, instances: inst });
+  const node = new MeshNode({ name: 'all', mesh: instMesh, material });
+  scene.add(node);
+
+  for (let i = 0; i < 12; i++) { camera.lookAt([0,0,120],[0,0,0],[0,1,0]); renderer.render(scene, camera); }
+  await renderer.device.device.queue.onSubmittedWorkDone();
+  const samples = [];
+  for (let i = 0; i < 60; i++) {
+    camera.lookAt([0,0,120],[0,0,0],[0,1,0]);
+    const t0 = performance.now();
+    renderer.render(scene, camera);
+    samples.push(performance.now() - t0);
+  }
+  const st = renderer.stats;
+  return {
+    engine: 'apse-instanced', scene: spec.name, p50CpuMs: samples.sort((a,b)=>a-b)[30],
+    draws: st.drawCalls, tris: st.triangles, heapBytes: 0, setupMs: 0, error: null,
+  };
+};
+
+g.__readback = () => readback();
+g.__benchReady = true;
+g.__benchError = null;
+void results;
+</script>
+</body>
+</html>

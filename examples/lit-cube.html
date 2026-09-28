@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apse — lit cube</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #06070a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; z-index: 1;
+    font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #8b93a7; background: #0c0e14cc; padding: 10px 14px;
+    border: 1px solid #1e2330; border-radius: 6px;
+    backdrop-filter: blur(8px); white-space: pre; pointer-events: none;
+  }
+  #err {
+    position: fixed; inset: 0; display: none; place-items: center; padding: 40px;
+    font: 13px/1.7 ui-monospace, Menlo, monospace; color: #ff8a7a; background: #06070a;
+  }
+  #err pre { max-width: 70ch; white-space: pre-wrap; }
+  b { color: #e6e9f0; font-weight: 600; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hud">initialising…</div>
+<div id="err"><pre></pre></div>
+<script type="module">
+import {
+  Renderer, PerspectiveCamera, Scene, MeshNode, box, upload,
+  basicMaterial, pbrMaterial, quat, fail, isAseError,
+} from '../dist/index.js';
+
+const hud = document.getElementById('hud');
+const errBox = document.getElementById('err');
+
+function showError(e) {
+  errBox.style.display = 'grid';
+  errBox.querySelector('pre').textContent = isAseError(e)
+    ? `<b>${e.code}</b>\n\n${e.message}\n\nWHY\n  ${e.why}\n\nFIX\n  ${e.fix}\n\n${e.link}`
+    : `<b>${e?.name ?? 'Error'}</b>\n\n${e?.message ?? e}\n\n${e?.stack ?? ''}`;
+  hud.style.display = 'none';
+}
+
+try {
+  const canvas = document.getElementById('stage');
+  const renderer = await Renderer.create(canvas, {
+    budget: { cpu: 2, drawCalls: 200 },
+  });
+
+  const scene = new Scene({ name: 'lit-cube' });
+  const camera = new PerspectiveCamera({ fov: 45, near: 0.1, far: 100, aspect: 1 });
+  renderer.camera = camera;
+  camera.lookAt([3.2, 2.4, 4.4], [0, 0, 0], [0, 1, 0]);
+
+  // One shared mesh, two materials: the point of the example is that geometry
+  // and material are independent, and that neither needs manual disposal.
+  const cube = upload(renderer.device.device, box({ width: 1.4 }));
+  const ground = upload(renderer.device.device, box({ width: 14, height: 0.2, depth: 14 }));
+
+  const unlit = await basicMaterial(renderer.device.device);
+  const pbr = await pbrMaterial(renderer.device.device);
+  const floor = await basicMaterial(renderer.device.device);
+  floor.setSlot('tint', [0.10, 0.11, 0.14]);
+  floor.setSlot('opacity', 1);
+
+  const spin = new MeshNode({ name: 'spinner', mesh: cube, material: pbr });
+  spin.setPosition(0, 0.8, 0);
+
+  scene.add(spin);
+  scene.add(new MeshNode({ name: 'floor', mesh: ground, material: floor }));
+  // 64 cubes sharing one material and one mesh: 64 draws, 2 GPU resources.
+  for (let i = 0; i < 64; i++) {
+    const a = (i / 64) * Math.PI * 2;
+    const n = new MeshNode({ name: `p${i}`, mesh: cube, material: i % 8 === 0 ? unlit : pbr });
+    n.setPosition(Math.cos(a) * 3.2, 0.35, Math.sin(a) * 3.2);
+    n.setScale(0.3);
+    scene.add(n);
+  }
+
+  let frames = 0;
+  renderer.start((dt, elapsed) => {
+    // Rotation is a quaternion, integrated from an Euler triple. Writing
+    // `node.rotation` in place bypasses the dirty flag, so `markDirty()` is
+    // required — this is the one place a caller writes the array directly.
+    quat.fromEulerXYZ(spin.rotation, 0, spin.rotation[1] + dt * 0.6, 0);
+    spin.markDirty();
+    spin.setPosition(0, 0.8 + Math.sin(elapsed * 1.2) * 0.15, 0);
+
+    const s2 = renderer.stats;
+    if ((frames++ & 15) === 0) {
+      hud.textContent =
+        `${renderer.describeGpu()}\n` +
+        `cpu      ${s2.averageCpu.toFixed(3)} ms   (${s2.cpu.toFixed(3)} last)\n` +
+        `draws    ${s2.drawCalls}\n` +
+        `tris     ${s2.triangles.toLocaleString()}\n` +
+        `uniforms ${(s2.uniformBytes / 1024).toFixed(1)} KiB/frame\n` +
+        `per draw ${(s2.cpuPerDraw * 1000).toFixed(1)} µs`;
+    }
+  });
+
+  // Exposed so the headless test can assert on a real frame.
+  globalThis.__apse = { renderer, scene, camera, mesh: cube, material: pbr };
+  window.__apseReady = true;
+} catch (e) {
+  showError(e);
+  window.__apseError = isAseError(e) ? e.toJSON() : { name: e?.name, message: e?.message };
+}
+</script>
+</body>
+</html>
