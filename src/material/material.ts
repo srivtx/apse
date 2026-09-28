@@ -411,9 +411,19 @@ async function compilePipeline(
 ): Promise<GPURenderPipeline> {
   const r = generated.resolved;
   device.pushErrorScope('validation');
-  let pipeline: GPURenderPipeline;
+  // `!` rather than a nullable: every path that can reach `return` assigns it,
+  // and the two failure paths below end in `never` as far as the caller is
+  // concerned. Tracking nullability across the two error routes buys nothing.
+  let pipeline!: GPURenderPipeline;
+  // Hoisted so a failure can ask the module for its real diagnostics rather than
+  // reporting only the validation wrapper.
+  let shaderModule: GPUShaderModule | null = null;
   try {
-    const module = device.createShaderModule({
+    // Named `shaderModule`, not `module`: Bun's types declare a *global*
+    // `module: NodeModule`, so a local named `module` shadows a real global and
+    // every later reference to the shader module silently resolves to it. That
+    // is not a stylistic preference — it is the bug this rename fixes.
+    shaderModule = device.createShaderModule({
       label: `apse:shader:${r.name}`,
       code: generated.code,
     });
@@ -421,7 +431,7 @@ async function compilePipeline(
       label: `apse:pipeline:${r.name}`,
       layout,
       vertex: {
-        module,
+        module: shaderModule,
         entryPoint: VERTEX_ENTRY,
         // `gpuLayouts()`, not `gpuLayout()`. An instanced layout has two slots
         // — vertex data and the per-instance transform — and WGSL reads both
@@ -432,7 +442,7 @@ async function compilePipeline(
         buffers: r.layout.gpuLayouts(),
       },
       fragment: {
-        module,
+        module: shaderModule,
         entryPoint: FRAGMENT_ENTRY,
         targets: r.targets.map((t) => ({
           format: t.format,
@@ -455,24 +465,70 @@ async function compilePipeline(
     });
   } catch (cause) {
     await device.popErrorScope();
-    pipelineFailure(r, generated, cause);
+    // Non-null: assigned before anything can throw past its own assignment.
+    await pipelineFailure(r, generated, shaderModule!, cause);
   }
 
   // The async path can also fail without rejecting, by setting a device error.
   // Both routes are real, and both get the same typed error.
   const scopeError = await device.popErrorScope();
-  if (scopeError !== null) pipelineFailure(r, generated, scopeError.message);
+  if (scopeError !== null) await pipelineFailure(r, generated, shaderModule!, scopeError.message);
   return pipeline;
 }
 
-function pipelineFailure(r: ResolvedMaterialSpec, generated: GeneratedShader, raw: unknown): never {
-  const text = raw instanceof Error ? raw.message : String(raw);
-  return fail('SHADER_COMPILE_FAILED',
-    `Material "${r.name}" did not compile.`, {
-    why: `The generated WGSL was rejected by the shader compiler. apse generates the bindings, the uniform structs, the varying struct, and the entry-point signatures, so the fault is almost always in the \`vertex\`/\`fragment\` statements. Compiler said: ${text}`,
-    fix: `Read the message above — it names the offending line, which is inside your body, not in generated code. Call describeMaterial() for the fields that exist, and pass \`scaffold: true\` to print the full ${generated.byteLength}-byte program.`,
+/**
+ * Turns a pipeline failure into a typed error carrying the *compiler's* message.
+ *
+ * The error scope's text is a wrapper: it names the stage and the validation
+ * rule, and points at a line of the generated program. `getCompilationInfo()`
+ * has the real diagnostic — file, line, column, and the message itself — and it
+ * is right there. Reading it is the difference between a message that says
+ * "expected ';' for variable declaration" and one that says "While validating
+ * vertex stage", which is a *lie* when the mistake was in the fragment body.
+ *
+ * Source excerpts are included because a line number in a 1,984-byte generated
+ * program is not something a person can act on, and because the generated
+ * program is mostly noise around the handful of lines the author wrote.
+ */
+async function pipelineFailure(
+  r: ResolvedMaterialSpec,
+  generated: GeneratedShader,
+  module: GPUShaderModule,
+  raw: unknown,
+): Promise<never> {
+  const scopeText = raw instanceof Error ? raw.message : String(raw);
+
+  let detail = '';
+  try {
+    const info = await module.getCompilationInfo();
+    const errors = info.messages.filter((m) => m.type === 'error');
+    if (errors.length > 0) {
+      const lines = generated.code.split('\n');
+      detail = errors.slice(0, 4).map((m) => {
+        const excerpt = lines[m.lineNum - 1] ?? '';
+        return `  ${m.lineNum}:${m.linePos} ${m.message}\n    ${excerpt.trim()}`;
+      }).join('\n');
+    }
+  } catch {
+    // getCompilationInfo is optional and can be unavailable. The scope text is
+    // worse but it is not nothing, so fall through to it rather than failing
+    // to report the failure at all.
+  }
+
+  const stage = detail === '' ? scopeText : detail;
+  fail('SHADER_COMPILE_FAILED',
+    `Material "${r.name}" did not compile: ${errors0(generated, stage)}`, {
+    why: `The WGSL was rejected by the shader compiler. apse generates the bindings, the uniform structs, the varying struct, and the entry-point signatures, so the fault is almost always in the \`vertex\`/\`fragment\` statements rather than in generated code.\n${detail === '' ? `  ${scopeText}` : detail}`,
+    fix: `The line and column above are in the generated program; the quoted line is the source. Fix the statement it points at. If the line is in a \`prelude\` function, check its name and arity. describeMaterial() lists every field that exists, and \`scaffold: true\` prints the full ${generated.byteLength}-byte program.`,
     cause: raw instanceof Error ? raw : undefined,
   });
+}
+
+/** The first line of the compiler detail, for the message headline. */
+function errors0(generated: GeneratedShader, detail: string): string {
+  const first = detail.split('\n')[0]?.trim() ?? '';
+  void generated;
+  return first === '' ? 'see the compiler output below' : first;
 }
 
 function toGPUBlend(blend: BlendSpec | null): GPUBlendState | undefined {

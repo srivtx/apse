@@ -137,7 +137,7 @@ export interface RendererOptions extends DeviceOptions {
 const EMPTY_ITEMS: DrawItem[] = [];
 
 /** Scratch, module-level, and reused. The frame loop must not allocate. */
-const _normal = new Float32Array(9);
+const _normal = new Float32Array(12);
 /** Two floats for `resolution` / `viewport`, so the frame uniform writes nothing. */
 const _pair = new Float32Array(2);
 /**
@@ -1001,6 +1001,23 @@ function indexFormatOf(geometry: DrawItem['geometry']): GPUIndexFormat {
  * inverse is ~120 multiplies and an allocation-free version still costs six
  * times as much for a result whose fourth row is never used.
  */
+/**
+ * Inverse transpose of the upper-left 3x3, written **in WGSL `mat3x3<f32>`
+ * layout**: three columns, each 16-byte aligned, so 12 floats with 3 of them
+ * padding.
+ *
+ * The padding is the whole point. A `mat3x3<f32>` is not nine contiguous floats
+ * — each of its three columns starts at a 16-byte boundary, because `vec3<f32>`
+ * is 16-byte aligned. Writing a tight 3x3 and letting the packer place the
+ * columns therefore reads three floats that were never written, and the third
+ * column arrives as zeros. The result is a normal matrix that is silently wrong
+ * for every mesh in the scene, which shades as though every face were lit
+ * head-on. No error is raised, anywhere, at any point.
+ *
+ * The adjugate divided by the determinant is `transpose(inverse)` directly, so
+ * no transpose step is needed. A general 4x4 inverse would be ~120 multiplies
+ * against this one's ~30, for a result whose fourth row is never read.
+ */
 function normalMatrixOf(m: Float32Array, out: Float32Array): Float32Array {
   const a = m[0]!, b = m[1]!, c = m[2]!;
   const d = m[4]!, e = m[5]!, f = m[6]!;
@@ -1009,23 +1026,28 @@ function normalMatrixOf(m: Float32Array, out: Float32Array): Float32Array {
   const A = e * i - f * h;
   const B = f * g - d * i;
   const C = d * h - e * g;
-  let det = a * A + b * B + c * C;
+  const det = a * A + b * B + c * C;
 
   if (det === 0 || !Number.isFinite(det)) {
     // A degenerate transform has no inverse. Identity is the least-wrong
-    // answer: it makes the object look un-transformed rather than invisible,
-    // which is a bug a user can see and report.
-    out.set(IDENTITY_NORMAL);
+    // answer: the object looks un-transformed rather than invisible, which is a
+    // bug a user can see and report.
+    for (let k = 0; k < 12; k++) out[k] = IDENTITY_NORMAL[k];
     return out;
   }
-  det = 1 / det;
+  const s = 1 / det;
 
-  out[0] = A * det;             out[1] = B * det;             out[2] = C * det;
-  out[3] = (c * h - b * i) * det; out[4] = (a * i - c * g) * det; out[5] = (b * g - a * h) * det;
-  out[6] = (b * f - c * e) * det; out[7] = (c * d - a * f) * det; out[8] = (a * e - b * d) * det;
+  // Column 0 at 0..2, column 1 at 4..6, column 2 at 8..10. Indices 3, 7 and 11
+  // are the vec3 padding and stay zero.
+  out[0] = A * s;                 out[1] = B * s;                 out[2] = C * s;
+  out[4] = (c * h - b * i) * s;   out[5] = (a * i - c * g) * s;   out[6] = (b * g - a * h) * s;
+  out[8] = (b * f - c * e) * s;   out[9] = (c * d - a * f) * s;   out[10] = (a * e - b * d) * s;
+  out[3] = 0; out[7] = 0; out[11] = 0;
   return out;
 }
 
-const IDENTITY_NORMAL = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+/** Identity in the same padded 12-float layout. */
+const IDENTITY_NORMAL = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]);
+
 
 export type { Material };

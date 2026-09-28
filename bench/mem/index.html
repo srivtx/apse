@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>apse mem bench</title>
+<style>
+body{margin:0;background:#000;color:#888;font:12px ui-monospace,Menlo,monospace}
+canvas{position:fixed;top:0;left:-99999px}
+</style>
+</head>
+<body>
+<canvas id="gpu"></canvas>
+<script type="module">
+// Per-object heap cost of two scene graphs.
+//
+// One library per page, always. The whole point of this harness is that the
+// isolate contains exactly one scene-graph implementation and nothing else, so
+// a heap snapshot can be attributed to it. Two libraries in one page
+// contaminate every number, because the only thing a slope can separate from a
+// whole-isolate total is the thing that scales with the object count — and in a
+// mixed page nothing else is guaranteed to be constant.
+//
+// The page builds N objects, holds them, and then does nothing. The driver
+// takes a CDP heap snapshot from outside and reads the answer out of it. The
+// page deliberately does not measure itself: performance.memory is
+// whole-isolate and quantised, which is fine for "did we leak" and useless for
+// "how many bytes is one node".
+//
+//   ?engine=apse|three  &n=<count>  &variant=<see VARIANTS>
+//
+// __memInfo() reports the cheap structural facts: how many own properties a
+// class has, and how many of those are closures allocated per instance. Those
+// are computed by identity-diffing two instances, which is the only definition
+// of "per instance" that cannot be fooled by a shared prototype.
+
+const g = globalThis;
+const P = new URLSearchParams(location.search);
+const ENGINE = P.get('engine') ?? 'apse';
+const N = Math.max(0, parseInt(P.get('n') ?? '10000', 10));
+const VARIANT = P.get('variant') ?? (ENGINE === 'apse' ? 'real' : 'none');
+// 'src' is the real TypeScript, transpiled by the server as it is served, so
+// class names survive into the snapshot. 'dist' is the shipped minified bundle.
+// Both are measured: a matching slope says the per-object cost is a property of
+// the library and not of how it was built, and the minified one is what a user
+// actually runs.
+const BUILD = P.get('build') ?? 'dist';
+const APSE_ENTRY = BUILD === 'src' ? '/src/index.ts' : '/dist/index.js';
+
+const VARIANTS = {
+  // apse: does the node's cost depend on what it points at? A stub geometry and
+  // a real uploaded GpuMesh should give the same slope, because a mesh and a
+  // material are one pointer each and both are shared. If they do not, the
+  // measurement is measuring something other than the node.
+  'apse:stub': 'apse, MeshNode over a plain stub geometry/material, no GPU device at all',
+  'apse:real': 'apse, MeshNode over a real uploaded GpuMesh and a real PBR Material',
+  'apse:collect': 'apse:real, plus one collectDrawItems() so the DrawItem pool is populated',
+  // Calibration, not a scene graph. Six Float32Arrays are 908 of apse's 1,060
+  // bytes per node, so the cost of one of them has to be a measured number and
+  // not an assumption. It also answers a question a heap snapshot raises on its
+  // own: a typed array's payload may or may not be inside the JS heap total.
+  'apse:calib': 'n bare Float32Array(16) in a flat array — the calibration unit apse is built from',
+  // A bare Node is the scene graph with no drawable on it, so the difference
+  // between it and a MeshNode is the measured cost of being drawable rather
+  // than an assumed one.
+  'apse:bare': 'apse, n bare Node — no mesh, no material, nothing drawn',
+  // three: 'bare' is the same move on the other side of the comparison, so
+  // three.js's cost of being drawable is measured the same way apse's is.
+  'three:bare': 'three, Scene + n bare Object3D — no geometry, no material',
+  // three: 'none' is the scene graph alone. 'webgl' adds a renderer, which is
+  // a large constant the slope removes but the total-heap row must show.
+  'three:none': 'three, Scene + Mesh(shared geometry, shared material), no renderer',
+  'three:webgl': 'three:none, plus a live WebGLRenderer and one rendered frame',
+};
+
+/** Everything the page built, so nothing here is collectable mid-snapshot. */
+const keep = {};
+g.__memKeep = keep;
+
+function side(n) { return Math.ceil(Math.sqrt(Math.max(1, n))); }
+
+/**
+ * A grid, not a line and not a stack at the origin.
+ *
+ * A scene where every object shares a position would be trivially culled, and
+ * a scene with a deep parent chain would measure the chain as much as the node.
+ * A flat grid at ±45 with a 50-degree camera at z=120 is inside the frustum for
+ * every count used here, so the draw-item pool is genuinely full at n.
+ */
+function grid(i, count) {
+  const s = side(count);
+  const step = s > 1 ? 90 / (s - 1) : 0;
+  return [(i % s) * step - 45, Math.floor(i / s) * step - 45];
+}
+
+// ---------------------------------------------------------------------------
+// apse
+// ---------------------------------------------------------------------------
+
+async function buildApse() {
+  const mod = await import(APSE_ENTRY);
+
+  if (VARIANT === 'calib') {
+    const objects = new Array(N);
+    for (let i = 0; i < N; i++) objects[i] = new Float32Array(16);
+    keep.objects = objects;
+    return { engine: 'apse', variant: VARIANT, n: N, drawItems: 0, held: N, usedJSHeapSize: performance.memory?.usedJSHeapSize ?? 0 };
+  }
+
+  const { Scene, MeshNode, Node, PerspectiveCamera } = mod;
+
+  const scene = new Scene({ name: 'mem' });
+  const camera = new PerspectiveCamera({ fov: 50, near: 0.1, far: 400, aspect: 1280 / 720 });
+  camera.lookAt([0, 0, 120], [0, 0, 0], [0, 1, 0]);
+
+  let renderer = null;
+  let mesh;
+  let material;
+
+  if (VARIANT === 'bare') {
+    const objects = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const [x, z] = grid(i, N);
+      const n = new Node({ name: `n${i}` });
+      n.setPosition(x, 0, z);
+      n.setScale(0.55);
+      scene.add(n);
+      objects[i] = n;
+    }
+    keep.scene = scene;
+    keep.objects = objects;
+    keep.camera = camera;
+    return { engine: 'apse', variant: VARIANT, n: N, drawItems: 0, held: N, usedJSHeapSize: performance.memory?.usedJSHeapSize ?? 0 };
+  }
+
+  if (VARIANT === 'stub') {
+    // MeshNode reads exactly two fields off the geometry and none off the
+    // material, so this is a faithful stand-in for a shared drawable pair and
+    // costs the page one small object instead of a GPU device.
+    mesh = { instanceCount: 1, firstInstance: 0, vertexCount: 24, indexCount: 36, name: 'stub' };
+    material = { phase: 'opaque', label: 'stub', pipelineKey: 'stub' };
+  } else {
+    const canvas = document.createElement('canvas');
+    // The CSS size has to be right, not just the attribute. CanvasSizer derives
+    // the backing store from the element's layout box, so a canvas left at the
+    // default 300x150 — or shrunk to hide it — hands WebGPU a 1x1 target, the
+    // GPU is never exercised, and the page still builds a perfectly normal
+    // looking scene graph. The node memory would be right; the page would be
+    // lying about what it tested.
+    canvas.style.width = '1280px';
+    canvas.style.height = '720px';
+    document.body.appendChild(canvas);
+    Object.defineProperty(canvas, 'clientWidth', { value: 1280, configurable: true });
+    Object.defineProperty(canvas, 'clientHeight', { value: 720, configurable: true });
+    renderer = await mod.Renderer.create(canvas, { sampleCount: 1 });
+    if (canvas.width < 640 || canvas.height < 360) {
+      throw new Error(`canvas backing store is ${canvas.width}x${canvas.height}; ` +
+        `that is a 1-pixel target, not a render. Check the canvas CSS size.`);
+    }
+    material = await mod.pbrMaterial(renderer.device.device);
+    mesh = mod.upload(renderer.device.device, mod.box({ width: 1 }));
+  }
+
+  const objects = new Array(N);
+  for (let i = 0; i < N; i++) {
+    const [x, z] = grid(i, N);
+    const n = new MeshNode({ name: `n${i}`, mesh, material });
+    n.setPosition(x, 0, z);
+    n.setScale(0.55);
+    scene.add(n);
+    objects[i] = n;
+  }
+
+  let drawItems = null;
+  if (VARIANT === 'collect' && N > 0) {
+    // The DrawItem pool is lazy: it only ever holds as many items as the widest
+    // frame has needed. Populating it here is the only way its cost shows up in
+    // a snapshot, and it is the number that answers "does a drawable cost more
+    // than a node" for apse.
+    drawItems = scene.collectDrawItems([], camera);
+  }
+
+  keep.scene = scene;
+  keep.objects = objects;
+  keep.camera = camera;
+  keep.renderer = renderer;
+  keep.mesh = mesh;
+  keep.material = material;
+  keep.drawItems = drawItems;
+
+  return {
+    engine: 'apse',
+    variant: VARIANT,
+    n: N,
+    drawItems: drawItems ? drawItems.length : 0,
+    culled: scene.culledCount,
+    meshNodeCount: scene.meshNodeCount,
+    peakDrawCount: scene.peakDrawCount,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// three.js
+// ---------------------------------------------------------------------------
+
+async function buildThree() {
+  const THREE = await import('/node_modules/three/build/three.module.js');
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, 1280 / 720, 0.1, 400);
+  camera.position.set(0, 0, 120);
+  camera.lookAt(0, 0, 0);
+  camera.updateMatrixWorld();
+
+  // One shared geometry and one shared material, which is what an application
+  // actually does and what makes the per-object cost the interesting number.
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.MeshStandardMaterial({ roughness: 0.4, metalness: 0 });
+
+  const objects = new Array(N);
+  for (let i = 0; i < N; i++) {
+    const [x, z] = grid(i, N);
+    const m = VARIANT === 'bare' ? new THREE.Object3D() : new THREE.Mesh(geometry, material);
+    m.position.set(x, 0, z);
+    m.scale.setScalar(0.55);
+    m.updateMatrix();
+    m.updateMatrixWorld(true);
+    scene.add(m);
+    objects[i] = m;
+  }
+
+  let renderer = null;
+  if (VARIANT === 'webgl') {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280; canvas.height = 720;
+    canvas.style.width = '1280px';
+    canvas.style.height = '720px';
+    document.body.appendChild(canvas);
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+    renderer.setPixelRatio(1);
+    renderer.setSize(1280, 720, false);
+    // One real frame. Without it, the renderer's per-object render list has
+    // never been built, so nothing about the "what a rendered scene costs"
+    // variant is actually a rendered scene.
+    renderer.render(scene, camera);
+  }
+
+  keep.scene = scene;
+  keep.objects = objects;
+  keep.camera = camera;
+  keep.renderer = renderer;
+  keep.geometry = geometry;
+  keep.material = material;
+
+  return { engine: 'three', variant: VARIANT, n: N, drawItems: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Structural facts: property counts and per-instance closures
+// ---------------------------------------------------------------------------
+
+/**
+ * Every function reachable from `root` within `depth` own-property hops,
+ * tagged with the path it was found at.
+ *
+ * Identity is the return value's identity, which is the whole point: a
+ * prototype method is found from every instance of the class and must not
+ * count, and a shared geometry or material is found from every node and must
+ * not count either. Both are removed by the diff in `perInstanceClosures`.
+ */
+function collectFunctions(root, depth, path, seen, out) {
+  if (depth < 0) return out;
+  for (const k of Object.getOwnPropertyNames(root)) {
+    let v;
+    try { v = root[k]; } catch { continue; }
+    if (typeof v === 'function') { out.push({ path: `${path}.${k}`, fn: v }); continue; }
+    if (v === null || typeof v !== 'object') continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    collectFunctions(v, depth - 1, `${path}.${k}`, seen, out);
+  }
+  return out;
+}
+
+/**
+ * Functions that exist because *this* instance exists.
+ *
+ * Two instances of the same class, diffed by function identity. Anything in A
+ * that is not in B was allocated per instance; anything in both is a prototype
+ * method, a module-level constant, or part of a shared object, and is not
+ * per-instance cost no matter how many own properties it has.
+ */
+function describeClass(make, label) {
+  const a = make();
+  const b = make();
+  const fa = collectFunctions(a, 3, label, new Set(), []);
+  const fb = new Set(collectFunctions(b, 3, label, new Set(), []).map((f) => f.fn));
+  const own = Object.getOwnPropertyNames(a);
+  const closures = fa.filter((f) => !fb.has(f.fn));
+  return {
+    label,
+    ownProps: own.length,
+    ownPropNames: own,
+    perInstanceClosures: closures.length,
+    closurePaths: closures.map((c) => c.path),
+    // Named differently so a reader can see that the two numbers answer
+    // different questions: a property is a slot in the object, a closure is a
+    // second heap object plus a scope.
+    ownFunctionProps: own.filter((k) => typeof a[k] === 'function').length,
+  };
+}
+
+g.__memInfo = async () => {
+  if (ENGINE === 'apse') {
+    const { Scene, MeshNode, Node } = await import(APSE_ENTRY);
+    const mesh = { instanceCount: 1, firstInstance: 0 };
+    const material = { phase: 'opaque' };
+    return {
+      engine: 'apse',
+      variants: VARIANTS,
+      classes: [
+        describeClass(() => new Node({ name: 'n' }), 'Node'),
+        describeClass(() => new MeshNode({ name: 'n', mesh, material }), 'MeshNode'),
+        describeClass(() => new Scene({ name: 's' }), 'Scene'),
+      ],
+    };
+  }
+  const THREE = await import('/node_modules/three/build/three.module.js');
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.MeshStandardMaterial();
+  return {
+    engine: 'three',
+    variants: VARIANTS,
+    classes: [
+      describeClass(() => new THREE.Object3D(), 'Object3D'),
+      describeClass(() => new THREE.Mesh(geometry, material), 'Mesh'),
+      describeClass(() => new THREE.Scene(), 'Scene'),
+      describeClass(() => new THREE.Matrix4(), 'Matrix4'),
+      describeClass(() => new THREE.Vector3(), 'Vector3'),
+      describeClass(() => new THREE.Euler(), 'Euler'),
+      describeClass(() => new THREE.Quaternion(), 'Quaternion'),
+      describeClass(() => new THREE.Layers(), 'Layers'),
+    ],
+  };
+};
+
+// ---------------------------------------------------------------------------
+
+g.__memBuild = async () => {
+  if (ENGINE !== 'apse' && ENGINE !== 'three') {
+    throw new Error(`unknown engine "${ENGINE}"; expected apse or three`);
+  }
+  if (!VARIANTS[`${ENGINE}:${VARIANT}`]) {
+    throw new Error(`unknown variant "${VARIANT}"; expected one of ` +
+      Object.keys(VARIANTS).filter((k) => k.startsWith(`${ENGINE}:`)).join(', '));
+  }
+  const info = ENGINE === 'apse' ? await buildApse() : await buildThree();
+  // Touch the heap so the objects are provably live and marked, not sitting in
+  // a register the collector has not caught up with.
+  let live = 0;
+  for (const o of keep.objects) if (o !== undefined) live++;
+  info.held = live;
+  info.usedJSHeapSize = performance.memory?.usedJSHeapSize ?? 0;
+  return info;
+};
+
+g.__memError = null;
+g.__memReady = true;
+</script>
+</body>
+</html>

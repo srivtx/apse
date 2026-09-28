@@ -68,7 +68,8 @@ The margin is elsewhere, and the two tables below are the ones to read:
 | | apse | three.js |
 |---|---:|---:|
 | bundle, tree-shaken: renderer + camera + PBR + scene graph + loop | **45.3 KB** gzip (38.6 KB brotli) | ~133 KB gzip |
-| JS heap, 1000–5000 objects | 50–76 MB | 60–85 MB |
+| heap per scene-graph object | **1,060 B**, 21 heap objects | 1,216 B, 57 heap objects |
+| isolate heap, 10,000-object scene | 12.65 MB | 17.38 MB |
 | 1000-node static scene, second frame | 0 matrix writes, 1 node visit | every world matrix rewritten |
 | one moving leaf 5 levels deep | 1 write, 5 visits | every world matrix rewritten |
 | transform upload, static scene, steady state | 0 bytes | re-uploaded per object per frame |
@@ -81,6 +82,45 @@ is a real minimal app bundled on every build, its gzip size is compared to a har
 import are actually absent — with a positive control, so the check cannot pass vacuously. The gate
 also prints the live size and the percentage of budget used, which is what keeps the number above
 honest.
+
+## Where apse wins, and where it does not
+
+Measured, not asserted. Every number here comes from a harness in `bench/` you can run.
+
+| axis | apse | three.js 0.186.1 | verdict |
+|---|---:|---:|---|
+| bundle, tree-shaken, full renderer + PBR + scene graph | **45.3 KB** gzip | ~133 KB | apse, 2.9× |
+| heap per scene-graph object | 1,060 B / 21 heap objects | 1,216 B / 57 heap objects | apse, 1.15× by size, **2.7× by object count** |
+| custom material, lines of code | 80 | 83 (`ShaderMaterial`) · 38 (`onBeforeCompile`) · **15 (node material)** | **three.js** |
+| generated code per material | 77 lines from 22 authored | 1,984 lines from 6 authored | neither — see below |
+| silent-vs-typed diagnostics, 9 scenarios | better 5 · worse 2 · equal 2 | — | apse, narrowly |
+| CPU frame time, 5000 objects | 3.80 ms | 3.50 ms | **three.js** |
+| CPU frame time, 1000-node static scene, frame 2 | 0 matrix writes | every world matrix rewritten | apse |
+
+**The three claims this README used to make that do not survive measurement:**
+
+1. *"A custom material is dramatically simpler."* It is not. apse is 80 lines, three.js
+   `ShaderMaterial` is 83 — a tie. And three.js's **node material path is 15 lines**, which
+   beats apse outright. That is the real competition for the scaffold, and apse currently
+   loses it. The scaffold's genuine win is not brevity, it is **generated code**: 77 lines
+   from 22 authored, against 1,984 generated from 6 on `onBeforeCompile`.
+
+2. *"An `Object3D` costs 1,804 bytes."* It does not. Measured with a Chrome heap snapshot
+   and GC forced: **1,216 B**, 13× less than claimed, against apse's 1,060 B. The real
+   difference is not the byte total — it is that three.js allocates **57 live heap objects per
+   node to apse's 21**, and 86% of apse's cost is six `Float32Array`s that would be one array
+   if the design were finished.
+
+3. *"42 typed error codes."* 38 are reachable. Two failures are **unrepresentable rather than
+   diagnosed**, which beats a good error, but the expensive ones are still silent: a disposed
+   material still renders, and `INTERNAL_INVARIANT` — catalogued as "always a bug in apse" —
+   is used at 55 of 140 `fail()` sites, so a user's bug gets filed as a library bug.
+
+**The one place apse is structurally better and it is not close:** two failures cannot be
+expressed. You cannot compile a material whose uniform block and JS packer disagree, because
+one table produces both. You cannot draw a material against a render target whose colour format
+differs, because the renderer checks before `setPipeline` — where WebGPU's own answer is a
+validation error that invalidates the *whole command buffer* and mentions two format enums.
 
 ## The one idea: a material is data, not a program
 
@@ -309,6 +349,11 @@ budgets, and typed errors over a finite catalog.
 
 What does not work yet. Read this before planning around it.
 
+- **The node-material comparison is a live threat, not a settled result.** three.js's
+  `material.colorNode = ...` path is 15 lines against apse's 80. If that gap does not close,
+  the scaffold is not a differentiator and the honest position is that apse's value is
+  bundle size and correctness, not authoring speed. Closing it means the scaffold emitting
+  structured errors the way the node system does — a typed node graph, not typed strings.
 - **Instancing is implemented but not reachable from the scene graph.** `InstanceData`,
   `GpuInstances`, `instancedLayout()` and the second vertex-buffer slot all exist and are tested
   (`test/instancing.test.ts`, 72 tests), and a pipeline built for an instanced layout draws
@@ -329,6 +374,9 @@ What does not work yet. Read this before planning around it.
 - **No asset loaders.** No glTF, no textures on disk, no environment maps. `textures` declares a
   slot and generates the binding; you supply the `GPUTextureView`.
 - **No editor, no scene serialisation, no inspector.**
+- **Four of the 42 error codes are unreachable** and two of them are the ones a user is most
+  likely to hit (`MATERIAL_DISPOSED`, `MESH_DISPOSED`) — a disposed resource currently fails
+  later, with a less useful message.
 - **No GPU timing.** `stats.gpu` is a hardcoded `0`, and `timestamp-query` is feature-detected but
   never actually requested. Until it is, you cannot tell from the API whether a frame is CPU- or
   GPU-bound, which is the question that decides whether any of the CPU work above matters.

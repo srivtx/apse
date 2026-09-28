@@ -1,0 +1,1796 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>apse diagnostic bench</title>
+<style>
+body{margin:0;background:#000;color:#888;font:12px ui-monospace,Menlo,monospace}
+canvas{position:fixed;top:0;left:-99999px}
+</style>
+</head>
+<body>
+<canvas id="scratch"></canvas>
+<script type="module">
+/**
+ * Diagnostic bench: what does a developer actually SEE when each of the nine
+ * failure modes is triggered, in apse and in three.js, in the same process and
+ * on the same GPU.
+ *
+ * Two harness rules copied from bench/index.html, because both of them make a
+ * measurement silently meaningless rather than fail:
+ *
+ *  1. The canvas is sized in CSS *and* has clientWidth/clientHeight defined.
+ *     apse's CanvasSizer derives the backing store from the layout box, so a
+ *     canvas left at the default 300x150 renders into a 1x1 target and never
+ *     touches the GPU.
+ *  2. onValidationError is wired to an array. A WebGPU validation error does
+ *     not throw; it invalidates the object it relates to, and the visible
+ *     result is a blank frame. A harness that ignores it measures a renderer
+ *     drawing nothing and calls it a clean run.
+ *
+ * Everything here records what the developer sees, not what the library
+ * intended: exceptions (fields read off the thrown object), console output
+ * (captured by patching console), and pixels (read back and classified against
+ * the known clear colour, so "drew black" and "drew nothing" stay
+ * distinguishable).
+ */
+
+const g = globalThis;
+
+// ---------------------------------------------------------------------------
+// Console recorder
+// ---------------------------------------------------------------------------
+// Nothing is forwarded. The driver prints every captured line, so nothing is
+// lost, and the run stays readable. `pageerror` still surfaces through
+// puppeteer, so a genuine harness fault is not swallowed.
+
+const consoleBuf = [];
+let captureLabel = null;
+
+function fmtArg(a) {
+  if (typeof a === 'string') return a;
+  if (a instanceof Error) return `${a.name}: ${a.message}`;
+  if (a === undefined) return 'undefined';
+  try { return JSON.stringify(a); } catch { return String(a); }
+}
+for (const level of ['error', 'warn', 'log', 'info', 'debug']) {
+  console[level] = (...args) => {
+    consoleBuf.push({ scenario: captureLabel, level, text: args.map(fmtArg).join(' ') });
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GPU validation recorder
+// ---------------------------------------------------------------------------
+
+const gpuBuf = [];
+let gpuLabel = null;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function safe(fn) { try { return fn(); } catch (e) { return `<threw: ${e && e.message}>`; } }
+
+function describeError(e) {
+  if (e === undefined || e === null) return { thrown: false, value: String(e) };
+  if (typeof e !== 'object') return { thrown: true, ctor: typeof e, message: String(e) };
+  return {
+    thrown: true,
+    name: e.name,
+    ctor: e.constructor && e.constructor.name,
+    code: e.code,
+    message: e.message,
+    why: e.why,
+    fix: e.fix,
+    link: e.link,
+    detail: e.detail === undefined ? undefined : safe(() => JSON.stringify(e.detail)),
+    toString: safe(() => String(e)),
+    toJSON: safe(() => JSON.stringify(typeof e.toJSON === 'function' ? e.toJSON() : null)),
+    stackTop: String(e.stack || '').split('\n').slice(0, 4).map((s) => s.trim()),
+  };
+}
+
+async function attempt(label, fn) {
+  captureLabel = label;
+  gpuLabel = label;
+  const cFrom = consoleBuf.length;
+  const gFrom = gpuBuf.length;
+  let data = null;
+  let error = null;
+  try {
+    data = await fn();
+  } catch (e) {
+    error = describeError(e);
+  }
+  captureLabel = null;
+  gpuLabel = null;
+  return {
+    data,
+    error,
+    console: consoleBuf.slice(cFrom),
+    validation: gpuBuf.slice(gFrom).map((m) => m.message),
+  };
+}
+
+function makeCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.style.width = `${w}px`;
+  c.style.height = `${h}px`;
+  document.body.appendChild(c);
+  Object.defineProperty(c, 'clientWidth', { value: w, configurable: true });
+  Object.defineProperty(c, 'clientHeight', { value: h, configurable: true });
+  return c;
+}
+
+/** apse clears to { r: 0.02, g: 0.02, b: 0.03 } -> (5, 5, 8). */
+const APSE_CLEAR = [5, 5, 8];
+/** three.js is set to the same colour so the two are comparable. */
+const THREE_CLEAR = [5, 5, 8];
+
+function analyse(imageData, clear) {
+  if (imageData.error) return { error: imageData.error };
+  const d = imageData.data;
+  let nonClear = 0;
+  let maxLuma = 0;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], gg = d[i+1], b = d[i+2];
+    const l = r + gg + b;
+    if (l > maxLuma) maxLuma = l;
+    sum += l;
+    if (Math.abs(r - clear[0]) + Math.abs(gg - clear[1]) + Math.abs(b - clear[2]) > 6) nonClear++;
+  }
+  const n = d.length / 4;
+  return {
+    nonClear,
+    total: n,
+    coverage: +(nonClear / n).toFixed(4),
+    maxLuma,
+    meanLuma: Math.round(sum / n / 3),
+  };
+}
+
+function centre(imageData) {
+  if (imageData.error) return null;
+  const d = imageData.data;
+  const w = imageData.width;
+  const h = imageData.height;
+  const i = ((h >> 1) * w + (w >> 1)) * 4;
+  return [d[i], d[i+1], d[i+2], d[i+3]];
+}
+
+/** The naive readback: draw the canvas into a 2D canvas and sample it. */
+function readCanvas(canvas) {
+  const c = document.createElement('canvas');
+  c.width = canvas.width;
+  c.height = canvas.height;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  try {
+    ctx.drawImage(canvas, 0, 0);
+  } catch (e) {
+    return { error: `drawImage threw: ${e && e.message}` };
+  }
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
+
+function readDataURL(canvas) {
+  const url = canvas.toDataURL('image/png');
+  if (url === 'data:,') return { error: 'toDataURL returned an empty data URL' };
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = img.width;
+      c.height = img.height;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      resolve({ data: ctx.getImageData(0, 0, c.width, c.height).data, width: img.width, height: img.height });
+    };
+    img.onerror = () => resolve({ error: 'PNG decode failed' });
+    img.src = url;
+  });
+}
+
+/** apse's capture() -> ImageData, honouring bytesPerRow and the BGRA swap. */
+function captureToImageData(frame) {
+  const { data, width, height, bytesPerRow, format } = frame;
+  const out = new Uint8ClampedArray(width * height * 4);
+  const bgra = format.startsWith('bgra');
+  for (let y = 0; y < height; y++) {
+    const src = y * bytesPerRow;
+    const dst = y * width * 4;
+    if (bgra) {
+      for (let x = 0; x < width; x++) {
+        out[dst + x * 4 + 0] = data[src + x * 4 + 2];
+        out[dst + x * 4 + 1] = data[src + x * 4 + 1];
+        out[dst + x * 4 + 2] = data[src + x * 4 + 0];
+        out[dst + x * 4 + 3] = data[src + x * 4 + 3];
+      }
+    } else {
+      for (let x = 0; x < width * 4; x++) out[dst + x] = data[src + x];
+    }
+  }
+  return { data: out, width, height };
+}
+
+// ---------------------------------------------------------------------------
+// Imports and the two renderers
+// ---------------------------------------------------------------------------
+
+let A = null;
+let THREE = null;
+let apse = null;
+let three = null;
+let env = {};
+
+async function init() {
+  A = await import('/dist/index.js');
+  THREE = await import('/node_modules/three/build/three.module.js');
+
+  // ONE apse device for the whole run. Chrome drops the first WebGPU instance
+  // when a second device is created in the same page, and the symptom surfaces
+  // later as "a valid external Instance reference no longer exists" — which
+  // would corrupt every measurement after it. So scenario 8 disposes this one
+  // and runs last; nothing else creates a device.
+  const canvas = makeCanvas(640, 360);
+  const renderer = await A.Renderer.create(canvas, {
+    sampleCount: 1,
+    onValidationError: (m) => gpuBuf.push({ scenario: gpuLabel, message: m }),
+  });
+  const backing = { w: canvas.width, h: canvas.height };
+  if (backing.w < 320 || backing.h < 180) {
+    throw new Error(`apse canvas backing store is ${backing.w}x${backing.h}; measurements would be meaningless`);
+  }
+  const device = renderer.device;
+
+  const boxMesh = A.upload(device.device, A.box({ width: 1 }));
+  const basic = await A.basicMaterial(device.device);
+  basic.setSlot('tint', [0.95, 0.35, 0.12]);
+
+  function litScene(material) {
+    const scene = new A.Scene({ name: 'diag' });
+    const node = new A.MeshNode({ name: 'cube', mesh: boxMesh, material: material ?? basic });
+    scene.add(node);
+    const camera = new A.PerspectiveCamera({ fov: 45, near: 0.1, far: 100, aspect: 640 / 360 });
+    camera.lookAt([0, 0, 3], [0, 0, 0], [0, 1, 0]);
+    return { scene, camera, node };
+  }
+
+  apse = { canvas, renderer, device, gpuDevice: device.device, basic, boxMesh, litScene };
+
+  // three.js. WebGL2, the path three.js recommends, and the default
+  // preserveDrawingBuffer: false, which is what a naive developer gets.
+  const tCanvas = makeCanvas(640, 360);
+  const tRenderer = new THREE.WebGLRenderer({
+    canvas: tCanvas, antialias: false, powerPreference: 'high-performance',
+  });
+  tRenderer.setPixelRatio(1);
+  tRenderer.setSize(640, 360, false);
+  tRenderer.setClearColor(0x050508, 1);
+
+  const tScene = new THREE.Scene();
+  tScene.add(new THREE.AmbientLight(0xffffff, 1.0)); // so "unpatched" is visibly lit
+  const tCamera = new THREE.PerspectiveCamera(45, 640 / 360, 0.1, 100);
+  tCamera.position.set(0, 0, 3);
+  tCamera.lookAt(0, 0, 0);
+  tCamera.updateMatrixWorld();
+
+  function tLitScene(material) {
+    const s = new THREE.Scene();
+    s.add(new THREE.AmbientLight(0xffffff, 1.0));
+    s.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material));
+    return s;
+  }
+
+  three = { canvas: tCanvas, renderer: tRenderer, scene: tScene, camera: tCamera, tLitScene, THREE };
+
+  env = {
+    apse: {
+      version: A.VERSION,
+      adapter: renderer.describeGpu(),
+      featureLevel: renderer.featureLevel,
+      canvasFormat: device.format,
+      preferredCanvasFormat: navigator.gpu.getPreferredCanvasFormat(),
+      minUniformBufferOffsetAlignment: device.limits.minUniformBufferOffsetAlignment,
+      objectUniformStride: A.OBJECT_UNIFORM_STRIDE,
+      maxObjects: device.maxObjects,
+      backing,
+      errorCodeCount: A.ERROR_CODES.length,
+      errorCodes: A.ERROR_CODES,
+    },
+    three: {
+      version: THREE.REVISION,
+      context: (() => {
+        const gl = tRenderer.getContext();
+        return { isWebGL2: tRenderer.capabilities.isWebGL2 === true, version: gl.getParameter(gl.VERSION), renderer: gl.getParameter(gl.RENDERER) };
+      })(),
+      preserveDrawingBuffer: tRenderer.getContextAttributes ? tRenderer.getContextAttributes().preserveDrawingBuffer : 'unknown',
+      checkShaderErrorsDefault: tRenderer.debug.checkShaderErrors,
+      clearColor: '0x050508',
+    },
+    ua: navigator.userAgent,
+  };
+}
+
+/** A three.js render followed by an immediate same-task canvas read. */
+function threeRenderAndRead(scene, camera) {
+  three.renderer.render(scene, camera);
+  return readCanvas(three.canvas);
+}
+
+// ===========================================================================
+// Scenario 1 — shader compile error in a custom material
+// ===========================================================================
+
+// A missing semicolon. validateBodyIdentifiers cannot see it: every identifier
+// in the body is real, only the punctuation is wrong. This is the class of typo
+// the identifier guard is explicitly not designed to catch, which makes it the
+// honest version of "a body with a typo".
+const TYPO_SPEC = {
+  name: 'typo-demo',
+  slots: { tint: 'vec3f' },
+  varyings: { nrm: 'vec3f' },
+  vertex: [
+    'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+    'out.nrm = normalize(in.normal);',
+  ].join('\n'),
+  fragment: [
+    'let n = normalize(in.nrm);',
+    'let l = max(dot(n, normalize(vec3f(0.3, 0.9, 0.4))), 0.0)',
+    'return vec4f(mat.tint * l, 1.0);',
+  ].join('\n'),
+};
+
+async function s1Apse() {
+  // The generated program, so the reported line/column can be located and the
+  // "does it point at your code or at generated code" question answered with
+  // the line itself rather than an assertion.
+  const generated = A.generateScaffold(TYPO_SPEC);
+  const code = generated.code;
+  const lines = code.split('\n');
+  // The scaffold re-indents the body, so locate it by its first line rather
+  // than by the whole block.
+  const bodyStart = code.indexOf(TYPO_SPEC.fragment.split('\n')[0]);
+  const bodyLine = code.slice(0, bodyStart).split('\n').length;
+
+  const out = { codeLines: lines.length, codeBytes: code.length, userBodyStartsAtLine: bodyLine };
+  try {
+    await A.Material.create(apse.gpuDevice, TYPO_SPEC);
+    out.compiled = true;
+  } catch (e) {
+    out.thrown = describeError(e);
+    // Pull the reported position out of the raw compiler text.
+    const raw = String(e.why || '');
+    const line = /(\d+)\s*:\s*(\d+)/.exec(raw);
+    const lint = /line[^\d]*(\d+)/i.exec(raw);
+    if (line) { out.reportedLine = +line[1]; out.reportedColumn = +line[2]; }
+    else if (lint) { out.reportedLine = +lint[1]; }
+    if (out.reportedLine) {
+      out.reportedSourceLine = lines[out.reportedLine - 1];
+      out.reportedLineIsInsideUserBody = out.reportedLine >= bodyLine;
+      out.reportedLineOffsetFromUserBody = out.reportedLine - bodyLine;
+    }
+    out.rawCompilerText = raw;
+  }
+  out.scaffoldAvailable = typeof A.describeMaterial === 'function';
+  out.pipelineKey = generated.pipelineKey;
+
+  // Is the diagnostic apse's `fix` promises actually obtainable? Build the same
+  // module by hand and ask the compiler directly. apse never calls
+  // getCompilationInfo() — this is the evidence that the information exists and
+  // is being discarded.
+  const mod = apse.gpuDevice.createShaderModule({ label: 'diag:s1', code });
+  const info = await mod.getCompilationInfo();
+  out.getCompilationInfo = {
+    messages: info.messages.map((m) => ({
+      type: m.type, lineNum: m.lineNum, linePos: m.linePos, message: m.message,
+      sourceLine: lines[m.lineNum - 1],
+      offsetFromUserBodyStart: m.lineNum - bodyLine,
+    })),
+  };
+  out.fragmentOnlyTypo = await s1ApseFragmentOnly();
+  // `|` fences survive the driver's whitespace-collapsing pretty printer, so
+  // the leading indentation of each generated line stays visible.
+  out.generatedTail = lines.slice(58).map((l, i) => `${59 + i}|${l}|`).join('\n');
+  out.userBodyFirstLineInGenerated = bodyLine;
+  out.userBodyLineCount = TYPO_SPEC.fragment.split('\n').length;
+  return out;
+}
+
+// The same typo in the fragment stage only, to check whether apse's message
+// names the offending stage or always reports the same cascade.
+async function s1ApseFragmentOnly() {
+  const spec = {
+    name: 'typo-fragment-only',
+    vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+    fragment: 'let a = 1.0\nreturn vec4f(a, 0.0, 0.0, 1.0);',
+  };
+  const code = A.generateScaffold(spec).code;
+  try {
+    await A.Material.create(apse.gpuDevice, spec);
+    return { compiled: true };
+  } catch (e) {
+    const mod = apse.gpuDevice.createShaderModule({ label: 'diag:s1f', code });
+    const info = await mod.getCompilationInfo();
+    return {
+      thrown: describeError(e),
+      realCompilerMessage: info.messages.map((m) => `${m.lineNum}:${m.linePos} ${m.message}`),
+    };
+  }
+}
+
+async function s1Three() {
+  const m = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  const ANCHOR = 'void main() {';
+  let anchorFound = false;
+  m.onBeforeCompile = (shader) => {
+    const at = shader.fragmentShader.indexOf(ANCHOR);
+    anchorFound = at !== -1;
+    const injectAt = at + ANCHOR.length;
+    const before = shader.fragmentShader.slice(0, injectAt);
+    const after = shader.fragmentShader.slice(injectAt);
+    // The typo: a missing semicolon.
+    shader.fragmentShader = `${before}\n  float fogAmount = 0.25\n  diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.5 ), fogAmount );${after}`;
+    m.userData.generatedFragment = shader.fragmentShader;
+    m.userData.injectLine = shader.fragmentShader.slice(0, shader.fragmentShader.indexOf('float fogAmount')).split('\n').length;
+  };
+
+  const scene = three.tLitScene(m);
+  three.renderer.render(scene, three.camera);
+  const px = readCanvas(three.canvas);
+
+  const out = {
+    anchorFound,
+    injectedAtLine: m.userData.injectLine,
+    generatedFragmentLines: m.userData.generatedFragment ? m.userData.generatedFragment.split('\n').length : 0,
+    programs: three.renderer.info.programs.length,
+    drawCalls: three.renderer.info.render.calls,
+    pixels: analyse(px, THREE_CLEAR),
+    centre: centre(px),
+    checkShaderErrors: three.renderer.debug.checkShaderErrors,
+    onShaderErrorHookInstalled: typeof three.renderer.debug.onShaderError === 'function',
+  };
+  // The reported line, and whether it is inside the injected patch.
+  const console_ = consoleBuf.slice(-40);
+  for (const line of console_) {
+    const m2 = /ERROR:\s*\d+:(\d+)/.exec(line.text);
+    if (m2) {
+      out.reportedLine = +m2[1];
+      out.reportedColumn = null;
+      const gen = (m.userData.generatedFragment || '').split('\n');
+      out.reportedSourceLine = gen[out.reportedLine - 1];
+      out.reportedLineIsInsideUserPatch = out.reportedLine >= m.userData.injectLine;
+      out.reportedLineOffsetFromPatch = out.reportedLine - m.userData.injectLine;
+    }
+  }
+  // Does the program exist at all, and does three.js know it is not runnable?
+  const props = three.renderer.properties.get(m);
+  out.programAcquired = props && props.currentProgram ? true : false;
+  out.diagnostics = props && props.currentProgram && props.currentProgram.diagnostics
+    ? { runnable: props.currentProgram.diagnostics.runnable, hasFragmentLog: props.currentProgram.diagnostics.fragmentShader.log.length > 0 }
+    : null;
+  out.programCacheKeyPrefix = props && props.programs ? [...props.programs.keys()].map(String).slice(0, 1) : [];
+  return out;
+}
+
+// ===========================================================================
+// Scenario 2 — uniform name typo
+// ===========================================================================
+
+async function s2Apse() {
+  const out = {};
+
+  // (a) a prefixed typo: `frame.` field that does not exist.
+  //     validateBodyIdentifiers is documented as catching exactly this.
+  try {
+    await A.Material.create(apse.gpuDevice, {
+      name: 'uniform-typo-frame',
+      slots: { tint: 'vec3f' },
+      vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+      fragment: 'return vec4f(frame.viewProt[0].xyz, 1.0);',
+    });
+    out.frameTypo = { compiled: true };
+  } catch (e) { out.frameTypo = { thrown: describeError(e) }; }
+
+  // (b) a `mat.` slot typo.
+  try {
+    await A.Material.create(apse.gpuDevice, {
+      name: 'uniform-typo-slot',
+      slots: { tint: 'vec3f' },
+      vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+      fragment: 'return vec4f(mat.tinnt, 1.0);',
+    });
+    out.slotTypo = { compiled: true };
+  } catch (e) { out.slotTypo = { thrown: describeError(e) }; }
+
+  // (c) the same mistake as (a) at runtime, through the slot setter. This one
+  //     is a plain dictionary lookup, not a shader scan.
+  const mat = await A.basicMaterial(apse.gpuDevice);
+  try {
+    mat.setSlot('tinnt', [1, 0, 0]);
+    out.slotSetterTypo = { accepted: true };
+  } catch (e) { out.slotSetterTypo = { thrown: describeError(e) }; }
+
+  // (d) A BARE undeclared identifier — no `in.`/`out.`/`frame`/`obj`/`mat.`
+  //     prefix, so the identifier scan does not see it, and no texture slot
+  //     declared. This is the boundary of what apse's guard covers.
+  try {
+    await A.Material.create(apse.gpuDevice, {
+      name: 'uniform-typo-bare',
+      slots: { tint: 'vec3f' },
+      vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+      fragment: 'let c = albedoTex * mat.tint;\nreturn vec4f(c, 1.0);',
+    });
+    out.bareIdentifier = { compiled: true };
+  } catch (e) {
+    out.bareIdentifier = { thrown: describeError(e) };
+    const raw = String(e.why || '');
+    out.bareIdentifier.code = e.code;
+    out.bareIdentifier.caughtBeforeCompile = e.code === 'SHADER_BODY_INVALID';
+  }
+  return out;
+}
+
+async function s2Three() {
+  const out = {};
+
+  // (a) uniform declared in the GLSL, misspelled key in `uniforms`.
+  //     three.js uploads only what the map holds; the rest stay at zero.
+  const VERT = `
+    void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 ); }
+  `;
+  const FRAG = `
+    uniform vec3 uColor;
+    void main() { gl_FragColor = vec4( uColor, 1.0 ); }
+  `;
+  const scene = new THREE.Scene();
+  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  // Background magenta, so three outcomes stay distinguishable:
+  //   magenta = nothing drew, black = uniform is zero, red = worked.
+  scene.background = new THREE.Color(0xff00ff);
+  const geo = new THREE.PlaneGeometry(2, 2);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uColour: { value: new THREE.Color(1, 0, 0) } }, // typo: uColor
+    vertexShader: VERT,
+    fragmentShader: FRAG,
+  });
+  scene.add(new THREE.Mesh(geo, mat));
+  three.renderer.render(scene, cam);
+  const pxMisspelled = readCanvas(three.canvas);
+  out.misspelledUniformsKey = {
+    pixels: analyse(pxMisspelled, [255, 0, 255]),
+    centre: centre(pxMisspelled),
+    uniformLocationsFound: (() => {
+      const p = three.renderer.properties.get(mat).currentProgram;
+      return p ? { names: p.getUniforms().seq.map((u) => u.id).slice(0, 8) } : null;
+    })(),
+  };
+
+  // control: the correct key
+  const scene2 = new THREE.Scene();
+  scene2.background = new THREE.Color(0xff00ff);
+  const mat2 = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(1, 0, 0) } },
+    vertexShader: VERT, fragmentShader: FRAG,
+  });
+  scene2.add(new THREE.Mesh(geo, mat2));
+  three.renderer.render(scene2, cam);
+  const pxCorrect = readCanvas(three.canvas);
+  out.correctUniformsKey = { pixels: analyse(pxCorrect, [255, 0, 255]), centre: centre(pxCorrect) };
+
+  // (b) the uniform itself is misspelled in the GLSL. Does anything report it?
+  const mat3 = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(1, 0, 0) } },
+    vertexShader: VERT,
+    fragmentShader: FRAG.replace('uColor', 'uColur'),
+  });
+  const scene3 = new THREE.Scene();
+  scene3.background = new THREE.Color(0xff00ff);
+  scene3.add(new THREE.Mesh(geo, mat3));
+  three.renderer.render(scene3, cam);
+  const px3 = readCanvas(three.canvas);
+  out.glsltypeo = {
+    pixels: analyse(px3, [255, 0, 255]),
+    centre: centre(px3),
+    drawCalls: three.renderer.info.render.calls,
+    threw: false,
+  };
+  return out;
+}
+
+// ===========================================================================
+// Scenario 3 — varying type mismatch between vertex and fragment
+// ===========================================================================
+
+async function s3Apse() {
+  const out = {};
+
+  // (a) The mismatch is unrepresentable: `varyings` is one declaration that
+  //     generates the struct for BOTH stages, so there is no second place to
+  //     disagree with. Show the single declaration driving both.
+  const spec = {
+    name: 'varying-single-source',
+    varyings: { nrm: 'vec3f' },
+    vertex: [
+      'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+      'out.nrm = normalize(in.normal);',
+    ].join('\n'),
+    fragment: 'let n = normalize(in.nrm);\nreturn vec4f(n * 0.5 + vec3f(0.5), 1.0);',
+  };
+  const gen = A.generateScaffold(spec);
+  const vs = gen.code.slice(gen.code.indexOf('@vertex'));
+  out.singleSourceOfTruth = {
+    varyingStruct: gen.code.match(/struct Varyings \{[\s\S]*?\n\};/)[0],
+    vertexEntry: vs.slice(0, vs.indexOf('@fragment')),
+    fragmentEntry: vs.slice(vs.indexOf('@fragment')),
+  };
+
+  // (b) Force a type error anyway: assign a vec4f to a vec3f varying. This is
+  //     the nearest reachable failure and it is a compile error, not a
+  //     VARYING_MISMATCH.
+  try {
+    await A.Material.create(apse.gpuDevice, {
+      name: 'varying-type-error',
+      varyings: { nrm: 'vec3f' },
+      vertex: [
+        'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+        'out.nrm = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+      ].join('\n'),
+      fragment: 'return vec4f(in.nrm, 1.0);',
+    });
+    out.forcedTypeError = { compiled: true };
+  } catch (e) { out.forcedTypeError = { thrown: describeError(e) }; }
+  // (c) The typed limit that does exist: too many inter-stage variables.
+  const many = {};
+  for (let i = 0; i < 20; i++) many[`v${i}`] = 'vec4f';
+  try {
+    await A.Material.create(apse.gpuDevice, {
+      name: 'too-many-varyings',
+      varyings: many,
+      vertex: [
+        'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+        ...Array.from({ length: 20 }, (_, i) => `out.v${i} = vec4f(0.0);`),
+      ].join('\n'),
+      fragment: 'return vec4f(0.0);',
+    });
+    out.tooManyVaryings = { compiled: true };
+  } catch (e) { out.tooManyVaryings = { thrown: describeError(e) }; }
+
+  // (d) A varying type that cannot cross the rasteriser.
+  try {
+    await A.Material.create(apse.gpuDevice, {
+      name: 'bad-varying-type',
+      varyings: { nrm: 'vec2f' },
+      vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);\nout.nrm = in.uv;',
+      fragment: 'return vec4f(in.nrm, 0.0, 1.0);',
+    });
+    out.badVaryingType = { compiled: true };
+  } catch (e) { out.badVaryingType = { thrown: describeError(e) }; }
+
+  // (e) Does the catalog's VARYING_MISMATCH code appear anywhere at runtime?
+  out.catalogHasVaryingMismatch = A.ERROR_CODES.includes('VARYING_MISMATCH');
+  return out;
+}
+
+async function s3Three() {
+  const out = {};
+  const VERT_V4 = `
+    varying vec4 vN;
+    void main() { vN = vec4( normal, 1.0 ); gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 ); }
+  `;
+  const FRAG_V3 = `
+    varying vec3 vN;
+    void main() { gl_FragColor = vec4( vN.xyz, 1.0 ); }
+  `;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xff00ff);
+  const mat = new THREE.ShaderMaterial({ vertexShader: VERT_V4, fragmentShader: FRAG_V3 });
+  scene.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat));
+  const cam = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  cam.position.set(0, 0, 3);
+  cam.lookAt(0, 0, 0);
+  cam.updateMatrixWorld();
+  three.renderer.render(scene, cam);
+  const px = readCanvas(three.canvas);
+  out.typeMismatch = {
+    pixels: analyse(px, [255, 0, 255]),
+    centre: centre(px),
+    drawCalls: three.renderer.info.render.calls,
+  };
+
+  // (b) fragment declares a varying the vertex stage never writes
+  const scene2 = new THREE.Scene();
+  scene2.background = new THREE.Color(0xff00ff);
+  const mat2 = new THREE.ShaderMaterial({
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 ); }',
+    fragmentShader: `
+      varying vec3 vNeverWritten;
+      void main() { gl_FragColor = vec4( vNeverWritten, 1.0 ); }
+    `,
+  });
+  scene2.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat2));
+  three.renderer.render(scene2, cam);
+  const px2 = readCanvas(three.canvas);
+  out.missingOutput = { pixels: analyse(px2, [255, 0, 255]), centre: centre(px2) };
+  return out;
+}
+
+// ===========================================================================
+// Scenario 4 — the program cache
+// ===========================================================================
+
+const TINT_ANCHOR = 'vec4 diffuseColor = vec4( diffuse, opacity );';
+
+async function s4Apse() {
+  const out = {};
+
+  // (a) The body is part of the pipeline key, so two materials that shade
+  //     differently get different pipelines. Measured, not asserted.
+  const mkSpec = (r, gg, b) => ({
+    name: 'cache-probe',
+    vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+    fragment: `return vec4f(${r}, ${gg}, ${b}, 1.0);`,
+  });
+  const mRed = await A.Material.create(apse.gpuDevice, mkSpec(1, 0, 0));
+  const mGreen = await A.Material.create(apse.gpuDevice, mkSpec(0, 1, 0));
+  out.differentBodies = {
+    redKey: mRed.generated.pipelineKey,
+    greenKey: mGreen.generated.pipelineKey,
+    keysDiffer: mRed.generated.pipelineKey !== mGreen.generated.pipelineKey,
+    samePipelineObject: mRed.renderPipeline === mGreen.renderPipeline,
+    redCentre: await captureCentre(mRed),
+    greenCentre: await captureCentre(mGreen),
+  };
+
+  // (b) The near-aparture equivalent: resolveSpec memoises on the spec object,
+  //     so mutating a spec after its first use is silently ignored.
+  const spec = {
+    name: 'mutated-spec',
+    vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+    fragment: 'return vec4f(1.0, 0.0, 0.0, 1.0);',
+  };
+  const first = await A.Material.create(apse.gpuDevice, spec);
+  spec.fragment = 'return vec4f(0.0, 1.0, 0.0, 1.0);';
+  const second = await A.Material.create(apse.gpuDevice, spec);
+  out.specMutatedAfterFirstUse = {
+    firstWgslHasGreen: first.wgsl.includes('0.0, 1.0, 0.0'),
+    secondWgslHasGreen: second.wgsl.includes('0.0, 1.0, 0.0'),
+    samePipelineObject: first.renderPipeline === second.renderPipeline,
+    sameKey: first.generated.pipelineKey === second.generated.pipelineKey,
+    secondCentre: await captureCentre(second),
+    firstCentre: await captureCentre(first),
+    note: 'the spec object now literally contains the green body; the material built from it is still red',
+  };
+
+  // (c) The pipeline key is a 32-bit FNV-1a hash. Search for a collision with
+  //     two bodies that compile and shade differently.
+  out.hashCollision = await findPipelineKeyCollision();
+  return out;
+}
+
+async function captureCentre(material) {
+  const { scene, camera } = apse.litScene(material);
+  const frame = await apse.renderer.capture(scene, camera);
+  return centre(captureToImageData(frame));
+}
+
+/**
+ * Brute-forces a 32-bit collision in `GeneratedShader.pipelineKey`.
+ *
+ * Bodies are parameterised by an index so that colliding indices render visibly
+ * different colours, and the probe is timed so the report can say how large the
+ * searched space was — a negative result is still a number worth having.
+ */
+async function findPipelineKeyCollision() {
+  const bodyFor = (i) => [
+    'let q = u32(' + i + ');',
+    'let r = f32(q % 4u) / 3.0;',
+    'return vec4f(r, 1.0 - r, 0.25, 1.0);',
+  ].join('\n');
+  const specFor = (i) => ({
+    name: 'collide',
+    vertex: 'out.clip = frame.viewProj * obj.model * vec4f(in.position, 1.0);',
+    fragment: bodyFor(i),
+  });
+
+  const seenKey = new Map();
+  const seenState = new Map();
+  const t0 = performance.now();
+  const BUDGET_MS = 45000;
+  let tried = 0;
+  let hit = null;
+  for (let i = 0; i < (1 << 20); i++) {
+    const gen = A.generateScaffold(specFor(i));
+    const k = gen.pipelineKey;
+    tried++;
+    if (seenKey.has(k)) { hit = { a: seenKey.get(k), b: i, key: k >>> 0, aBody: bodyFor(seenKey.get(k)), bBody: bodyFor(i) }; break; }
+    seenKey.set(k, i);
+    seenState.set(k, gen);
+    if ((i & 0x3ff) === 0x3ff && performance.now() - t0 > BUDGET_MS) break;
+  }
+  const searchMs = Math.round(performance.now() - t0);
+
+  const out = { specsHashed: tried, searchMs, found: hit !== null, keyBits: 32 };
+  if (hit === null) {
+    out.note = `no collision across ${tried.toLocaleString()} generated programs in ${searchMs} ms`;
+    return out;
+  }
+  out.key = hit.key;
+  out.a = hit.a;
+  out.b = hit.b;
+  out.collidingColorsFromIndex = {
+    a: [ +(hit.a % 4) / 3, 1 - +(hit.a % 4) / 3, 0.25 ],
+    b: [ +(hit.b % 4) / 3, 1 - +(hit.b % 4) / 3, 0.25 ],
+  };
+
+  // Now prove the consequence on the real device, through the real cache.
+  const mA = await A.Material.create(apse.gpuDevice, specFor(hit.a));
+  const mB = await A.Material.create(apse.gpuDevice, specFor(hit.b));
+  out.samePipelineObject = mA.renderPipeline === mB.renderPipeline;
+  out.distinctWgsl = mA.wgsl !== mB.wgsl;
+  out.bodyA = hit.aBody;
+  out.bodyB = hit.bBody;
+  try {
+    out.centreA = await captureCentre(mA);
+    out.centreB = await captureCentre(mB);
+    out.BrendersWithAColour =
+      out.centreA !== null && out.centreB !== null &&
+      out.centreA[0] === out.centreB[0] && out.centreA[1] === out.centreB[1];
+  } catch (e) {
+    out.centreError = describeError(e);
+  }
+  return out;
+}
+
+async function s4Three() {
+  const out = {};
+
+  // (a) The classic form, re-verified against 0.186.1: a patched material next
+  //     to an unpatched one. Material.customProgramCacheKey() defaults to
+  //     `this.onBeforeCompile.toString()`, so the patch text is in the key.
+  const patchFn = function (shader) {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      TINT_ANCHOR,
+      'vec4 diffuseColor = vec4( diffuse * vec3( 1.0, 0.0, 0.0 ), opacity );',
+    );
+  };
+  const mPatched = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  mPatched.onBeforeCompile = patchFn;
+  const mPlain = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  out.classicForm = {
+    cacheKeysEqual: mPatched.customProgramCacheKey() === mPlain.customProgramCacheKey(),
+    patchedKey: mPatched.customProgramCacheKey().slice(0, 80),
+    plainKey: mPlain.customProgramCacheKey(),
+  };
+  {
+    const s = three.tLitScene(mPatched);
+    three.renderer.render(s, three.camera);
+    out.classicForm.patchedCentre = centre(readCanvas(three.canvas));
+    out.classicForm.programsAfterPatched = three.renderer.info.programs.length;
+  }
+  {
+    const s = three.tLitScene(mPlain);
+    three.renderer.render(s, three.camera);
+    out.classicForm.plainCentre = centre(readCanvas(three.canvas));
+    out.classicForm.programsAfterPlain = three.renderer.info.programs.length;
+  }
+  out.classicForm.collapseObserved =
+    out.classicForm.patchedCentre?.[0] === out.classicForm.plainCentre?.[0] &&
+    out.classicForm.patchedCentre?.[1] === out.classicForm.plainCentre?.[1];
+
+  // (b) The form that IS still broken: the cache key is the patch function's
+  //     SOURCE TEXT, so two closures from one factory are indistinguishable
+  //     however different their captured values are.
+  function makeTint(r, gg, b) {
+    return function (shader) {
+      shader.fragmentShader = shader.fragmentShader.replace(
+        TINT_ANCHOR,
+        `vec4 diffuseColor = vec4( diffuse * vec3( ${r.toFixed(1)}, ${gg.toFixed(1)}, ${b.toFixed(1)} ), opacity );`,
+      );
+    };
+  }
+  const mRed = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  mRed.onBeforeCompile = makeTint(1, 0, 0);
+  const mGreen = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  mGreen.onBeforeCompile = makeTint(0, 1, 0);
+  const mPlain2 = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  out.closureFactory = {
+    redKeyEqualsGreenKey: mRed.customProgramCacheKey() === mGreen.customProgramCacheKey(),
+    redKey: mRed.customProgramCacheKey().replace(/\s+/g, ' ').slice(0, 120),
+    greenKey: mGreen.customProgramCacheKey().replace(/\s+/g, ' ').slice(0, 120),
+    differentFunctionObjects: mRed.onBeforeCompile !== mGreen.onBeforeCompile,
+  };
+
+  const before = three.renderer.info.programs.length;
+  {
+    const s = three.tLitScene(mRed);
+    three.renderer.render(s, three.camera);
+    out.closureFactory.redCentre = centre(readCanvas(three.canvas));
+  }
+  const afterRed = three.renderer.info.programs.length;
+  {
+    const s = three.tLitScene(mGreen);
+    three.renderer.render(s, three.camera);
+    out.closureFactory.greenCentre = centre(readCanvas(three.canvas));
+  }
+  const afterGreen = three.renderer.info.programs.length;
+  out.closureFactory.programsBefore = before;
+  out.closureFactory.programsAfterRed = afterRed;
+  out.closureFactory.programsAfterGreen = afterGreen;
+  out.closureFactory.newProgramsForGreen = afterGreen - afterRed;
+  out.closureFactory.sameProgramObject =
+    three.renderer.properties.get(mRed).currentProgram === three.renderer.properties.get(mGreen).currentProgram;
+  out.closureFactory.greenRenderedRed =
+    out.closureFactory.redCentre !== null && out.closureFactory.greenCentre !== null &&
+    out.closureFactory.greenCentre[0] === out.closureFactory.redCentre[0] &&
+    out.closureFactory.greenCentre[1] === out.closureFactory.redCentre[1] &&
+    out.closureFactory.greenCentre[1] < 40;
+  {
+    const s = three.tLitScene(mPlain2);
+    three.renderer.render(s, three.camera);
+    out.closureFactory.plainCentre = centre(readCanvas(three.canvas));
+  }
+  return out;
+}
+
+// ===========================================================================
+// Scenario 5 — wrong colour attachment format
+// ===========================================================================
+
+async function s5Apse() {
+  const out = {};
+  const material = await A.pbrMaterial(apse.gpuDevice);
+  out.materialTargetFormats = material.targetFormats;
+  out.canvasTargetFormat = apse.device.format;
+  out.preferredCanvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+  const { scene, camera } = apse.litScene(material);
+
+  // control: matching format
+  const matchTarget = A.createColorTarget(apse.device, {
+    width: 256, height: 144, format: out.materialTargetFormats[0], depth: true, sampleCount: 1,
+  });
+  const controlStats = apse.renderer.render(scene, camera, matchTarget);
+  out.matchingFormat = { drew: true, drawCalls: controlStats.drawCalls, validationDuring: gpuBuf.length };
+
+  // the failure: an rgba16float target with a bgra8unorm pipeline
+  const badTarget = A.createColorTarget(apse.device, {
+    width: 256, height: 144, format: 'rgba16float', depth: true, sampleCount: 1,
+  });
+  const vBefore = gpuBuf.length;
+  try {
+    apse.renderer.render(scene, camera, badTarget);
+    out.mismatchedFormat = { threw: false };
+  } catch (e) {
+    out.mismatchedFormat = { threw: true, error: describeError(e) };
+  }
+  out.mismatchedFormat.validationDuring = gpuBuf.length - vBefore;
+  matchTarget.dispose();
+  badTarget.dispose();
+
+  // What the guard is protecting against, measured directly on raw WebGPU:
+  // build a pipeline for one format, draw it into a pass with another, and read
+  // the texture back. This is the claim in the error's `why`.
+  out.rawWebGPUConsequence = await rawFormatMismatchDemo();
+  return out;
+}
+
+async function rawFormatMismatchDemo() {
+  const device = apse.gpuDevice;
+  const module = device.createShaderModule({
+    label: 'diag:raw',
+    code: `
+      @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {
+        let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+        return vec4f(p[i], 0.0, 1.0);
+      }
+      @fragment fn fs() -> @location(0) vec4f { return vec4f(1.0, 0.0, 0.0, 1.0); }
+    `,
+  });
+  const pipeline = device.createRenderPipeline({
+    label: 'diag:raw-pipeline-rgba8',
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const target = device.createTexture({
+    label: 'diag:raw-target-bgra8',
+    size: { width: 64, height: 64 },
+    format: 'bgra8unorm',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+  const encoder = device.createCommandEncoder({ label: 'diag:raw-encoder' });
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target.createView(),
+      clearValue: { r: 0, g: 0, b: 0.25, a: 1 }, // blue-ish clear
+      loadOp: 'clear', storeOp: 'store',
+    }],
+  });
+  pass.setPipeline(pipeline);
+  pass.draw(3);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  const readback = device.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const copy = device.createCommandEncoder();
+  copy.copyTextureToBuffer({ texture: target }, { buffer: readback, bytesPerRow: 256 }, { width: 64, height: 64 });
+  device.queue.submit([copy.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const px = new Uint8Array(readback.getMappedRange()).slice(0, 4);
+  readback.unmap();
+  return {
+    pipelineFormat: 'rgba8unorm',
+    attachmentFormat: 'bgra8unorm',
+    firstPixel: [...px],
+    drawLanded: px[0] > 100 && px[1] < 60,
+    note: 'clear was (0,0,64); red (255,0,0) would mean the draw landed',
+  };
+}
+
+// ---------------------------------------------------------------------------
+
+const FB_STATUS = {};
+async function s5Three() {
+  const THREE = three.THREE;
+  const gl = three.renderer.getContext();
+  for (const [k, v] of Object.entries({
+    COMPLETE: gl.FRAMEBUFFER_COMPLETE,
+    INCOMPLETE_ATTACHMENT: gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT,
+    INCOMPLETE_MISSING_ATTACHMENT: gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT,
+    INCOMPLETE_DIMENSIONS: gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS,
+    UNSUPPORTED: gl.FRAMEBUFFER_UNSUPPORTED,
+    INCOMPLETE_MULTISAMPLE: gl.FRAMEBUFFER_INCOMPLETE_MULTISAMPLE,
+  })) if (v !== undefined) FB_STATUS[v] = k;
+
+  const configs = [
+    { label: 'RGBA8 / UnsignedByte (control)', format: THREE.RGBAFormat, type: THREE.UnsignedByteType },
+    { label: 'RGBA8UI / UnsignedInt (integer internal format)', format: THREE.RGBAIntegerFormat, type: THREE.UnsignedIntType },
+    { label: 'RGBA32F / FloatType', format: THREE.RGBAFormat, type: THREE.FloatType },
+    { label: 'RGBA16F / HalfFloatType', format: THREE.RGBAFormat, type: THREE.HalfFloatType },
+    { label: 'R8 / RedFormat', format: THREE.RedFormat, type: THREE.UnsignedByteType },
+    { label: 'RGB8 / RGBFormat', format: THREE.RGBFormat, type: THREE.UnsignedByteType },
+  ];
+
+  // Counters are read with autoReset off so "did it draw" is a measurement
+  // rather than a difference of two numbers that both reset.
+  three.renderer.info.autoReset = false;
+
+  const results = [];
+  for (const cfg of configs) {
+    const cFrom = consoleBuf.length;
+    const rt = new THREE.WebGLRenderTarget(64, 64, {
+      format: cfg.format, type: cfg.type, depthBuffer: true,
+    });
+    const scene = three.tLitScene(new THREE.MeshStandardMaterial({ color: 0xff0000 }));
+    three.renderer.info.reset();
+    three.renderer.setRenderTarget(rt);
+    // three.js has bound rt's framebuffer by now. Ask the driver directly what
+    // it thinks of the attachment set, because three.js never does.
+    const statusBound = FB_STATUS[gl.checkFramebufferStatus(gl.FRAMEBUFFER)] ?? String(gl.checkFramebufferStatus(gl.FRAMEBUFFER));
+    const glErrorAfterBind = gl.getError();
+    three.renderer.render(scene, three.camera);
+    const calls = three.renderer.info.render.calls;
+    three.renderer.setRenderTarget(null);
+
+    const buf = new Uint8Array(64 * 64 * 4);
+    let readThrew = null;
+    try {
+      three.renderer.readRenderTargetPixels(rt, 0, 0, 64, 64, buf);
+    } catch (e) { readThrew = String(e && e.message); }
+    const centrePixel = [buf[(32 * 64 + 32) * 4], buf[(32 * 64 + 32) * 4 + 1], buf[(32 * 64 + 32) * 4 + 2]];
+    let lit = 0;
+    for (let i = 0; i < buf.length; i += 4) if (buf[i] > 20 || buf[i + 1] > 20 || buf[i + 2] > 20) lit++;
+
+    results.push({
+      config: cfg.label,
+      framebufferStatusWhileBound: statusBound,
+      glErrorAfterBind,
+      drawCallsIssued: calls,
+      readbackCentrePixel: centrePixel,
+      readbackLitPixels: lit,
+      drewNothing: lit === 0,
+      readThrew,
+      consoleOutput: consoleBuf.slice(cFrom).map((l) => `[${l.level}] ${l.text}`),
+    });
+    rt.dispose();
+  }
+  three.renderer.info.autoReset = true;
+
+  // A deliberately incomplete framebuffer, built by hand, to show what the
+  // check would have reported. three.js never issues this call.
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8UI, 64, 64, 0, gl.RGBA_INTEGER, gl.UNSIGNED_INT, null);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const handmadeIncomplete = FB_STATUS[gl.checkFramebufferStatus(gl.FRAMEBUFFER)] ?? String(gl.checkFramebufferStatus(gl.FRAMEBUFFER));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fbo);
+  gl.deleteTexture(tex);
+
+  return {
+    configs: results,
+    threeCallsCheckFramebufferStatus: 0,
+    handmadeIncompleteFramebufferStatus: handmadeIncomplete,
+  };
+}
+
+// ===========================================================================
+// Scenario 6 — reading pixels back from the canvas
+// ===========================================================================
+
+async function s6Apse() {
+  const out = {};
+  const { scene, camera } = apse.litScene(apse.basic);
+
+  const read = async (label, awaitFirst) => {
+    if (awaitFirst) await null;
+    const px = readCanvas(apse.canvas);
+    return { label, pixels: analyse(px, APSE_CLEAR), centre: centre(px) };
+  };
+
+  apse.renderer.render(scene, camera);
+  out.sameTask = await read('same task, immediately after render()');
+
+  apse.renderer.render(scene, camera);
+  await apse.gpuDevice.queue.onSubmittedWorkDone();
+  out.afterQueueDone = await read('after await queue.onSubmittedWorkDone()');
+
+  apse.renderer.render(scene, camera);
+  await new Promise((r) => setTimeout(r, 0));
+  out.afterTimeout = await read('after await setTimeout(0)');
+
+  apse.renderer.render(scene, camera);
+  await new Promise((r) => requestAnimationFrame(r));
+  out.afterAnimationFrame = await read('after await requestAnimationFrame()');
+
+  apse.renderer.render(scene, camera);
+  const url = await readDataURL(apse.canvas);
+  out.toDataURL = url.error
+    ? { error: url.error }
+    : {
+      pixels: analyse({ data: url.data, width: url.width, height: url.height }, APSE_CLEAR),
+      centre: (() => { const i = (((url.height >> 1) * url.width) + (url.width >> 1)) * 4; return [url.data[i], url.data[i + 1], url.data[i + 2], url.data[i + 3]]; })(),
+    };
+
+  // the supported path
+  const frame = await apse.renderer.capture(scene, camera);
+  const img = captureToImageData(frame);
+  out.capture = {
+    pixels: analyse(img, APSE_CLEAR),
+    centre: centre(img),
+    bytesPerRow: frame.bytesPerRow,
+    width: frame.width,
+    height: frame.height,
+    format: frame.format,
+    naiveBytesPerRowWouldBe: frame.width * 4,
+  };
+
+  // The stride trap. At 640 the 256-byte padding is zero, so the trap is
+  // invisible; at 641 it is not. copyTextureToBuffer with an unpadded
+  // bytesPerRow is a validation error, and the padded one shears the image if
+  // you read it at width*4.
+  out.stride = await strideProbe(641);
+  return out;
+}
+
+async function strideProbe(width) {
+  const device = apse.gpuDevice;
+  const texture = device.createTexture({
+    label: 'diag:stride', size: { width, height: 4 }, format: apse.device.format,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+  });
+  const padded = Math.ceil((width * 4) / 256) * 256;
+  const out = { width, naiveBytesPerRow: width * 4, paddedBytesPerRow: padded, paddedBy: padded - width * 4 };
+
+  // unpadded
+  const rb1 = device.createBuffer({ size: padded * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const vBefore = gpuBuf.length;
+  device.queue.submit([(() => {
+    const e = device.createCommandEncoder();
+    e.copyTextureToBuffer({ texture }, { buffer: rb1, bytesPerRow: width * 4 }, { width, height: 4 });
+    return e.finish();
+  })()]);
+  await device.queue.onSubmittedWorkDone();
+  out.unpadded = { validationErrors: gpuBuf.slice(vBefore).map((m) => m.message) };
+  rb1.destroy();
+
+  // padded: legal, and the reason every apse readback in this repo indexes rows
+  // at bytesPerRow rather than width * 4.
+  const rb2 = device.createBuffer({ size: padded * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const vPadded = gpuBuf.length;
+  device.queue.submit([(() => {
+    const e = device.createCommandEncoder();
+    e.copyTextureToBuffer({ texture }, { buffer: rb2, bytesPerRow: padded }, { width, height: 4 });
+    return e.finish();
+  })()]);
+  await device.queue.onSubmittedWorkDone();
+  out.padded = { validationErrors: gpuBuf.slice(vPadded).map((m) => m.message) };
+  rb2.destroy();
+  texture.destroy();
+  out.everyRowStartsAt = 'bytesPerRow = ' + padded + ', so row N begins at N * ' + padded +
+    ', not N * ' + width * 4 + ' (' + (padded - width * 4) + ' bytes of shear per row)';
+  return out;
+}
+
+async function s6Three() {
+  const THREE = three.THREE;
+  const out = {};
+  const scene = three.tLitScene(new THREE.MeshStandardMaterial({ color: 0xffffff }));
+  const clear = THREE_CLEAR;
+
+  three.renderer.render(scene, three.camera);
+  {
+    const px = readCanvas(three.canvas);
+    out.sameTask = { pixels: analyse(px, clear), centre: centre(px) };
+  }
+  three.renderer.render(scene, three.camera);
+  await apse.gpuDevice.queue.onSubmittedWorkDone();
+  {
+    const px = readCanvas(three.canvas);
+    out.afterQueueDone = { pixels: analyse(px, clear), centre: centre(px) };
+  }
+  three.renderer.render(scene, three.camera);
+  await new Promise((r) => setTimeout(r, 0));
+  {
+    const px = readCanvas(three.canvas);
+    out.afterTimeout = { pixels: analyse(px, clear), centre: centre(px) };
+  }
+  three.renderer.render(scene, three.camera);
+  await new Promise((r) => requestAnimationFrame(r));
+  {
+    const px = readCanvas(three.canvas);
+    out.afterAnimationFrame = { pixels: analyse(px, clear), centre: centre(px) };
+  }
+  three.renderer.render(scene, three.camera);
+  {
+    const url = await readDataURL(three.canvas);
+    out.toDataURL = url.error
+      ? { error: url.error }
+      : {
+        pixels: analyse({ data: url.data, width: url.width, height: url.height }, clear),
+        centre: (() => { const i = (((url.height >> 1) * url.width) + (url.width >> 1)) * 4; return [url.data[i], url.data[i + 1], url.data[i + 2], url.data[i + 3]]; })(),
+      };
+  }
+
+  // the supported path
+  const rt = new THREE.WebGLRenderTarget(320, 180, { depthBuffer: true });
+  const rtScene = three.tLitScene(new THREE.MeshStandardMaterial({ color: 0xffffff }));
+  three.renderer.setRenderTarget(rt);
+  three.renderer.render(rtScene, three.camera);
+  const buf = new Uint8Array(320 * 180 * 4);
+  three.renderer.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  three.renderer.setRenderTarget(null);
+  const cFrom = consoleBuf.length;
+  let readThrew = null;
+  try {
+    three.renderer.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  } catch (e) { readThrew = String(e && e.message); }
+  const oob = consoleBuf.slice(cFrom);
+  const centreIndex = ((90 * 320) + 160) * 4;
+  out.readRenderTargetPixels = {
+    centrePixel: [buf[centreIndex], buf[centreIndex + 1], buf[centreIndex + 2]],
+    pixels: analyse({ data: buf, width: 320, height: 180 }, [0, 0, 0]),
+  };
+
+  // A wrong MRT texture index: an unguarded array access inside three.js.
+  const cFrom2 = consoleBuf.length;
+  let badIndexThrew = null;
+  try {
+    three.renderer.readRenderTargetPixels(rt, 0, 0, 320, 180, new Uint8Array(320 * 180 * 4), undefined, 99);
+  } catch (e) { badIndexThrew = describeError(e); }
+  out.wrongTextureIndex = {
+    threw: badIndexThrew !== null, error: badIndexThrew,
+    consoleOutput: consoleBuf.slice(cFrom2).map((l) => `[${l.level}] ${l.text}`),
+  };
+
+  // An out-of-range read rectangle: three.js's own bounds check skips the
+  // readPixels and returns without a word.
+  const buf3 = new Uint8Array(320 * 180 * 4);
+  const cFrom3 = consoleBuf.length;
+  let oobThrew = null;
+  try {
+    three.renderer.readRenderTargetPixels(rt, 5000, 5000, 320, 180, buf3);
+  } catch (e) { oobThrew = describeError(e); }
+  out.outOfBoundsCoords = {
+    threw: oobThrew !== null, error: oobThrew,
+    consoleOutput: consoleBuf.slice(cFrom3).map((l) => `[${l.level}] ${l.text}`),
+    bufferAllZero: buf3.every((v) => v === 0),
+    note: 'the buffer the caller passed is left untouched, with no message',
+  };
+  out.secondRead = { threw: readThrew, consoleOutput: oob.map((l) => `[${l.level}] ${l.text}`) };
+  rt.dispose();
+  return out;
+}
+
+// ===========================================================================
+// Scenario 7 — disposing a shared resource
+// ===========================================================================
+
+async function s7Apse() {
+  const out = {};
+  const device = apse.gpuDevice;
+  const mesh = A.upload(device, A.box({ width: 1 }));
+  const material = await A.basicMaterial(device);
+
+  out.baseline = { meshRefCount: mesh.refCount, materialRefCount: material.refCount, meshDisposed: mesh.disposed, materialDisposed: material.disposed };
+
+  // Does scene.add() take a reference?
+  const scene = new A.Scene({ name: 'shared' });
+  const n1 = new A.MeshNode({ name: 'a', mesh, material });
+  const n2 = new A.MeshNode({ name: 'b', mesh, material });
+  scene.add(n1);
+  scene.add(n2);
+  out.afterTwoNodesInScene = { meshRefCount: mesh.refCount, materialRefCount: material.refCount };
+
+  // The documented dance: take a reference for the second user.
+  mesh.ref();
+  material.ref();
+  out.afterExplicitRef = { meshRefCount: mesh.refCount, materialRefCount: material.refCount };
+
+  // Remove one user. Is anything freed?
+  scene.remove(n1);
+  out.afterSceneRemove = { meshRefCount: mesh.refCount, materialRefCount: material.refCount, meshDisposed: mesh.disposed };
+
+  // Drop both references — the second user's and the creator's own. Now the
+  // count reaches zero and the buffers go.
+  mesh.unref();
+  material.unref();
+  out.afterUnrefToZero = { meshRefCount: mesh.refCount, materialRefCount: material.refCount, meshDisposed: mesh.disposed, materialDisposed: material.disposed };
+  out.disposeIsIdempotent = (() => { mesh.unref(); return { refCount: mesh.refCount, disposed: mesh.disposed }; })();
+
+  // The mistake resource.ts claims to make impossible: a disposed mesh still
+  // referenced by a live scene, drawn without complaint.
+  const scene2 = new A.Scene({ name: 'use-after-dispose' });
+  const camera = new A.PerspectiveCamera({ fov: 45, near: 0.1, far: 100, aspect: 640 / 360 });
+  camera.lookAt([0, 0, 3], [0, 0, 0], [0, 1, 0]);
+  scene2.add(new A.MeshNode({ name: 'zombie', mesh, material: apse.basic }));
+  const vBefore = gpuBuf.length;
+  let drawThrew = null;
+  let frame = null;
+  try {
+    frame = await apse.renderer.capture(scene2, camera);
+  } catch (e) { drawThrew = describeError(e); }
+  out.drawWithDisposedMesh = {
+    threw: drawThrew !== null,
+    error: drawThrew,
+    validationErrors: gpuBuf.slice(vBefore).map((m) => m.message),
+    pixels: frame ? analyse(captureToImageData(frame), APSE_CLEAR) : null,
+    centre: frame ? centre(captureToImageData(frame)) : null,
+  };
+  return out;
+}
+
+async function s7Three() {
+  const THREE = three.THREE;
+  const info = three.renderer.info;
+  const snapshot = () => ({
+    geometries: info.memory.geometries,
+    textures: info.memory.textures,
+    programs: info.programs.length,
+  });
+
+  const before = snapshot();
+  const canvasTex = new THREE.Texture(three.canvas);
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.MeshStandardMaterial({ color: 0xffffff, map: canvasTex });
+  const mesh = new THREE.Mesh(geometry, material);
+  const scene = three.tLitScene(material);
+  three.renderer.render(scene, three.camera);
+  const afterFirstRender = snapshot();
+
+  // removing the only user of the geometry + material frees nothing
+  scene.remove(mesh);
+  const afterSceneRemove = snapshot();
+
+  // material.dispose() does not free the texture it holds
+  material.dispose();
+  const afterMaterialDispose = snapshot();
+
+  // geometry.dispose() does free the geometry
+  geometry.dispose();
+  const afterGeometryDispose = snapshot();
+
+  // and the "freed" material still works: it is silently recompiled
+  canvasTex.needsUpdate = true;
+  const scene2 = three.tLitScene(material);
+  three.renderer.render(scene2, three.camera);
+  const afterReuseOfDisposedMaterial = snapshot();
+  const px = readCanvas(three.canvas);
+
+  // does three.js expose any refcount or liveness for shared resources?
+  const out = {
+    before, afterFirstRender, afterSceneRemove, afterMaterialDispose, afterGeometryDispose, afterReuseOfDisposedMaterial,
+    geometryRetainedAfterSceneRemove: afterSceneRemove.geometries - afterFirstRender.geometries,
+    textureRetainedAfterMaterialDispose: afterMaterialDispose.textures - afterFirstRender.textures,
+    reuseStillDraws: analyse(px, THREE_CLEAR),
+    reuseCentre: centre(px),
+    exposedLivenessInfo: {
+      geometryHasDisposeFlag: 'disposed' in geometry,
+      materialHasDisposeFlag: 'disposed' in material,
+      materialVersion: material.version,
+      textureHasDisposeFlag: 'disposed' in canvasTex,
+      refCountProperty: geometry.refCount ?? null,
+    },
+  };
+
+  // a shared material, disposed while a second mesh still uses it
+  const sharedGeom = new THREE.BoxGeometry(1, 1, 1);
+  const sharedMat = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+  const s1 = new THREE.Scene();
+  s1.add(new THREE.Mesh(sharedGeom, sharedMat));
+  const s2 = new THREE.Scene();
+  s2.add(new THREE.Mesh(sharedGeom, sharedMat));
+  three.renderer.render(s1, three.camera);
+  const beforeSharedDispose = snapshot();
+  sharedMat.dispose();
+  const afterSharedDispose = snapshot();
+  let secondSceneThrew = null;
+  let secondCentre = null;
+  try {
+    three.renderer.render(s2, three.camera);
+    secondCentre = centre(readCanvas(three.canvas));
+  } catch (e) { secondSceneThrew = describeError(e); }
+  out.sharedMaterialDisposedWhileStillUsed = {
+    beforeSharedDispose, afterSharedDispose,
+    otherSceneThrew: secondSceneThrew,
+    otherSceneCentre: secondCentre,
+    programsRecompiled: afterReuseOfDisposedMaterial.programs - beforeSharedDispose.programs,
+  };
+  sharedGeom.dispose();
+  return out;
+}
+
+// ===========================================================================
+// Scenario 8 — using a renderer after dispose()
+// ===========================================================================
+
+async function s8Apse() {
+  const out = {};
+  const device = apse.gpuDevice;
+
+  // (a) A material disposed while still in use.
+  const material = await A.basicMaterial(device);
+  const { scene, camera } = apse.litScene(material);
+  apse.renderer.render(scene, camera);
+  material.dispose();
+  out.disposedMaterial = { disposed: material.disposed, refCount: material.refCount };
+  try {
+    material.setSlot('tint', [1, 0, 0]);
+    out.disposedMaterial.slotWrite = 'accepted';
+  } catch (e) { out.disposedMaterial.slotWrite = describeError(e); }
+  try {
+    await apse.renderer.capture(scene, camera);
+    out.disposedMaterial.draw = 'rendered with no complaint';
+  } catch (e) { out.disposedMaterial.draw = describeError(e); }
+
+  // (b) A mesh disposed while still in use.
+  const mesh = A.upload(device, A.box({ width: 1 }));
+  const m2 = await A.basicMaterial(device);
+  const { scene: scene2 } = apse.litScene(m2);
+  scene2.clear();
+  const n = new A.MeshNode({ name: 'x', mesh, material: m2 });
+  scene2.add(n);
+  apse.renderer.render(scene2, camera);
+  mesh.dispose();
+  const vBefore = gpuBuf.length;
+  let captureErr = null;
+  let cap = null;
+  try { cap = await apse.renderer.capture(scene2, camera); }
+  catch (e) { captureErr = describeError(e); }
+  out.disposedMesh = {
+    disposed: mesh.disposed,
+    threw: captureErr !== null,
+    error: captureErr,
+    validationErrors: gpuBuf.slice(vBefore).map((m) => m.message),
+    pixels: cap ? analyse(captureToImageData(cap), APSE_CLEAR) : null,
+  };
+
+  // (c) The renderer itself. Must run last: it destroys the one device.
+  apse.renderer.dispose();
+  try {
+    apse.renderer.render(scene, camera);
+    out.disposedRenderer = { threw: false };
+  } catch (e) { out.disposedRenderer = { threw: true, error: describeError(e) }; }
+  // `await` matters here. `capture()` is async, so without it the typed error
+  // arrives as a rejected promise that nothing observes: the try/catch reports
+  // "threw: false" and the developer sees an unhandled rejection instead.
+  try {
+    await apse.renderer.capture(scene, camera);
+    out.disposedRendererCapture = { threw: false, returnedAFrame: true };
+  } catch (e) { out.disposedRendererCapture = { threw: true, error: describeError(e) }; }
+  return out;
+}
+
+async function s8Three() {
+  const THREE = three.THREE;
+  const out = {};
+
+  // A second WebGL context just for the renderer-dispose case: disposing the
+  // shared one would end every later scenario.
+  const c = makeCanvas(320, 180);
+  const r = new THREE.WebGLRenderer({ canvas: c, antialias: false });
+  r.setPixelRatio(1);
+  r.setSize(320, 180, false);
+  r.setClearColor(0xff00ff, 1);
+  const scene = new THREE.Scene();
+  scene.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xffffff })));
+  scene.add(new THREE.AmbientLight(0xffffff, 1));
+  const cam = new THREE.PerspectiveCamera(45, 320 / 180, 0.1, 100);
+  cam.position.set(0, 0, 3);
+  cam.lookAt(0, 0, 0);
+  cam.updateMatrixWorld();
+  r.render(scene, cam);
+  const before = { geometries: r.info.memory.geometries, textures: r.info.memory.textures, programs: r.info.programs.length };
+  r.dispose();
+  let renderAfter = null;
+  try {
+    r.render(scene, cam);
+    const px = readCanvas(c);
+    renderAfter = { threw: false, pixels: analyse(px, [255, 0, 255]), centre: centre(px) };
+  } catch (e) { renderAfter = { threw: true, error: describeError(e) }; }
+  out.disposedRenderer = { before, after: renderAfter, memoryAfter: r.info.memory, programsAfter: r.info.programs.length };
+
+  // Disposing a material and a geometry, then rendering with them again.
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+  const s2 = new THREE.Scene();
+  s2.add(new THREE.AmbientLight(0xffffff, 1));
+  s2.add(new THREE.Mesh(geometry, material));
+  const p0 = r.info.programs.length;
+  r.render(s2, cam);
+  material.dispose();
+  geometry.dispose();
+  let reuse = null;
+  try {
+    r.render(s2, cam);
+    const px = readCanvas(c);
+    reuse = { threw: false, pixels: analyse(px, [255, 0, 255]), centre: centre(px), programsBefore: p0, programsAfter: r.info.programs.length };
+  } catch (e) { reuse = { threw: true, error: describeError(e) }; }
+  out.disposedMaterialAndGeometry = reuse;
+  out.versionAfterDispose = { material: material.version, geometry: geometry.version };
+  return out;
+}
+
+// ===========================================================================
+// Scenario 9 — a minUniformBufferOffsetAlignment-sized stride
+// ===========================================================================
+
+async function s9Apse() {
+  const out = {};
+  const device = apse.gpuDevice;
+  out.declaredStrideBytes = A.OBJECT_UNIFORM_STRIDE;
+  out.deviceMinAlignment = apse.device.limits.minUniformBufferOffsetAlignment;
+  out.strideIsAMultiple = A.OBJECT_UNIFORM_STRIDE % apse.device.limits.minUniformBufferOffsetAlignment === 0;
+
+  // The public API takes a stride. What happens with a wrong one?
+  const { scene, camera } = apse.litScene(apse.basic);
+  for (let i = 1; i < 3; i++) {
+    const extra = new A.MeshNode({ name: `x${i}`, mesh: apse.boxMesh, material: apse.basic });
+    extra.setPosition(i * 1.5, 0, 0);
+    scene.add(extra);
+  }
+  const items = [];
+  scene.collectDrawItems(items, camera, 128);
+  out.nodeCount = items.length;
+  out.offsetsAtStride128 = items.slice(0, 4).map((i) => i.objectOffset);
+  out.offsetsAtStride128Aligned = items.slice(0, 4).map((i) => i.objectOffset % apse.device.limits.minUniformBufferOffsetAlignment === 0);
+  const items2 = [];
+  scene.collectDrawItems(items2, camera, A.OBJECT_UNIFORM_STRIDE);
+  out.offsetsAtStride256 = items2.slice(0, 4).map((i) => i.objectOffset);
+  out.rendererUses = A.OBJECT_UNIFORM_STRIDE;
+
+  // ObjectUniforms derives the offset from OBJECT_BLOCK.stride, not from the
+  // argument, so the two cannot be made to disagree through the object uniform.
+  out.objectUniformsOffsetFor = [0, 1, 2].map((i) => apse.renderer.objectUniforms.offsetFor(i));
+  out.objectUniformsStride = apse.renderer.objectUniforms.spec.stride;
+  out.objectUniformsSize = apse.renderer.objectUniforms.spec.size;
+
+  // Force the failure through raw WebGPU, at the offset a 128 stride implies.
+  out.forced = await misalignedDynamicOffsetDemo();
+  return out;
+}
+
+async function misalignedDynamicOffsetDemo() {
+  const device = apse.gpuDevice;
+  const alignment = apse.device.limits.minUniformBufferOffsetAlignment;
+  const make = (offset) => {
+    const encoder = device.createCommandEncoder({ label: `diag:offset-${offset}` });
+    const texture = device.createTexture({
+      label: `diag:offset-${offset}-target`,
+      size: { width: 32, height: 32 },
+      format: apse.device.format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const module = device.createShaderModule({
+      label: 'diag:offset',
+      code: `
+        struct Frame { m : mat4x4f };
+        @group(0) @binding(0) var<uniform> frame : Frame;
+        @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {
+          let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+          return vec4f(p[i], 0.0, 1.0);
+        }
+        @fragment fn fs() -> @location(0) vec4f { return vec4f(frame.m[0][0], 0.0, 0.0, 1.0); }
+      `,
+    });
+    const bgl = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 64 } }],
+    });
+    const pipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: apse.device.format }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    const buffer = device.createBuffer({ size: 1024, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer, offset: 0, size: 64 } }] });
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: texture.createView(), clearValue: { r: 0, g: 0, b: 0.25, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg, new Uint32Array([offset]));
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    return texture;
+  };
+
+  const readCentre = async (texture) => {
+    const rb = device.createBuffer({ size: 256 * 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const e = device.createCommandEncoder();
+    e.copyTextureToBuffer({ texture }, { buffer: rb, bytesPerRow: 256 }, { width: 32, height: 32 });
+    device.queue.submit([e.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const px = [...new Uint8Array(rb.getMappedRange()).slice(0, 4)];
+    rb.unmap();
+    return px;
+  };
+
+  const out = { alignment };
+  for (const offset of [0, 256, 128]) {
+    const vBefore = gpuBuf.length;
+    const tex = make(offset);
+    await device.queue.onSubmittedWorkDone();
+    const px = await readCentre(tex);
+    out[`offset${offset}`] = {
+      aligned: offset % alignment === 0,
+      validationErrors: gpuBuf.slice(vBefore).map((m) => m.message),
+      centrePixel: px,
+      drawLanded: px[0] > 10,
+    };
+    tex.destroy();
+  }
+
+  // And what apse does if the same call is inside withErrorScope.
+  try {
+    await A.withErrorScope(device, 'validation', () => {
+      const encoder = device.createCommandEncoder({ label: 'diag:offset-scoped' });
+      const texture = device.createTexture({
+        size: { width: 32, height: 32 }, format: apse.device.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      const module = device.createShaderModule({
+        code: `
+          @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {
+            let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(p[i], 0.0, 1.0);
+          }
+          @fragment fn fs() -> @location(0) vec4f { return vec4f(1.0); }
+        `,
+      });
+      const bgl = device.createBindGroupLayout({
+        entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 64 } }],
+      });
+      const pipeline = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        vertex: { module, entryPoint: 'vs' },
+        fragment: { module, entryPoint: 'fs', targets: [{ format: apse.device.format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      const buffer = device.createBuffer({ size: 1024, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer, offset: 0, size: 64 } }] });
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{ view: texture.createView(), clearValue: { r: 0, g: 0, b: 0.25, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg, new Uint32Array([128]));
+      pass.draw(3);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }, 'apse:object bind group at a 128-byte dynamic offset');
+    out.withErrorScope = { threw: false };
+  } catch (e) {
+    out.withErrorScope = { threw: true, error: describeError(e) };
+  }
+  return out;
+}
+
+async function s9Three() {
+  const out = {};
+  // Does the WebGL2 material path bind uniform buffers with dynamic offsets?
+  // Probed rather than asserted: search three.js's own uniform machinery for
+  // the calls that would be required, and record the answer as text.
+  const gl = three.renderer.getContext();
+  out.context = {
+    isWebGL2: three.renderer.capabilities.isWebGL2 === true,
+    maxUniformBufferBindings: gl.getParameter(gl.MAX_UNIFORM_BUFFER_BINDINGS),
+    uniformBufferOffsetAlignment: gl.getParameter(gl.UNIFORM_BUFFER_OFFSET_ALIGNMENT),
+  };
+  out.findings = [];
+  // A UniformsGroup is three.js's only UBO path. Build one and see whether it
+  // has a per-draw dynamic offset at all.
+  const THREE = three.THREE;
+  try {
+    const ubo = new THREE.UniformsGroup([{ name: 'time', type: 'f32' }]);
+    out.findings.push({ probe: 'THREE.UniformsGroup exists', value: ubo !== null, layout: ubo.layout !== undefined });
+  } catch (e) {
+    out.findings.push({ probe: 'THREE.UniformsGroup', error: String(e && e.message) });
+  }
+  const probeMat = new THREE.MeshStandardMaterial();
+  const probeScene = three.tLitScene(probeMat);
+  three.renderer.render(probeScene, three.camera);
+  const props = three.renderer.properties.get(probeMat);
+  const program = props === undefined ? undefined : props.currentProgram;
+  out.materialUniformStrategy = props && props.uniforms && program
+    ? `per-program WebGLUniforms list of ${program.getUniforms().seq.length} entries uploaded with gl.uniform* on every draw; no uniform buffer object and no dynamic offset`
+    : 'unknown';
+  out.uniformNames = program ? program.getUniforms().seq.map((u) => u.id).slice(0, 6) : null;
+  out.usesUniformBufferObjects = false;
+  return out;
+}
+
+// ===========================================================================
+// The table
+// ===========================================================================
+
+const SCENARIOS = {
+  1: { title: 'Shader compile error in a custom material', apse: s1Apse, three: s1Three },
+  2: { title: 'Uniform name typo', apse: s2Apse, three: s2Three },
+  3: { title: 'Varying type mismatch between vertex and fragment', apse: s3Apse, three: s3Three },
+  4: { title: 'Program cache', apse: s4Apse, three: s4Three },
+  5: { title: 'Wrong colour attachment format', apse: s5Apse, three: s5Three },
+  6: { title: 'Reading pixels back from the canvas', apse: s6Apse, three: s6Three },
+  7: { title: 'Disposing a shared resource', apse: s7Apse, three: s7Three },
+  8: { title: 'Using a renderer after dispose()', apse: s8Apse, three: s8Three },
+  9: { title: 'Wrong minUniformBufferOffsetAlignment-sized stride', apse: s9Apse, three: s9Three },
+};
+
+// Scenario 8 disposes the one apse device this page has, because `Renderer.dispose()`
+// calls `device.destroy()` and Chrome will not give a page a second WebGPU
+// instance. So 8 runs last. The order is explicit rather than left to integer-key
+// ordering, because getting it wrong shows up as a DOMException about a lost
+// device in an unrelated scenario.
+const ORDER = [1, 2, 3, 4, 5, 6, 7, 9, 8];
+
+g.__diagEnv = () => env;
+g.__diagScenarioIds = () => ORDER.slice();
+g.__diag = async (id) => {
+  const s = SCENARIOS[id];
+  if (s === undefined) return { id, error: `no scenario ${id}` };
+  const started = performance.now();
+  const rec = { id, title: s.title };
+  rec.apse = s.apse === undefined ? null : await attempt(`${id}/apse`, s.apse);
+  rec.three = s.three === undefined ? null : await attempt(`${id}/three`, s.three);
+  rec.ms = Math.round(performance.now() - started);
+  return rec;
+};
+
+try {
+  await init();
+  g.__diagReady = true;
+  g.__diagError = null;
+} catch (e) {
+  g.__diagReady = false;
+  g.__diagError = { name: e && e.name, message: e && e.message, stack: String(e && e.stack).split('\n').slice(0, 6) };
+}
+</script>
+</body>
+</html>
