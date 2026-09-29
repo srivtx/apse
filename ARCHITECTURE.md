@@ -955,11 +955,27 @@ than amortised. Per-instance transforms arrive as vertex attributes at slot 1 an
 are transformed in the vertex stage, not read from a per-object uniform slot, so
 there is nothing per-instance to serialise on the CPU side.
 
-The per-draw marginal cost — 0.87 us against three.js's 0.66 us — is the number
-apse still loses on, and it is stable from 1,000 to 100,000 draws. Frame time is
-85-100% per-draw encode; the scene-graph walk, sort and uniform pack together are
-under 15%. `setBindGroup` fires once per object, which is the specific call to
-attack if the per-draw path is ever optimised.
+The per-draw path is also a win now, 1.5x at 1,000 objects and 2.2x at 5,000
+(`bun run bench`). It was a 1.32x loss until `src/render/renderer.ts` stopped
+using a `Uint32Array` for its dynamic offsets.
+
+That is the most useful performance fact in this file, and it is not a fast path
+-- it is a **type**. Blink's IDL conversion for `sequence<>` has a fast path that
+requires a real `v8::Array`; a typed array falls off it onto the generic iterator
+protocol. One `setBindGroup` cost 1.22 us with a `Uint32Array(1)` and 0.28 us
+with `number[]`, measured with the queue drained, in core and in compatibility
+alike. The call count is byte-identical either way, so no call census can see it.
+
+Three profilers had looked at that loop before this was found: one attributed the
+gap to two bind-group calls per draw (the frame group was already suppressed to
+once per pass), one rewrote the counting sort for a 2.4-3.6x win that moved the
+end-to-end ratio not at all, and one counted calls. The cost was in the argument
+to a call, not in the call.
+
+**The architectural lesson, and the reason it is written down here:** a profiler
+that counts calls cannot find a cost that is in an argument. It found this one by
+timing a single isolated call with the queue drained. Any future hot path in this
+renderer should be measured that way before it is measured any other way.
 
 **There is no GPU-side millisecond here.** This device exposes no
 `timestamp-query`, so `stats.gpu` is `null` and every end-to-end figure is a

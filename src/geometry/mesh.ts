@@ -651,6 +651,14 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
   readonly firstIndex: number;
   /** Added to every index read. 0 for a whole mesh; a batched sub-range uses it. */
   readonly baseVertex: number;
+  /**
+   * First vertex for a non-indexed draw. 0 for a whole mesh.
+   *
+   * Distinct from {@link baseVertex} on purpose: that one shifts indices, this
+   * one shifts the vertex cursor a non-indexed draw starts from, and confusing
+   * the two is how a batched non-indexed range draws the wrong source.
+   */
+  readonly firstVertex: number;
   /** Bytes per instance in `instanceBuffer`, or 0 when there is none. */
   readonly instanceStride: number;
   /** Total bytes held on the device, excluding any instance buffer. */
@@ -725,6 +733,7 @@ export class GpuMesh extends Resource implements DrawableGeometryRange {
     this.firstInstance = firstInstance;
     this.firstIndex = 0;
     this.baseVertex = 0;
+    this.firstVertex = 0;
     this.instanceStride = instanceStride;
     this.byteLength = align4(vertexBytes) + (indexBuffer === null ? 0 : align4(indexBytes));
     this.#sourceLayout = data.layout;

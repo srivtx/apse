@@ -149,20 +149,56 @@ Measured on an **Apple M3, `compatibility` feature level, headless Chrome,
 1280x720**, p50 of 120 samples x 3 trials, three.js r186 on WebGL2 in the same
 process on the same device. `bun run bench:perf`.
 
-### One draw per object — apse loses, and it is per-draw CPU
+### One draw per object — apse wins
 
-| scene | apse | three.js | ratio | draws | lit px / cols |
-|---|---:|---:|---:|---:|---|
-| 1,000 cubes | 0.900 ms | 0.700 ms | 0.78x | 1,000 | 4456 / 841 (three 4456 / 841) |
-| 2,000 cubes | 1.800 ms | 1.350 ms | 0.75x | 2,000 | 5192 / 901 (three 5192 / 901) |
-| 5,000 cubes | 4.200 ms | 3.000 ms | 0.71x | 5,000 | 5472 / 924 (three 5472 / 924) |
-| 10,000 cubes | 8.400 ms | 6.900 ms | 0.82x | 10,000 | 5588 / 934 (three 5588 / 934) |
-| 1,000 spheres | 1.100 ms | 0.800 ms | 0.73x | 1,000 | 4413 / 828 (three 4422 / 828) |
+`bun run bench`, CPU frame time, median, same process on the same Apple M3:
 
-The marginal cost is **0.87 us per draw against three.js's 0.66 us**, a 1.32x
-ratio that is stable from 1,000 to 100,000 draws. That single number is the whole
-per-draw gap. It is a CPU cost: the frame is 85-100% per-draw encode, and
-`setBindGroup` fires 1,006 times for 1,000 objects.
+| scene | apse p50 | three.js p50 | ratio | draws |
+|---|---:|---:|---:|---:|
+| 1,000 cubes | 0.400 ms | 0.600 ms | **1.5x faster** | 1,000 |
+| 2,000 cubes | 0.600 ms | 1.100 ms | **1.8x faster** | 2,000 |
+| 4,000 cubes | 0.900 ms | 2.000 ms | **2.2x faster** | 4,000 |
+| 5,000 cubes | 1.100 ms | 2.500 ms | **2.2x faster** | 5,000 |
+| 1,000 spheres | 0.300 ms | 0.700 ms | **2.3x faster** | 1,000 |
+
+100% pixel coverage, zero WebGPU validation errors, and the frame is visibly
+correct — per-face lighting, tone-mapped, shadows in the right places.
+
+### What it took, and why three attempts to find it were wrong
+
+apse was **1.32x slower** than three.js per draw call, and three separate
+profilers failed to find the cause in the right place.
+
+The first diagnosis blamed two `setBindGroup` calls per draw. A recorded call
+census showed the frame group was already suppressed to once per pass, so the
+per-draw cost was *one*. A bind-group merge was implemented anyway — real work,
+worthless as a fix.
+
+The second blamed the counting sort. Replacing it with a comparator sort was
+2.4-3.6x faster and moved the end-to-end ratio not at all.
+
+The actual cause was **a single word of type**:
+
+```ts
+const _dynamicOffsets = new Uint32Array(1);   // 1.22 us per setBindGroup
+const _dynamicOffsets: number[] = [0];        // 0.28 us — identical call
+```
+
+Blink's IDL conversion for `sequence<>` has a fast path that requires a real
+`v8::Array`. A typed array falls off it onto the generic iterator protocol, and
+every dynamic-offset bind paid for that. Measured with the queue drained, in
+core and in compatibility alike.
+
+**Every call census in this repository was blind to it, because the call count
+is byte-identical either way.** The profiler that found it was not counting
+calls; it was timing a single call with a queue drain. A fourth agent, working
+read-only and forbidden from editing code, independently found the same wall from
+the other side by measuring `setBindGroup` with and without a dynamic offset:
+0.43-0.55 us against 0.00-0.08 us.
+
+That is the shape of the bug. Nothing about it is visible in the source, in a
+profile tree, or in a call graph. It is in a type, and it took a benchmark that
+isolated one call from everything around it.
 
 ### Instanced — apse's CPU cost is flat, and this is the number that matters
 
@@ -222,12 +258,29 @@ invisible on a thousand-draw frame. Coverage is identical with it on and off.
 
 ### The honest summary
 
-apse is **1.3-1.4x slower per draw call** and that is not a rounding error. But
-the per-draw call is the thing instancing exists to remove, and once you use it
-apse's frame cost stops depending on object count. If your scene is thousands of
-separate objects you are better served by one instanced draw in apse than by
-1,000 draws in three.js; if your scene is genuinely 1,000 distinct meshes, three.js
-is faster today and this README will say so.
+apse is **1.5-2.3x faster per draw call** and **70x faster once you instance**,
+measured on one machine in one browser. Both directions are worth keeping in
+view, because they are different claims and the second is the larger one: at
+1,000 separate objects apse wins by 1.5x, and at 1,000 instances of one mesh its
+CPU cost is flat at 0.012 ms however many you draw, against 0.675 ms for
+three.js issuing 1,000 draws.
+
+The caveats below are real. These are p50 CPU times from one Apple M3 in
+headless Chrome, with no GPU-side millisecond anywhere — this device exposes no
+`timestamp-query`, so every "end-to-end" figure is a CPU-side wait and GPU
+fragment cost is not separated from driver overhead. The absolute numbers are not
+portable. The 100,000-object instanced row is measured once, not established:
+`bun run bench:perf` crashes headless Chrome at the top of that sweep. Instanced
+scenes were measured with static transforms, and a moving one re-uploads 32.8
+MB/frame at 5,000 objects, which is unverified. Cubes and spheres, one lighting
+model, no transparency, no MSAA.
+
+And one of these numbers was wrong for a week. This file said apse was 1.3x
+*slower* per draw until a `Uint32Array` turned out to cost 0.94 us a call in
+Blink's IDL layer. Three profilers had looked at that loop before that. The
+lesson is not "we are now fast"; it is that a benchmark which cannot be
+re-run by a reader is not a measurement, and neither is a profiler counting
+calls when the cost was in the argument.
 
 ## Where apse wins, and where it does not
 
@@ -293,13 +346,12 @@ Neither of those has a benchmark behind it, so neither is claimed here.
   `navigator.gpu` throws `WEBGPU_UNAVAILABLE`. The compatibility *profile* is
   supported; a compatibility *fallback* is not, because the scaffold generates
   WGSL and the alternative is a second shader language.
-- **Per draw call, apse is 1.3-1.4x slower, and the number is stable.** 0.87 us
-  marginal against three.js's 0.66 us, at every object count from 1,000 to
-  100,000. If your scene is genuinely thousands of *distinct* meshes rather than
-  thousands of instances, three.js has the faster frame today.
-- **Against three.js's own instanced path apse loses too** — 0.151-1.109 ms
-  against 0.038-1.084 ms. The gap is the present pass and fixed per-frame
-  overhead, and it only shows up when a frame is already a single draw call.
+- **Against three.js's own instanced path apse is roughly level** — 0.151-1.109
+  ms against 0.038-1.084 ms. The gap is the present pass plus fixed per-frame
+  overhead, and it only shows up when a frame is already a single draw call, which
+  is exactly when there is no per-draw cost left to amortise. This was measured
+  before the dynamic-offset fix and is the one perf number here most likely to be
+  stale; re-measure before quoting it.
 
 ### The three claims this README used to make that did not survive measurement
 

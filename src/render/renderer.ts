@@ -1157,10 +1157,14 @@ export class Renderer {
       // which of the two this is, and the getter checks liveness, so reading it
       // again is a third liveness check per draw to learn what a local in scope
       // already says. Measured in Chrome at ~16 ns/draw for the loop body.
+      // firstIndex and baseVertex come from the geometry, not from literals. A
+      // batched mesh shares one buffer across its sources and returns them here;
+      // hardcoding 0 made `sub(1)` draw source 0's geometry, silently, with a
+      // valid draw call and no validation error anywhere.
       if (ib !== null) {
-        enc.drawIndexed(geometry.indexCount, instances, 0, 0, first);
+        enc.drawIndexed(geometry.indexCount, instances, geometry.firstIndex, geometry.baseVertex, first);
       } else {
-        enc.draw(geometry.indexCount, instances, 0, first);
+        enc.draw(geometry.indexCount, instances, geometry.firstVertex, first);
       }
       drawCalls++;
 

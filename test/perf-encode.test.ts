@@ -299,6 +299,9 @@ describe('the encode loop — what must not change', () => {
         instanceCount: 1,
         firstInstance: 0,
         instanceBuffer: null,
+        firstIndex: 0,
+        baseVertex: 0,
+        firstVertex: 0,
       };
       e.scene.add(new MeshNode({ name: 'unindexed', mesh: unindexed, material: e.materials[0]! }));
       e.renderer.render(e.scene, e.camera);

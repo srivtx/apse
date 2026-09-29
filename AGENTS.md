@@ -143,6 +143,19 @@ reaches 179 names. `src/index.ts` is still not the whole of `src/**` — check t
   result at that stride, not `width * 4`. `unpadRows()` does it for you.
 - **A WebGPU canvas has no `preserveDrawingBuffer`.** Reading it after present
   gives black. Use `Renderer.capture()`.
+- **Dynamic-offset arguments must be a plain `number[]`, never a typed array.**
+  Blink's IDL conversion for `sequence<>` has a fast path that requires a real
+  `v8::Array`; a `Uint32Array` falls off it onto the generic iterator protocol.
+  One `setBindGroup` measured 1.22 us with `Uint32Array(1)` against 0.28 us with
+  `number[]`, in core and in compatibility alike — and the call count is
+  byte-identical either way, so no call census can detect the regression. This
+  was the whole 1.32x per-draw deficit against three.js, and it survived three
+  profiling passes. If you touch a hot WebGPU call, time one isolated call with
+  the queue drained before you reason about how many calls there are.
+- **`GpuMesh.vertexBuffer` / `.indexBuffer` are accessors that check liveness.**
+  Hoist each into a local and read it once. They are method calls, not field
+  reads, and at 5,000 draws an extra read is 5,000 extra liveness checks in the
+  loop that is 85-100% of the frame.
 - **Never pass `adapter.limits` as `requiredLimits`,** and never spread it:
   `GPUSupportedLimits` is prototype getters, so `{...adapter.limits}` is `{}`.
   `requiredLimits` also rejects unknown keys. Send the compatibility profile.

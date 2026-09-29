@@ -298,6 +298,8 @@ export class GpuBatchedMesh extends Resource implements DrawableGeometryRange {
   readonly firstIndex: number;
   /** 0: a whole-batch draw has no vertex rebasing. */
   readonly baseVertex: number;
+  /** First vertex for a non-indexed sub-range draw. 0 for a whole batch. */
+  readonly firstVertex: number;
   /** Total bytes held on the device. */
   readonly byteLength: number;
   /** The batched CPU description, for the ranges and the source names. */
@@ -320,6 +322,7 @@ export class GpuBatchedMesh extends Resource implements DrawableGeometryRange {
     this.indexFormat = this.#whole.indexFormat;
     this.firstIndex = 0;
     this.baseVertex = 0;
+    this.firstVertex = 0;
     this.byteLength = this.#whole.byteLength;
   }
 
@@ -344,6 +347,7 @@ export class GpuBatchedMesh extends Resource implements DrawableGeometryRange {
       indexFormat: this.indexFormat,
       firstIndex: range.firstIndex,
       baseVertex: range.firstVertex,
+      firstVertex: range.firstVertex,
     };
   }
 

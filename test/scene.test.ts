@@ -955,6 +955,9 @@ class TrackedMesh extends Resource {
   readonly instanceCount = 1;
   readonly firstInstance = 0;
   readonly instanceBuffer = null;
+  readonly firstIndex = 0;
+  readonly baseVertex = 0;
+  readonly firstVertex = 0;
 
   constructor(readonly name: string = 'tracked') {
     super();

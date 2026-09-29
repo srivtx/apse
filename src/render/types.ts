@@ -88,6 +88,20 @@ export interface DrawableGeometry {
    * shader reading a storage buffer compiles on a laptop and fails on a phone.
    */
   readonly instanceBuffer: GPUBuffer | null;
+  /**
+   * First index and base vertex, for a mesh that shares buffers with others.
+   *
+   * Both 0 for a whole mesh. `GpuBatchedMesh.sub(i)` returns non-zero values so
+   * one draw can target one source out of a merged buffer, and a renderer that
+   * hardcodes 0 here renders source 0 every time — silently, with a valid draw.
+   */
+  readonly firstIndex: number;
+  readonly baseVertex: number;
+  /**
+   * First vertex for a non-indexed draw. 0 for a whole mesh; a batched sub-range
+   * starts partway in, the same way `firstIndex` does for an indexed one.
+   */
+  readonly firstVertex: number;
 }
 
 // ---------------------------------------------------------------------------

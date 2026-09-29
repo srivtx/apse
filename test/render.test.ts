@@ -2011,6 +2011,9 @@ describe('the frame loop — the draw-list counters', () => {
         instanceCount: 1,
         firstInstance: 0,
         instanceBuffer: null,
+        firstIndex: 0,
+        baseVertex: 0,
+        firstVertex: 0,
       };
       frame.scene.add(new MeshNode({ name: 'empty', mesh: unindexed, material }));
       const stats = frame.renderer.render(frame.scene, frame.camera);
