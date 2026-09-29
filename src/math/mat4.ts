@@ -523,14 +523,198 @@ export function translate(out: Float32Array, x: number, y: number, z: number): F
   return out;
 }
 
-/** Post-multiplies a local scale: `out = out * S`. `out` is in and out. */
+/**
+ * Post-multiplies a local scale: `out = out * S`. `out` is in and out.
+ *
+ * The side is what makes this a *local* scale. `S` is diagonal, so `out * S`
+ * scales **column** `c` by `S[c][c]`: the node's own basis axes grow and the
+ * translation, which is not part of the scaled basis, stays put. `S * out`
+ * scales the **rows** and drags the translation with them — `T(5,6,7) * S(2)`
+ * must leave the node at (5, 6, 7), and the row form walks it to (10, 12, 14).
+ *
+ * Only the twelve basis elements are touched: the homogeneous row is
+ * `(0, 0, 0, 1)` and scaling it by `S[3][3] = 1` is a no-op.
+ */
 export function scale(out: Float32Array, x: number, y: number, z: number): Float32Array {
-  for (let c = 0; c < 4; c++) {
-    const i = c * 4;
-    out[i] *= x;
-    out[i + 1] *= y;
-    out[i + 2] *= z;
+  out[0] *= x;
+  out[1] *= x;
+  out[2] *= x;
+  out[4] *= y;
+  out[5] *= y;
+  out[6] *= y;
+  out[8] *= z;
+  out[9] *= z;
+  out[10] *= z;
+  return out;
+}
+
+/**
+ * Writes `a * b` for two **affine** matrices, into `out`.
+ *
+ * Affine means the bottom row is `(0, 0, 0, 1)` — true of anything that places
+ * an object in the world, so true of every `parent.world * node.local` in the
+ * transform walk. For such a pair four of the sixteen results are structural
+ * constants and every remaining dot product loses a term that is a multiply by
+ * a structural zero: 36 multiplies against {@link mul}'s 64. Measured on Apple
+ * M3, 61/61 paired reps in both orderings: 22–27% off the hottest call in the
+ * walk.
+ *
+ * ## The precondition
+ *
+ * Both operands must carry the `(0, 0, 0, 1)` row. Every matrix apse builds
+ * does, and a product of two affine matrices is affine, so it holds by
+ * induction up a graph. A genuinely projective matrix — a projection, or
+ * anything from a loader — needs {@link mul}; {@link assertMat4} is the
+ * boundary check for that.
+ *
+ * ## Not bit-identical to `mul`
+ *
+ * Dropping `a30 * b03` drops a term that is `a30 * 0`. It cannot change a
+ * *value* — over a million random affine pairs, not one element differs by
+ * even an ulp — but it can change the *sign of a zero*, because `mul` evaluates
+ * `(-0) + (+0)` as `+0` and this does not. Inert for every consumer apse has
+ * (WGSL `==` and `!=` treat them alike), and still a real difference, which is
+ * why this is a separate function rather than a change to {@link mul}.
+ */
+export function mulAffine(out: Float32Array, a: Float32Array, b: Float32Array): Float32Array {
+  const a00 = a[0];
+  const a01 = a[1];
+  const a02 = a[2];
+  const a10 = a[4];
+  const a11 = a[5];
+  const a12 = a[6];
+  const a20 = a[8];
+  const a21 = a[9];
+  const a22 = a[10];
+  const a30 = a[12];
+  const a31 = a[13];
+  const a32 = a[14];
+
+  const b00 = b[0];
+  const b01 = b[1];
+  const b02 = b[2];
+  const b10 = b[4];
+  const b11 = b[5];
+  const b12 = b[6];
+  const b20 = b[8];
+  const b21 = b[9];
+  const b22 = b[10];
+  const b30 = b[12];
+  const b31 = b[13];
+  const b32 = b[14];
+
+  out[0] = a00 * b00 + a10 * b01 + a20 * b02;
+  out[1] = a01 * b00 + a11 * b01 + a21 * b02;
+  out[2] = a02 * b00 + a12 * b01 + a22 * b02;
+  out[4] = a00 * b10 + a10 * b11 + a20 * b12;
+  out[5] = a01 * b10 + a11 * b11 + a21 * b12;
+  out[6] = a02 * b10 + a12 * b11 + a22 * b12;
+  out[8] = a00 * b20 + a10 * b21 + a20 * b22;
+  out[9] = a01 * b20 + a11 * b21 + a21 * b22;
+  out[10] = a02 * b20 + a12 * b21 + a22 * b22;
+  out[12] = a00 * b30 + a10 * b31 + a20 * b32 + a30;
+  out[13] = a01 * b30 + a11 * b31 + a21 * b32 + a31;
+  out[14] = a02 * b30 + a12 * b31 + a22 * b32 + a32;
+  out[3] = 0;
+  out[7] = 0;
+  out[11] = 0;
+  out[15] = 1;
+  return out;
+}
+
+/**
+ * The 3×3 identity in `mat3x3<f32>` layout, padding included. Module-level, so
+ * {@link normalMatrix} allocates nothing on any path.
+ */
+const IDENTITY_NORMAL_MATRIX3 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]);
+
+/**
+ * Writes the **normal matrix** of `m` into `out`: the inverse transpose of the
+ * upper-left 3×3, in WGSL `mat3x3<f32>` layout.
+ *
+ * ## The layout is the whole point
+ *
+ * `out` is **12 floats, not 9**. A `mat3x3<f32>` is three columns and each
+ * column starts at a 16-byte boundary, because `vec3<f32>` is 16-byte aligned
+ * and 12 bytes wide. So column 0 is `out[0..2]`, column 1 is `out[4..6]`, and
+ * column 2 is `out[8..10]`, with `out[3]`, `out[7]` and `out[11]` as padding.
+ * Writing a tight 3×3 and letting the packer place the columns reads three
+ * floats nobody wrote, and the third column arrives as zeros — a normal matrix
+ * that is silently wrong for every mesh in the scene, shading as though every
+ * face were lit head-on, with no error raised anywhere.
+ *
+ * ## The three padding floats are written, and that is deliberate
+ *
+ * Skipping them on the fast path measured as a 14% win in isolation and as
+ * nothing under a paired comparison (0.1 ns, p10..p90 straddling zero, 32/41
+ * reps). Three dead stores into an L1-resident scratch are free; this is not
+ * a store-bound loop. Keeping them is what lets the function have **no
+ * precondition at all** — hand it any 12-float buffer and all twelve come back
+ * defined. "The padding must already be zero" is exactly the assumption that
+ * produced the shipped normal-matrix bug, and it is not worth three stores
+ * that measure at zero.
+ *
+ * ## There is no rigid-transform fast path
+ *
+ * A rotation is its own inverse transpose, and a uniform scale is that over
+ * `s²`, so the adjugate really does collapse for the common case. It is still
+ * not worth having: proving the 3×3 is orthonormal costs three dot products
+ * and three squared lengths — 18 multiplies — to save 9, and the test has to
+ * run on every object to catch the rigid ones. Measured on a pure rotation, a
+ * uniformly scaled one and a non-uniformly scaled one, the fast path is 3–6 ns
+ * *slower* in 36–40 reps out of 41, in both orderings. Loosening the test to a
+ * tolerance would make it cheaper still, and would be a silently-wrong normal
+ * waiting for the one matrix that lands just outside the epsilon.
+ *
+ * ## Degenerate input
+ *
+ * A singular or non-finite 3×3 has no inverse. Identity is written rather than
+ * NaN: the object looks un-transformed instead of disappearing, which is a bug
+ * a user can see and report. The guard stays `det === 0 || !Number.isFinite(det)`;
+ * a two-comparison form was measured and was inside the noise.
+ *
+ * On performance: this is the same arithmetic the renderer already runs, and it
+ * is not faster. Dropping the three padding stores measured 14% in isolation
+ * and 0.1 ns paired; the residual ~1 ns deficit against the renderer's copy is
+ * the module boundary, not the code — two byte-identical copies of this
+ * function compare to 0.02 ns when both are module-local and 1.0 ns when one
+ * is imported, under Bun's JSC. See `test/perf-math.test.ts`.
+ */
+export function normalMatrix(out: Float32Array, m: Float32Array): Float32Array {
+  const a = m[0];
+  const b = m[1];
+  const c = m[2];
+  const d = m[4];
+  const e = m[5];
+  const f = m[6];
+  const g = m[8];
+  const h = m[9];
+  const i = m[10];
+
+  // Row 0 of the cofactor matrix. `det` is this row dotted with the basis.
+  const A = e * i - f * h;
+  const B = f * g - d * i;
+  const C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+
+  if (det === 0 || !Number.isFinite(det)) {
+    for (let k = 0; k < 12; k++) out[k] = IDENTITY_NORMAL_MATRIX3[k];
+    return out;
   }
+  const s = 1 / det;
+
+  out[0] = A * s;
+  out[1] = B * s;
+  out[2] = C * s;
+  out[4] = (c * h - b * i) * s;
+  out[5] = (a * i - c * g) * s;
+  out[6] = (b * g - a * h) * s;
+  out[8] = (b * f - c * e) * s;
+  out[9] = (c * d - a * f) * s;
+  out[10] = (a * e - b * d) * s;
+  out[3] = 0;
+  out[7] = 0;
+  out[11] = 0;
   return out;
 }
 

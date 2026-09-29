@@ -117,11 +117,14 @@ export function transform(out: Sphere, s: Sphere, m: Float32Array): Sphere {
   out.center[1] = (m[1] * cx + m[5] * cy + m[9] * cz + m[13]) * inv;
   out.center[2] = (m[2] * cx + m[6] * cy + m[10] * cz + m[14]) * inv;
 
-  // Column lengths are the scale on each basis axis.
-  const sx = Math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
-  const sy = Math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
-  const sz = Math.sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
-  out.radius = s.radius * (sx > sy ? (sx > sz ? sx : sz) : sy > sz ? sy : sz);
+  // Column lengths are the scale on each basis axis. `sqrt` is monotonic, so
+  // the longest column is the one with the largest *squared* length: comparing
+  // the squares and taking a single square root at the end is the same answer
+  // bit for bit, for two fewer square roots.
+  const lx = m[0] * m[0] + m[1] * m[1] + m[2] * m[2];
+  const ly = m[4] * m[4] + m[5] * m[5] + m[6] * m[6];
+  const lz = m[8] * m[8] + m[9] * m[9] + m[10] * m[10];
+  out.radius = s.radius * Math.sqrt(lx > ly ? (lx > lz ? lx : lz) : ly > lz ? ly : lz);
   return out;
 }
 

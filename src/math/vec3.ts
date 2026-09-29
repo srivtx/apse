@@ -112,19 +112,43 @@ export function negate(out: Float32Array, a: Float32Array): Float32Array {
   return out;
 }
 
-/** Component-wise minimum. NaN in either input propagates, per IEEE-754. */
+/**
+ * Component-wise minimum.
+ *
+ * **NaN handling is asymmetric, and deliberately left that way.** The
+ * comparison is `a[i] < b[i] ? a[i] : b[i]`, so a NaN in `a` fails the
+ * comparison and yields `b[i]` — the NaN is dropped — while a NaN in `b` wins
+ * the fallback and propagates. This is not `Math.min`, which propagates from
+ * either side, and it is not IEEE-754 `minimumNumber`, which drops from
+ * either side.
+ *
+ * The previous doc claimed NaN propagated "per IEEE-754", which was true of
+ * neither the code nor the standard. It is stated exactly as implemented
+ * because a caller cannot act on a paraphrase: `min(a, b)` and `min(b, a)` are
+ * not interchangeable when either operand is NaN. Making this symmetric is a
+ * behaviour change and needs its own decision — it is not a maths fix.
+ */
 export function min(out: Float32Array, a: Float32Array, b: Float32Array): Float32Array {
-  out[0] = a[0] < b[0] ? a[0] : b[0];
-  out[1] = a[1] < b[1] ? a[1] : b[1];
-  out[2] = a[2] < b[2] ? a[2] : b[2];
+  const ax = a[0];
+  const ay = a[1];
+  const az = a[2];
+  out[0] = ax < b[0] ? ax : b[0];
+  out[1] = ay < b[1] ? ay : b[1];
+  out[2] = az < b[2] ? az : b[2];
   return out;
 }
 
-/** Component-wise maximum. NaN in either input propagates, per IEEE-754. */
+/**
+ * Component-wise maximum. Same asymmetric NaN handling as {@link min}: a NaN
+ * in `a` is dropped, a NaN in `b` propagates.
+ */
 export function max(out: Float32Array, a: Float32Array, b: Float32Array): Float32Array {
-  out[0] = a[0] > b[0] ? a[0] : b[0];
-  out[1] = a[1] > b[1] ? a[1] : b[1];
-  out[2] = a[2] > b[2] ? a[2] : b[2];
+  const ax = a[0];
+  const ay = a[1];
+  const az = a[2];
+  out[0] = ax > b[0] ? ax : b[0];
+  out[1] = ay > b[1] ? ay : b[1];
+  out[2] = az > b[2] ? az : b[2];
   return out;
 }
 

@@ -144,6 +144,15 @@ export function setAxisAngle(out: Float32Array, axis: Float32Array, angle: numbe
  * as a column-major model matrix `Rz * Ry * Rx` built with
  * {@link mat4.fromQuat} on the result.
  *
+ * The expanded product is written out rather than routed through three
+ * {@link setAxisAngle} calls and two {@link mul}s, because it is a pure
+ * function of three scalars and the intermediate quaternions would be six
+ * redundant stores. The signs are checkable by expanding the Hamilton product
+ * by hand: `x` picks up `-cx*sy*sz` and `y` picks up `+sx*cy*sz`, because
+ * `qy * qx` is `(cy*sx, sy*cx, -sy*sx, cy*cx)` and the `qz` product flips the
+ * sign of the second cross term in each. A test asserts the result against
+ * `quat.mul` over random triples, which is what catches a sign here.
+ *
  * Use this when a loader, an editor, or a test hands you three angles. Do not
  * use it as an animation storage format — that is the failure mode the rest of
  * this module exists to prevent.
@@ -161,8 +170,8 @@ export function fromEulerXYZ(out: Float32Array, x: number, y: number, z: number)
   const cy = Math.cos(hy);
   const sz = Math.sin(hz);
   const cz = Math.cos(hz);
-  out[0] = sx * cy * cz + cx * sy * sz;
-  out[1] = cx * sy * cz - sx * cy * sz;
+  out[0] = sx * cy * cz - cx * sy * sz;
+  out[1] = cx * sy * cz + sx * cy * sz;
   out[2] = cx * cy * sz - sx * sy * cz;
   out[3] = cx * cy * cz + sx * sy * sz;
   return out;

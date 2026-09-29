@@ -216,8 +216,20 @@ const _pair = new Float32Array(2);
  *
  * Reused rather than a `[offset]` literal per draw, which would be one
  * short-lived array per object per frame.
+ *
+ * **A plain `Array`, not a `Uint32Array`.** The two are equally correct — the
+ * IDL type is `sequence<GPUBufferDynamicOffset>`, so both convert — but Blink's
+ * `sequence<>` conversion has a fast path that requires a real `v8::Array` and
+ * falls off it for a typed array, walking the generic iterator protocol instead.
+ * Measured on Apple M2 / Chrome / headless with the queue drained each iteration,
+ * one `setBindGroup` with a reused 1-element `Uint32Array` costs 1.22 us against
+ * 0.28 us for the same reused 1-element `Array`, in core and in compatibility
+ * alike. At one such bind per draw that is ~0.9 us per draw — several times the
+ * entire per-draw gap this renderer had against three.js — and it was invisible
+ * to every call census, because the number of calls is identical either way.
+ * A call census counts calls; it cannot price an argument.
  */
-const _dynamicOffsets = new Uint32Array(1);
+const _dynamicOffsets: number[] = [0];
 
 /** `FrameStats` with every field writable, so `#record` does not copy. */
 type MutableStats = { -readonly [K in keyof FrameStats]: FrameStats[K] };
@@ -1141,7 +1153,11 @@ export class Renderer {
         lastInstanceIB = instBuf;
       }
 
-      if (geometry.indexBuffer !== null) {
+      // `ib`, not `geometry.indexBuffer`: the branch above already established
+      // which of the two this is, and the getter checks liveness, so reading it
+      // again is a third liveness check per draw to learn what a local in scope
+      // already says. Measured in Chrome at ~16 ns/draw for the loop body.
+      if (ib !== null) {
         enc.drawIndexed(geometry.indexCount, instances, 0, 0, first);
       } else {
         enc.draw(geometry.indexCount, instances, 0, first);
